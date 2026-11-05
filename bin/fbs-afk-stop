@@ -1,0 +1,13 @@
+#!/bin/sh
+# The Stop hook runs at the end of every turn in every session with fbs enabled, so it must never depend on Bun to allow: only a running afk run switches it on.
+input="$(cat)"
+cwd="$(printf '%s' "$input" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+[ -n "$cwd" ] && [ -d "$cwd" ] || cwd="$PWD"
+common="$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || exit 0
+# The grep relies on writeRun in cli/afk.ts writing "status" as a top-level key with a two-space indent.
+grep -qs '^  "status": "running"' "$common"/fbs/afk/*/run.json || exit 0
+dir="$(dirname "$0")"
+out="$(printf '%s' "$input" | "$dir/fbs" afk stop-check)"
+# A failure must let the session stop, never trap the user in a turn.
+[ $? -eq 0 ] && printf '%s' "$out"
+exit 0

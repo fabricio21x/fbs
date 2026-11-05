@@ -1,0 +1,123 @@
+#!/bin/sh
+# A stand-in for gh in eval runs: answers from files the case's fixture wrote to <git common dir>/fake-gh/ and logs every call there.
+# fbs runs it with an empty environment, so it sets its own PATH and prefers the git wrapper beside it.
+here="${0%/*}"
+PATH="$here:${PATH:-/usr/bin:/bin}:/usr/bin:/bin"
+export PATH
+
+common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
+  echo "fake gh: not in a git repository" >&2
+  exit 1
+}
+data="$common/fake-gh"
+mkdir -p "$data"
+log="$data/calls.log"
+
+# One line per call: the arguments, tab-separated, newlines folded to spaces.
+line=""
+for arg in "$@"; do
+  flat="$(printf '%s' "$arg" | tr '\n\t' '  ')"
+  if [ -z "$line" ]; then line="$flat"; else line="$line	$flat"; fi
+done
+printf '%s\n' "$line" >> "$log"
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+serve() {
+  [ -f "$data/$1" ] || fail "fake gh: no $1 in the fixture"
+  cat "$data/$1"
+  exit 0
+}
+
+any() {
+  needle="$1"
+  shift
+  for arg in "$@"; do
+    case "$arg" in *"$needle"*) return 0 ;; esac
+  done
+  return 1
+}
+
+# A field from a one-line JSON file, enough for the few --jq paths fbs asks for.
+field() {
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$data/$1" | head -n 1
+}
+
+# The value after --input, logged so graders can read what was posted.
+input_file() {
+  take=""
+  for arg in "$@"; do
+    if [ -n "$take" ]; then
+      printf '%s' "$arg"
+      return 0
+    fi
+    [ "$arg" = "--input" ] && take=1
+  done
+  return 1
+}
+
+case "$1 $2" in
+  "auth status")
+    echo "Logged in to github.com (fake)"
+    exit 0
+    ;;
+  "repo view")
+    if any ".nameWithOwner" "$@" && any "--jq" "$@"; then field repo.json nameWithOwner; exit 0; fi
+    if any ".defaultBranchRef.name" "$@"; then sed -n 's/.*"defaultBranchRef"[[:space:]]*:[[:space:]]*{[[:space:]]*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$data/repo.json"; exit 0; fi
+    serve repo.json
+    ;;
+  "pr create")
+    echo "https://github.com/$(field repo.json nameWithOwner)/pull/7"
+    exit 0
+    ;;
+  "pr ready" | "pr checks" | "run rerun")
+    exit 0
+    ;;
+  "pr view")
+    serve pr-view.json
+    ;;
+  "pr merge")
+    fail "merging is not allowed in this fixture"
+    ;;
+esac
+
+if [ "$1" = "api" ]; then
+  if file="$(input_file "$@")"; then
+    printf 'input\t%s\n' "$(tr '\n\t' '  ' < "$file")" >> "$log"
+    n="$(wc -l < "$log" | tr -d ' ')"
+    printf '{"id":%s,"updated_at":"%s","html_url":"https://github.com/fake/comment/%s"}\n' "$((900000 + n))" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$n"
+    exit 0
+  fi
+  if any "resolveReviewThread" "$@"; then
+    echo '{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}'
+    exit 0
+  fi
+  if any "PullRequestReviewThread" "$@"; then serve thread.json; fi
+  if any "reviewThreads" "$@"; then
+    count=$(( $(cat "$data/graphql.count" 2>/dev/null || echo 0) + 1 ))
+    [ -f "$data/graphql-$count.json" ] || count=$((count - 1))
+    [ "$count" -ge 1 ] || fail "fake gh: no graphql-1.json in the fixture"
+    echo "$count" > "$data/graphql.count"
+    serve "graphql-$count.json"
+  fi
+  if [ "$2" = "user" ] || [ "$2" = "/user" ]; then
+    if any "--jq" "$@"; then field user.json login; exit 0; fi
+    serve user.json
+  fi
+  # Any other REST read answers from rest/<path with / as _>.json, or 404s like GitHub.
+  for arg in "$@"; do
+    case "$arg" in
+      repos/* | /repos/*)
+        name="$(printf '%s' "${arg#/}" | tr '/' '_')"
+        [ -f "$data/rest/$name.json" ] || fail "gh: Not Found (HTTP 404)"
+        cat "$data/rest/$name.json"
+        exit 0
+        ;;
+    esac
+  done
+fi
+
+fail "fake gh: unsupported call: $*"

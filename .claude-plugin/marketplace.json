@@ -1,0 +1,22 @@
+{
+  "name": "fabs",
+  "description": "Claude Code plugins by Fabricio Monsalve",
+  "owner": { "name": "Fabricio Monsalve" },
+  "plugins": [
+    {
+      "name": "fbs",
+      "source": "./",
+      "description": "An engineering harness for Claude Code: grills an idea into a spec, designs, builds test-first with blind review, verifies, opens and works the PR; a small CLI enforces approvals, the verify stamp and a never-merge guard."
+    },
+    {
+      "name": "thermos",
+      "source": {
+        "source": "git-subdir",
+        "url": "cursor/plugins",
+        "path": "thermos",
+        "sha": "dc415439eebed0cd8fddb11e896dee43bce9d8b0"
+      },
+      "description": "Cursor's thermo-nuclear review skills, fetched from cursor/plugins at a pinned commit. Used by /fbs:polish."
+    }
+  ]
+}

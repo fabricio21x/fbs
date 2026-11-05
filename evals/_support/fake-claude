@@ -1,0 +1,14 @@
+#!/bin/sh
+# A stand-in for claude in eval runs: answers `plugin list --json` from <git common dir>/fake-claude/plugins.json, or with no plugins when no fixture wrote one; every other call goes to the real claude.
+# scripts/eval.sh replaces REAL_CLAUDE with the real binary's path when it copies this file.
+real="REAL_CLAUDE"
+# fbs may run it with an empty environment, so it sets its own PATH and prefers the git wrapper beside it.
+PATH="${0%/*}:${PATH:-/usr/bin:/bin}:/usr/bin:/bin"
+export PATH
+common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+data="$common/fake-claude/plugins.json"
+if [ "$*" = "plugin list --json" ]; then
+  if [ -n "$common" ] && [ -f "$data" ]; then cat "$data"; else echo "[]"; fi
+  exit 0
+fi
+exec "$real" "$@"

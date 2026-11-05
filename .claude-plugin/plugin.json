@@ -1,0 +1,11 @@
+{
+  "name": "fbs",
+  "version": "0.4.0",
+  "description": "An engineering harness for Claude Code: grills an idea into a spec, designs, builds test-first with blind review, verifies, opens and works the PR; a small CLI enforces approvals, the verify stamp and a never-merge guard.",
+  "author": {
+    "name": "Fabricio Monsalve"
+  },
+  "homepage": "https://github.com/fabricio21x/fbs",
+  "repository": "https://github.com/fabricio21x/fbs",
+  "license": "MIT"
+}

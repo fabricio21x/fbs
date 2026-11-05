@@ -1,0 +1,85 @@
+{
+  "description": "fbs guard: while an fbs PR flow (a camp, or any feature with an open PR) or afk run runs in a repo, deny merges, default-branch pushes and force pushes, and during an afk run also edits to its protected files and state, deploys and history rewrites; /fbs:land typed by the user, or the user's bare land answer to a pending fbs land request in the asking session, writes the one-time land token; the Stop hook keeps the session's running afk run going; and an Assuming, Confirm or Approve question (or one that says \"above\") is denied when its message wrote nothing in the chat before it.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|Monitor|Skill|CronCreate|ScheduleWakeup|RemoteTrigger|Agent|SendMessage",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/fbs-guard",
+            "args": [],
+            "timeout": 10,
+            "onFailure": "block"
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__.*__(push_files|create_or_update_file|delete_file|merge_pull_request|write_file|edit_file|create_file|create_directory|move_file|delete_directory)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/fbs-guard",
+            "args": [],
+            "timeout": 10,
+            "onFailure": "block"
+          }
+        ]
+      },
+      {
+        "matcher": "^AskUserQuestion$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/fbs",
+            "args": [
+              "ask-check"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptExpansion": [
+      {
+        "matcher": "(^|:)land$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/fbs-guard",
+            "args": [
+              "--prompt"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/fbs-guard",
+            "args": [
+              "--reply"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/fbs-afk-stop",
+            "args": [],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

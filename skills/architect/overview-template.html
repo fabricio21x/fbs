@@ -1,0 +1,89 @@
+<!doctype html>
+<!--
+  The one page the user reviews to approve a design, the way an engineer presents a technical design to their tech lead: the shape and the reasoning, not the detail.
+  Every line comes from design.md, or from the spec's Problem and Out of scope; when this page and design.md disagree, design.md wins and this page is rewritten.
+  About 600 words outside the diagrams and mockups. No implementation detail an implementer would settle (timeouts, field names, error codes, file names).
+  Replace each guidance comment below with its content, and each angle-bracket placeholder such as the title; drop the UI section when the feature has no screens.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overview: <title></title>
+<style>
+  :root { --bg: #ffffff; --fg: #1c1d21; --muted: #5d6170; --line: #e3e5ea; --accent: #3b5bdb; --card: #f7f8fa; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #121317; --fg: #eceef2; --muted: #a2a7b4; --line: #2a2d35; --accent: #8ea6ff; --card: #1a1c22; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 32px 16px 64px; }
+  header p { color: var(--muted); margin: 4px 0 0; }
+  h1 { font-size: 28px; margin: 0; }
+  h2 { font-size: 19px; margin: 36px 0 10px; padding-top: 16px; border-top: 1px solid var(--line); }
+  ul { padding-left: 20px; } li { margin: 4px 0; }
+  .callout { background: var(--card); border: 1px solid var(--line); padding: 12px 16px; border-radius: 8px; }
+  figure { margin: 0; max-width: 100%; }
+  .mermaid { background: var(--card); border-radius: 8px; padding: 12px; overflow-x: auto; }
+  .screens { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; }
+  .frame { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: #fff; }
+  .frame figcaption { font-size: 13px; color: var(--muted); padding: 6px 10px; border-top: 1px solid var(--line); background: var(--card); }
+  .phone iframe { width: 375px; max-width: 100%; height: 720px; border: 0; display: block; }
+  .desktop { width: 100%; max-width: 880px; }
+  .desktop .viewport { width: 100%; aspect-ratio: 1280 / 800; overflow: hidden; position: relative; }
+  .desktop iframe { width: 1280px; height: 800px; border: 0; transform-origin: 0 0; position: absolute; top: 0; left: 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Overview: <title></h1>
+    <p>Feature <code><slug></code> · source of truth: <code><dir>/design.md</code></p>
+  </header>
+
+  <h2>What we're building</h2>
+  <!-- Two or three sentences: the problem, what the user gets, and what is left out on purpose. -->
+
+  <h2>Architecture</h2>
+  <!-- One mermaid diagram of the main parts and how data moves between them, in a pre element with class mermaid (escape < and & in it), then one short paragraph walking through it. -->
+
+  <h2>Approach and why</h2>
+  <!-- The recommended option in one sentence, then each option considered in one line with why it lost. -->
+
+  <h2>UI</h2>
+  <!-- Only when the feature has screens: three to five lines from the design's UI direction (the screens, the look, the one thing that matters most), then each screen's mockup at both widths:
+  <div class="screens">
+    <figure class="frame phone"><iframe src="mockups/<screen>.html" loading="lazy"></iframe><figcaption><screen>, 375 px</figcaption></figure>
+    <figure class="frame desktop"><div class="viewport"><iframe src="mockups/<screen>.html" loading="lazy"></iframe></div><figcaption><screen>, 1280 px</figcaption></figure>
+  </div>
+  -->
+
+  <h2>Data model</h2>
+  <!-- The core entities and states at a glance: a small mermaid state or entity diagram, or a short table. -->
+
+  <h2>Key decisions</h2>
+  <!-- At most seven <li>, one line each: the decision and its reason. -->
+
+  <h2>Risks</h2>
+  <!-- At most five <li>, one line each: the risk and what limits it. -->
+
+  <h2>Rollout</h2>
+  <!-- Two or three lines: how it reaches users, from the design's Rollout. -->
+
+  <h2>Review</h2>
+  <!-- One line: the gulag's findings, how many were accepted, and the changes that mattered most. -->
+
+  <h2>Needs your call</h2>
+  <!-- In a <div class="callout">: what the approver signs off on or still has to answer, one line each: the unknowns accepted as assumptions, any Stale: line in the Gulag outcome, and the open questions while the gate still stops on them; or None. -->
+</main>
+<script>
+  // Scale each desktop mockup to the width its frame has.
+  const fit = () => document.querySelectorAll('.desktop .viewport').forEach(v => {
+    const f = v.querySelector('iframe'); if (f) f.style.transform = `scale(${v.clientWidth / 1280})`;
+  });
+  addEventListener('resize', fit); addEventListener('load', fit);
+</script>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default' });
+</script>
+</body>
+</html>

@@ -1,0 +1,29 @@
+#!/bin/sh
+# The guard hook runs on every tool call and prompt in every session with fbs enabled, so it must never depend on Bun to allow: only a running camp, an open fbs PR, an afk run or a pending land request switches it on.
+input="$(cat)"
+cwd="$(printf '%s' "$input" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+[ -n "$cwd" ] && [ -d "$cwd" ] || cwd="$PWD"
+common="$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || exit 0
+# The grep relies on writeRun in cli/afk.ts writing "status" as a top-level key with a two-space indent; a met run is held until it lands or stops.
+afk_run() { grep -qsE '^  "status": "(running|met)"' "$common"/fbs/afk/*/run.json; }
+# The greps rely on writeRecord in cli/status.ts writing "pr" and "landed" as top-level keys with a two-space indent.
+open_pr() {
+  for record in "$common"/fbs/features/*.json; do
+    grep -qsE '^  "pr": [0-9]' "$record" && ! grep -qs '^  "landed":' "$record" && return 0
+  done
+  return 1
+}
+case "$1" in
+  --prompt) ;;
+  --reply) [ -f "$common/fbs/land/request.json" ] || exit 0 ;;
+  *) ls "$common"/fbs/pr/*.camp >/dev/null 2>&1 || open_pr || afk_run || exit 0 ;;
+esac
+dir="$(dirname "$0")"
+printf '%s' "$input" | "$dir/fbs" guard "$@"
+status=$?
+# A prompt hook must never block the user's message, even when the CLI crashed.
+[ "$1" = "--reply" ] && exit 0
+[ "$status" -eq 0 ] || [ "$status" -eq 2 ] && exit "$status"
+# A crash must not lock the user out silently: deny with the way out.
+echo "fbs guard failed (exit $status) while a PR flow or an afk run is running, so this call is denied. Report this error to the user and wait for them; don't work around the guard." >&2
+exit 2

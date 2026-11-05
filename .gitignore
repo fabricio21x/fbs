@@ -1,0 +1,7 @@
+node_modules/
+evals/results/
+bin/fbs-bin
+notes/
+CLAUDE.local.md
+.claude/scheduled_tasks.lock
+.claude/worktrees/

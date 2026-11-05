@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# The eval sandbox hides the environment from compiled Bun, so the shim resolves git, gh and claude and passes their paths.
+git_path="$(PATH="$dir:${PATH:-/usr/local/bin:/usr/bin:/bin}" command -v git || true)"
+gh_path="$(PATH="$dir:${PATH:-/usr/local/bin:/usr/bin:/bin}" command -v gh || true)"
+claude_path="$(PATH="$dir:${PATH:-/usr/local/bin:/usr/bin:/bin}" command -v claude || true)"
+set -- ${git_path:+"--fbs-git=$git_path"} ${gh_path:+"--fbs-gh=$gh_path"} ${claude_path:+"--fbs-claude=$claude_path"} "$@"
+if [ -x "$dir/fbs-bin" ]; then
+  exec "$dir/fbs-bin" "$@"
+fi
+exec bun "$dir/../cli/main.ts" "$@"
