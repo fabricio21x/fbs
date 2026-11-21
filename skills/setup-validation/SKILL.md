@@ -23,7 +23,7 @@ Input, optional: a feature slug whose flows to add: $ARGUMENTS
 
 - If `.fbs/validation/README.md` exists and a feature was given, this is an update: add that feature's flows (step 3), propose any new allow rule they need (step 4), run them once (step 5), and keep the rest.
 - If it exists and nothing was given, say it's set up, show its "Verified end to end" line, and stop.
-- The setup is committed on the feature's branch, never on the default branch unless the user explicitly asked. A calling stage is already on it. Run alone for a feature: `fbs branch <slug> --existing`. Run alone with no feature, it's a tiny change of its own: `fbs status init validation-setup --size tiny`, then `fbs branch validation-setup --type chore`. Say each `note:` in one line; on `refused:`, show it to the user and do what they choose.
+- The setup is committed on the feature's branch, never on the default branch unless the user explicitly asked. A calling stage is already on it. Run alone for a feature: `fbs branch <slug> --existing`. Run alone with no feature, it's a tiny change of its own: `fbs status init validation-setup --size tiny`, then `fbs branch validation-setup --type chore` (`chore` is in every family; with a config that leaves it out, the closest type `fbs branch --types` lists). Say each `note:` in one line; on `refused:`, show it to the user and do what they choose.
 - Load `fbs:principle-prove-it-works` with the Skill tool.
 
 ## 2. Find out from the repo first

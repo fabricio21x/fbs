@@ -39,11 +39,14 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 
 | Command | What it does |
 |---|---|
-| `branch <slug> [--type feature\|bugfix\|hotfix\|chore] [--ticket <id>] [--existing] [--parent <branch>]` | Puts the checkout on the feature's branch and records it. Creates `<type>/<ticket>-<slug>` from origin's default branch (or `--parent`, for a stack) when none is recorded; `--existing` never creates; `--ticket` renames a branch fbs cut that has no PR yet |
+| `branch <slug> [--type <type>] [--ticket <id>] [--existing] [--parent <branch>]` | Puts the checkout on the feature's branch and records it. Creates `<type>/<ticket>-<slug>` from origin's default branch (or `--parent`, for a stack) when none is recorded; `--existing` never creates; `--ticket` renames a branch fbs cut that has no PR yet, into an allowed type when `branches.types` leaves out its own (`feature` to `feat`, `bugfix` or `hotfix` to `fix`, and back; else the first listed). `<type>` is `feature`, `bugfix`, `hotfix`, `chore` or another Conventional Commit type (`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `revert`); only those in `branches.types` in `.fbs/config.json` when it's set |
+| `branch --types` | The types to pick `--type` from, as one JSON line: `{types, from, seen}`. `from` is `config` (`branches.types`), `branches` (the family, conventional branch or Conventional Commit, that the 50 most recently committed local and remote branches with a type prefix use more; a tie is `default`) or `default` (`feature`, `bugfix`, `hotfix`, `chore`); `seen` counts each type prefix found. Reads only |
 | `branch <slug> --use <branch>` | Adopts a branch you named instead |
 | `push <slug>` | Pushes the feature's branch, never the default branch. Before the PR it overwrites only what fbs pushed last; after, it only adds commits. Skipped without an origin |
 | `commits check <slug>` | Lists the branch's commit subjects that aren't Conventional Commits, leaving out the parent branch's |
 | `commits title <text>` | Checks a PR title the same way |
+
+For `branch --types`, `test/`, `docs/`, `build/` and `style/` branches count as Conventional Commit evidence, like `feat/` and `fix/`; `chore/` counts for neither family.
 
 ### Verification
 

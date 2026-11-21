@@ -713,7 +713,9 @@ test("the help lists the stamp commands", () => {
 test("the help lists the branch types", () => {
   const out: string[] = [];
   expect(run(["help"], io(out, []))).toBe(0);
-  expect(out.join("\n")).toContain("branch <slug> [--type <feature|bugfix|hotfix|chore>] [--ticket <id>] [--existing] [--parent <branch>]");
+  expect(out.join("\n")).toContain("branch <slug> [--type <type>] [--ticket <id>] [--existing] [--parent <branch>]");
+  expect(out.join("\n")).toContain("feature, bugfix, hotfix, chore, feat, fix, docs, style, refactor, perf, test, build, ci or revert");
+  expect(out.join("\n")).toContain("branch --types ");
 });
 
 test("branch names the flags --use can't be combined with, instead of an unknown command", () => {

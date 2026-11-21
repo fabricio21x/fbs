@@ -306,9 +306,9 @@ export function makeEmptyRootCommit(cwd: string, branch: string, message: string
   return sha;
 }
 
-/** Local and remote-tracking branch names, without `refs/heads/` or `refs/remotes/<remote>/`, each once. */
+/** Local and remote-tracking branch names, without `refs/heads/` or `refs/remotes/<remote>/`, each once, newest commit first. */
 export function branchNames(cwd: string): string[] {
-  const refs = gitOutput(cwd, ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"]).split("\n");
+  const refs = gitOutput(cwd, ["for-each-ref", "--sort=-committerdate", "--format=%(refname)", "refs/heads", "refs/remotes"]).split("\n");
   const names = refs.flatMap((ref) => /^refs\/(?:heads|remotes\/[^/]+)\/(.+)$/.exec(ref)?.[1] ?? []);
   return [...new Set(names.filter((name) => name !== "HEAD"))];
 }

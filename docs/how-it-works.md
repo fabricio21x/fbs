@@ -75,7 +75,8 @@ A fact with a source is a fact. Anything nobody confirmed is an assumption, and 
 
 Every feature lives on its own branch from the moment it has a record, so no stage commits on the default branch.
 
-- `fbs branch <slug>` puts the checkout on the feature's branch, creating it the first time from the remote's default branch. Names follow the conventional branch format, all lowercase: `<type>/<ticket>-<slug>` when the feature has a ticket and `<type>/<slug>` when it has none, where `<type>` is `feature`, `bugfix`, `hotfix` or `chore`.
+- `fbs branch <slug>` puts the checkout on the feature's branch, creating it the first time from the remote's default branch. Names follow the conventional branch format, all lowercase: `<type>/<ticket>-<slug>` when the feature has a ticket and `<type>/<slug>` when it has none, where `<type>` is one of the conventional branch types (`feature`, `bugfix`, `hotfix`, `chore`) or the Conventional Commit types (`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`).
+- The stages follow the repo's convention: `fbs branch --types` gives the types to pick from, which are `branches.types` from `.fbs/config.json` when set (then no other type is accepted, and a `--ticket` rename before the PR moves a branch into an allowed type), else the family the repo's 50 most recently committed typed branches use, else `feature`, `bugfix`, `hotfix` and `chore`.
 - A feature built on another feature's unmerged work branches from it (`--parent`), and its PR stacks on that one. The default branch, or any other, is used only when you name it for that feature (`--use`).
 - `fbs push <slug>` pushes only the feature's branch, never the default branch. Before the PR opens it overwrites only what fbs pushed last; after, it only adds commits.
 - Commits are Conventional Commits. `organize-commits` rewords any subject that isn't one before the PR opens, and the PR title is one too, because land squash-merges under it.
@@ -167,6 +168,7 @@ When git ignores the features folder, the documents stay local: fbs reads them f
 | `context.staleDays` | `30` | When a fact is due for a recheck |
 | `tracker` | unset | `{"kind": "linear", "team": "<key>"}`, `{"kind": "github"}` or `{"kind": "none"}` |
 | `camp.autoFixRounds` | `2` | Review rounds camp-pr fixes on its own before it checks in with you |
+| `branches.types` | any type | The only branch types `fbs branch` creates, such as `["feat", "fix", "chore"]` when CI requires branch names to start with a Conventional Commit type |
 | `afk.migrations`, `afk.infra`, `afk.checkConfig` | built-in globs | Extra globs for autopilot's migration, infra and check-config flags |
 | `afk.deny` | none | Extra commands the guard denies during an autopilot run (deploy CLIs, say) |
 

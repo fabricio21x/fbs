@@ -4,7 +4,7 @@ import plugin from "../.claude-plugin/plugin.json";
 import { AfkError, type AfkDeps, afkGuardRun, checkStep, finalRun, parseSpec, REAL_AFK_DEPS, resumeRun, showRun, startRun, stopCheck, stopRun } from "./afk";
 import { preflight } from "./afk-preflight";
 import { askCheck } from "./ask-check";
-import { BranchRefusedError, enterFeatureBranch, pushFeatureBranch } from "./branch";
+import { BranchRefusedError, branchTypes, enterFeatureBranch, pushFeatureBranch } from "./branch";
 import { addFollowup, CampError, COUNTS, type Counts, closeFollowup, recordCheckpoint, recordRound, showCamp, startCamp, stopCamp } from "./camp";
 import { CommitsRefusedError, commitProblems, isConventionalSubject } from "./commits";
 import { ConfigError, projectConfig } from "./config";
@@ -94,11 +94,13 @@ const USAGE = [
   "  tracker detect            print the evidence for a tracker setting as one JSON line: the config, ticket-id prefixes",
   "                            in branch names, tracker links in the last 30 merged PR bodies and the issue count (each",
   "                            null when gh can't tell); reads only",
-  "  branch <slug> [--type <feature|bugfix|hotfix|chore>] [--ticket <id>] [--existing] [--parent <branch>]",
+  "  branch <slug> [--type <type>] [--ticket <id>] [--existing] [--parent <branch>]",
   "  branch <slug> --use <branch>",
   "                            put the work tree on the feature's branch and record it; prints one JSON line",
   "                            the recorded branch, else a new <type>/<ticket>-<slug> (or <type>/<slug>) from origin's",
-  "                            --parent or default branch; --type is needed only to create one; --ticket defaults to the",
+  "                            --parent or default branch; --type is needed only to create one, and is one of",
+  "                            feature, bugfix, hotfix, chore, feat, fix, docs, style, refactor, perf, test, build, ci or revert",
+  "                            (only those in .fbs/config.json branches.types, when set); --ticket defaults to the",
   "                            record's ticket; the ticket is lowercased",
   "                            and a bare issue number becomes issue-<n>; --existing never creates one; --parent moves",
   "                            a recorded branch that has no PR and whose origin copy is only what fbs pushed;",
@@ -106,7 +108,13 @@ const USAGE = [
   "                            below it, which becomes its parent); an explicit --ticket renames a recorded branch fbs",
   "                            cut to carry it, refused while its PR is open, origin has commits fbs didn't push, the",
   "                            new name is taken or another feature is stacked on it; the next push deletes the old",
-  "                            name on origin",
+  "                            name on origin; a type branches.types leaves out becomes an allowed one in that rename",
+  "                            (feature and feat, bugfix or hotfix and fix, swap; else the first listed)",
+  "  branch --types            print the types to pick --type from as one JSON line: {types,from,seen}, from config",
+  "                            (branches.types), else branches (the family, conventional branch or Conventional Commit",
+  "                            types, that the 50 most recently committed local and remote branch names with a type prefix",
+  "                            use more, by the types only it has), else default (feature, bugfix, hotfix, chore; also on",
+  "                            a tie); seen counts each type prefix among those 50; reads only",
   "  push <slug>               push the feature's branch to origin's branch of that name and track it; prints one JSON line",
   "                            before a PR it overwrites only what fbs pushed last, after one it only adds commits;",
   "                            never main, master or origin's default branch; skipped without an origin remote",
@@ -501,6 +509,10 @@ function runStamp(args: string[], io: Io): number {
 }
 
 function runBranch(args: string[], io: Io): number {
+  if (args.length === 1 && args[0] === "--types") {
+    io.out(JSON.stringify(branchTypes(io.cwd)));
+    return 0;
+  }
   const parsed = parseOptions(args, ["--type", "--ticket", "--parent", "--use"], ["--existing"]);
   if (!parsed || parsed.positionals.length !== 1) {
     io.err(`unknown command: branch ${args.join(" ")}`.trimEnd());

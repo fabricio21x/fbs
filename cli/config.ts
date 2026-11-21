@@ -8,6 +8,8 @@ export interface FbsConfig {
   afk?: AfkConfig;
   tracker?: Tracker;
   camp?: { autoFixRounds?: number };
+  /** `types` is the only branch types `fbs branch` creates here. */
+  branches?: { types?: string[] };
 }
 
 /** The project's issue tracker; `none` says it has none, which differs from unset. */
@@ -20,6 +22,11 @@ export interface AfkConfig {
   checkConfig?: string[];
   deny?: string[];
 }
+
+/** The conventional branch format's types, and the Conventional Commit types some repos name branches by instead. */
+export const BRANCH_FAMILY: readonly string[] = ["feature", "bugfix", "hotfix", "chore"];
+export const COMMIT_FAMILY: readonly string[] = ["feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert"];
+export const BRANCH_TYPES: readonly string[] = [...new Set([...BRANCH_FAMILY, ...COMMIT_FAMILY])];
 
 export const DEFAULT_CONFIG: FbsConfig = {
   featuresDir: "docs/features",
@@ -88,6 +95,13 @@ function parseConfig(text: string, path: string): FbsConfig {
     const rounds = raw.camp.autoFixRounds;
     if (rounds !== undefined && (!Number.isInteger(rounds) || (rounds as number) < 1)) throw invalid("camp.autoFixRounds must be a positive integer");
     config.camp = rounds === undefined ? {} : { autoFixRounds: rounds as number };
+  }
+  if (raw.branches !== undefined) {
+    if (!isObject(raw.branches)) throw invalid("branches must be an object");
+    const types = raw.branches.types;
+    const valid = Array.isArray(types) && types.length > 0 && types.every((type) => BRANCH_TYPES.includes(type)) && new Set(types).size === types.length;
+    if (types !== undefined && !valid) throw invalid(`branches.types must be a non-empty array of distinct types from ${BRANCH_TYPES.join(", ")}`);
+    config.branches = types === undefined ? {} : { types: types as string[] };
   }
   return config;
 }

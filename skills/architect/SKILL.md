@@ -39,7 +39,7 @@ Then look for earlier work on this stage:
 
 Read `<dir>/spec.md`, and `<dir>/changes.md` when it exists: design to the spec and to its `open` design-level entries, and mark those `planned` once the design holds them. The spec's scope, criteria and decisions are settled input; don't reopen them.
 
-Run `fbs branch <slug> --type feature` before writing anything (the type only names a branch plan didn't create), so the design is committed on the feature's branch; say each `note:` in one line; on `refused:`, show it to the user and do what they choose, never discarding their changes.
+Run `fbs branch --types`, then `fbs branch <slug> --type <type>` before writing anything (the type only names a branch plan didn't create: `feat` or `feature`, whichever its `types` lists, else the closest type it lists), so the design is committed on the feature's branch; say each `note:` in one line; on `refused:`, show it to the user and do what they choose, never discarding their changes.
 
 ## 2. Load the principles
 

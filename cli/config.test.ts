@@ -68,6 +68,23 @@ test.each([
   expect(() => loadConfig(repoWithConfig(content))).toThrow(ConfigError);
 });
 
+test("branches.types is kept, and no branches key leaves it unset", () => {
+  expect(loadConfig(repoWithConfig('{"branches":{"types":["feat","fix","chore"]}}')).branches).toEqual({ types: ["feat", "fix", "chore"] });
+  expect(loadConfig(repoWithConfig("{}")).branches).toBeUndefined();
+});
+
+test.each([
+  '{"branches":[]}',
+  '{"branches":{"types":"feat"}}',
+  '{"branches":{"types":[]}}',
+  '{"branches":{"types":[1]}}',
+  '{"branches":{"types":["Feat"]}}',
+  '{"branches":{"types":["feat","release"]}}',
+  '{"branches":{"types":["feat","fix","feat"]}}',
+])("branches config %s is a ConfigError", (content) => {
+  expect(() => loadConfig(repoWithConfig(content))).toThrow("branches");
+});
+
 test("camp.autoFixRounds is kept", () => {
   expect(loadConfig(repoWithConfig('{"camp":{"autoFixRounds":3}}')).camp).toEqual({ autoFixRounds: 3 });
 });

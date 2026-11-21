@@ -1,4 +1,5 @@
 import {
+  branchNames,
   commitOf,
   commitsBetween,
   currentBranch,
@@ -16,6 +17,7 @@ import {
   switchBranch,
   uncommittedFiles,
 } from "./git";
+import { BRANCH_FAMILY, BRANCH_TYPES, COMMIT_FAMILY, CONFIG_PATH, projectConfig } from "./config";
 import { protectedBranches } from "./guard";
 import { type FeatureBranch, type FeatureRecord, isBranchName, isUnit, listFeatures, readFeature, StatusError, type UnitRecord, unitBelow, updateFeature } from "./status";
 
@@ -61,8 +63,6 @@ export interface BranchChoice {
   existing?: boolean;
 }
 
-export const BRANCH_TYPES: readonly string[] = ["feature", "bugfix", "hotfix", "chore"];
-
 const SEGMENT = "[a-z0-9]+(\\.[a-z0-9]+)*";
 const CONVENTIONAL_BRANCH = new RegExp(`^(${BRANCH_TYPES.join("|")})/${SEGMENT}(-${SEGMENT})*$`);
 
@@ -71,15 +71,50 @@ export function isConventionalBranchName(name: string): boolean {
   return CONVENTIONAL_BRANCH.test(name);
 }
 
-/** The name a new branch gets; the ticket is left out of the description when the slug already starts with it. */
-function newBranchName(slug: string, { type, ticket }: BranchChoice): string {
-  if (type === undefined) throw new BranchRefusedError(`a new branch needs --type <${BRANCH_TYPES.join("|")}>`);
-  if (!BRANCH_TYPES.includes(type)) throw new BranchRefusedError(`unknown type ${JSON.stringify(type)}; --type is one of ${BRANCH_TYPES.join(", ")}`);
+/**
+ * The name a new branch gets, its type one of `configured` (the config's branches.types) when set, else any;
+ * the ticket is left out of the description when the slug already starts with it.
+ */
+function newBranchName(slug: string, { type, ticket }: BranchChoice, configured?: readonly string[]): string {
+  const types = configured ?? BRANCH_TYPES;
+  if (type === undefined) throw new BranchRefusedError(`a new branch needs --type <${types.join("|")}>`);
+  if (!types.includes(type)) {
+    const where = configured === undefined ? "" : ` (branches.types in ${CONFIG_PATH})`;
+    throw new BranchRefusedError(`unknown type ${JSON.stringify(type)}; --type is one of ${types.join(", ")}${where}`);
+  }
   const id = ticket === undefined ? undefined : ticketId(ticket);
   const description = id === undefined || slug === id || slug.startsWith(`${id}-`) ? slug : `${id}-${slug}`;
   const name = `${type}/${description}`;
   if (!isConventionalBranchName(name)) throw new BranchRefusedError(`${name} is not a conventional branch name`);
   return name;
+}
+
+/** What `fbs branch --types` prints: the types to pick `--type` from, where they come from, and the type prefixes recent branches use. */
+export interface BranchTypes {
+  types: readonly string[];
+  from: "config" | "branches" | "default";
+  seen: { type: string; count: number }[];
+}
+
+const RECENT_BRANCHES = 50;
+
+/**
+ * The config's branch types; else the family the most recent typed branches use more, by the types only it has;
+ * else the conventional branch format's.
+ */
+export function branchTypes(cwd: string): BranchTypes {
+  const typed = branchNames(cwd).flatMap((name) => /^([^/]+)\//.exec(name)?.[1] ?? []).filter((type) => BRANCH_TYPES.includes(type));
+  const counts = new Map<string, number>();
+  for (const type of typed.slice(0, RECENT_BRANCHES)) counts.set(type, (counts.get(type) ?? 0) + 1);
+  const seen = [...counts].map(([type, count]) => ({ type, count })).sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
+  const configured = projectConfig(cwd).branches?.types;
+  if (configured !== undefined) return { types: configured, from: "config", seen };
+  const onlyIn = (family: readonly string[], other: readonly string[]) =>
+    seen.filter(({ type }) => family.includes(type) && !other.includes(type)).reduce((sum, { count }) => sum + count, 0);
+  const commit = onlyIn(COMMIT_FAMILY, BRANCH_FAMILY);
+  const branch = onlyIn(BRANCH_FAMILY, COMMIT_FAMILY);
+  if (commit !== branch) return { types: commit > branch ? COMMIT_FAMILY : BRANCH_FAMILY, from: "branches", seen };
+  return { types: BRANCH_FAMILY, from: "default", seen };
 }
 
 /** A ticket id in lowercase, such as `acm-123`; a bare issue number, with or without `#`, is `issue-<n>`. */
@@ -106,20 +141,21 @@ export function enterFeatureBranch(cwd: string, slug: string, choice: BranchChoi
   if (isUnit(known) && choice.parent !== undefined) throw new BranchRefusedError(`${slug} is unit ${known.unit} of ${known.unitOf}; its stack sets its parent, so --parent isn't used`);
   // Only a new branch takes the record's ticket; a recorded one is renamed only for an explicit --ticket.
   const naming = known.branch === undefined ? withTicket(known) : choice;
+  const configured = projectConfig(cwd).branches?.types;
   // The fetch runs before the lock, so a slow or failing network never holds it.
-  const origin = refreshOrigin(cwd, namesOnOrigin(cwd, known, naming), note);
+  const origin = refreshOrigin(cwd, namesOnOrigin(cwd, known, naming, configured), note);
   let result: BranchResult | undefined;
   updateFeature(cwd, slug, (rec) => {
     let step: Step;
     if (choice.use !== undefined) step = adopt(cwd, choice.use, rec.branch, isUnit(rec) ? rec : null, origin, note);
     else if (rec.branch !== undefined) {
-      const newName = renameTarget(slug, rec.branch, choice.ticket);
+      const newName = renameTarget(slug, rec.branch, choice.ticket, configured, rec.pr !== null);
       if (newName !== null) assertRenamable(cwd, slug, rec.branch, newName, rec.pr !== null, origin, note);
       step = resume(cwd, rec.branch, rec.pr !== null, choice.parent, origin, note);
       if (newName !== null) step = rename(cwd, step, newName, note);
     } else if (choice.existing) throw new BranchRefusedError(`no branch recorded for ${slug}`);
-    else if (isUnit(rec)) step = createUnit(cwd, newBranchName(slug, withTicket(rec)), rec, origin, note);
-    else step = create(cwd, newBranchName(slug, withTicket(rec)), choice.parent ?? defaultBranch(cwd), origin, note);
+    else if (isUnit(rec)) step = createUnit(cwd, newBranchName(slug, withTicket(rec), configured), rec, origin, note);
+    else step = create(cwd, newBranchName(slug, withTicket(rec), configured), choice.parent ?? defaultBranch(cwd), origin, note);
     result = step.result;
     return { ...rec, branch: step.branch };
   });
@@ -133,10 +169,17 @@ function step(branch: FeatureBranch, change: { created?: boolean; switched?: boo
   return { branch, result: { branch: branch.name, parent: branch.parent, base: branch.base, created, switched, moved, renamed } };
 }
 
-/** The conventional name of a recorded branch fbs cut, with the ticket; null when it already has it, or isn't fbs's or conventional. */
-function renameTarget(slug: string, recorded: FeatureBranch, ticket: string | undefined): string | null {
-  const type = recorded.name.split("/")[0];
+/** The same kind of change in the other family, for a rename into the types a config allows. */
+const COUNTERPART: Record<string, string> = { feature: "feat", feat: "feature", bugfix: "fix", hotfix: "fix", fix: "bugfix" };
+
+/**
+ * The conventional name of a recorded branch fbs cut, with the ticket; null when it already has it, or isn't fbs's or
+ * conventional. Before a PR, a type `configured` leaves out becomes its counterpart there, else the first listed.
+ */
+function renameTarget(slug: string, recorded: FeatureBranch, ticket: string | undefined, configured: readonly string[] | undefined, prOpen: boolean): string | null {
+  let type = recorded.name.split("/")[0];
   if (ticket === undefined || recorded.parent === null || !BRANCH_TYPES.includes(type)) return null;
+  if (configured !== undefined && !prOpen && !configured.includes(type)) type = configured.includes(COUNTERPART[type]) ? COUNTERPART[type] : configured[0];
   const name = newBranchName(slug, { type, ticket });
   return name === recorded.name ? null : name;
 }
@@ -165,20 +208,20 @@ function rename(cwd: string, resumed: Step, newName: string, note: (line: string
 }
 
 /** The branches whose origin copies this run reads. */
-function namesOnOrigin(cwd: string, rec: FeatureRecord, choice: BranchChoice): string[] {
+function namesOnOrigin(cwd: string, rec: FeatureRecord, choice: BranchChoice, configured: readonly string[] | undefined): string[] {
   const { slug, branch: recorded } = rec;
   if (choice.use !== undefined) {
     const below = isUnit(rec) ? stackedOn(cwd, rec) : null;
     return [choice.use, defaultBranch(cwd), ...(below !== null ? [below.name] : [])];
   }
   if (recorded !== undefined) {
-    const newName = renameTarget(slug, recorded, choice.ticket);
+    const newName = renameTarget(slug, recorded, choice.ticket, configured, rec.pr !== null);
     const parent = choice.parent !== undefined && choice.parent !== recorded.parent ? [choice.parent] : [];
     return [recorded.name, ...(newName !== null ? [newName] : []), ...parent];
   }
   if (choice.existing) return [];
-  if (isUnit(rec)) return [newBranchName(slug, choice), stackedOn(cwd, rec)?.name ?? defaultBranch(cwd)];
-  return [newBranchName(slug, choice), ...(choice.parent !== undefined ? [choice.parent] : defaultNames(cwd))];
+  if (isUnit(rec)) return [newBranchName(slug, choice, configured), stackedOn(cwd, rec)?.name ?? defaultBranch(cwd)];
+  return [newBranchName(slug, choice, configured), ...(choice.parent !== undefined ? [choice.parent] : defaultNames(cwd))];
 }
 
 /** The default branch; an unborn repo can't tell it before fetching, so main and master are fetched too. */

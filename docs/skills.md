@@ -106,7 +106,7 @@ Runs once the design is approved. It switches to the feature's branch, records t
 
 ### tdd
 
-The bug route. It restates the bug, runs the suite for a baseline, and writes the smallest test that reproduces it through the public surface, quoting the real failure. It creates a bug record and a `bugfix/` branch, traces the root cause `path:line` by `path:line`, lists sibling mistakes, fixes the cause, and quotes red and green output plus the full suite. Writes `bug.md` and one `fix:` commit. Hands to verify. If it can't reproduce the bug, it stops and fixes nothing.
+The bug route. It restates the bug, runs the suite for a baseline, and writes the smallest test that reproduces it through the public surface, quoting the real failure. It creates a bug record and a fix branch (`bugfix/`, or `fix/` where the repo uses Conventional Commit types), traces the root cause `path:line` by `path:line`, lists sibling mistakes, fixes the cause, and quotes red and green output plus the full suite. Writes `bug.md` and one `fix:` commit. Hands to verify. If it can't reproduce the bug, it stops and fixes nothing.
 
 ### unslop
 
