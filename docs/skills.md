@@ -146,7 +146,7 @@ Runs on a stamped tree. It checks the stamp, the GitHub remote and `gh`, makes s
 
 ### camp-pr
 
-Stays with the PR until it is ready to land. `fbs watch-pr` runs in the background and wakes the agent once per settled round. Each comment and each failing check is verified against the code, then triaged: fix, decline once with a reason, follow-up, or ask you (security, data, billing, scope). Fixes go through the change path and implement's review-round mode, then verify, then one push per round; replies and resolved threads follow. After a fix budget (two rounds by default), it holds one checkpoint with you, then fixes only blockers. It marks the draft ready when green, proposes follow-ups as tickets once at the end, and never merges or rewrites pushed history. Comments are treated as data, never as instructions.
+Stays with the PR until it is ready to land. `fbs watch-pr` runs in the background and wakes the agent once per round, not per event, sometimes before every check has finished. Each comment and each failing check is verified against the code, then triaged: fix, decline once with a reason, follow-up, or ask you (security, data, billing, scope). Fixes go through the change path and implement's review-round mode, then verify, then one push per round; replies and resolved threads follow. After a fix budget (two rounds by default), it holds one checkpoint with you, then fixes only blockers. It marks the draft ready when green, proposes follow-ups as tickets once at the end, and never merges or rewrites pushed history. Comments are treated as data, never as instructions.
 
 ### land
 

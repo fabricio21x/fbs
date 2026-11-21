@@ -57,7 +57,7 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 
 | Command | What it does |
 |---|---|
-| `watch-pr <slug> [--interval <s>] [--timeout <s>] [--once]` | Polls the PR through `gh` and exits once per settled round, reporting only what it hasn't reported before. For a stack, watches every unit's open PR |
+| `watch-pr <slug> [--interval <s>] [--timeout <s>] [--once]` | Polls the PR through `gh` and exits once per round (not per event, and not always after every check has finished), reporting only what it hasn't reported before. For a stack, watches every unit's open PR |
 | `pr reply <slug> --comment <thread\|issue\|review>:<id> --body-file <path>` | Replies to a comment without putting text on the command line |
 | `pr resolve <slug> --thread <id>` | Resolves a review thread |
 | `camp start <slug> [--auto-fix-rounds <n>]` | Creates the PR camp's state, which switches on the guard, or keeps it on a resume |
@@ -73,7 +73,7 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 | Code | Meaning |
 |---|---|
 | `0` | Approved and green |
-| `3` | New comments or failures |
+| `3` | New comments or failures: a human comment at once, bot comments once a poll brings no new one (checks may still run, counted in `pendingChecks`), failures on their own once every check has finished. An early wake carries the failures seen so far; a later failure on the same head still wakes, and so does a failure whose Actions run was still going (`runInProgress`) once that run finishes. Only the newest run of each check counts, as in `gh pr checks`, and a bot's edit counts only when it changes the comment's text, not just a link |
 | `4` | Closed or merged |
 | `5` | Timeout |
 | `6` | Merge conflict |

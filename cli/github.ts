@@ -69,7 +69,7 @@ export interface Comment {
 }
 
 export interface Check {
-  /** Unique per run, so a re-run is a new check and two checks may share a name. */
+  /** Unique per run, so a re-run is a new check; a snapshot keeps each check's newest run, and two checks share a name only across workflows. */
   id: string;
   name: string;
   status: string;
@@ -128,7 +128,7 @@ const SNAPSHOT_QUERY = `query($owner: String!, $repo: String!, $pr: Int!) {
       comments(last: 100) { ${OLDER} nodes { databaseId ${AUTHOR} body createdAt updatedAt } }
       commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { pageInfo { hasNextPage } nodes {
         __typename
-        ... on CheckRun { databaseId name status conclusion detailsUrl checkSuite { app { slug } workflowRun { databaseId } } }
+        ... on CheckRun { databaseId name status conclusion startedAt detailsUrl checkSuite { app { slug } workflowRun { databaseId workflow { name } } } }
         ... on StatusContext { context state createdAt targetUrl }
       } } } } } }
     }
@@ -202,7 +202,7 @@ export function parseSnapshot(raw: unknown): Snapshot {
       ...nodes(issueComments).map((c) => comment(c, "issue", null)),
       ...submitted.filter((r) => str(r, "body").trim() !== "").map((r) => comment(r, "review", null)),
     ],
-    checks: contexts === null ? [] : nodes(contexts).flatMap(check),
+    checks: contexts === null ? [] : newestRuns(nodes(contexts).flatMap(checkRun)),
     truncated,
   };
 }
@@ -230,38 +230,82 @@ function author(c: Record<string, unknown>): { login: string; bot: boolean } {
   return { login: str(who, "login"), bot: who.__typename !== "User" };
 }
 
-function check(node: Record<string, unknown>): Check[] {
+/** One run of a check as the rollup lists it, with what tells it apart from the other runs of the same check. */
+export interface CheckRunOf<T extends { name: string }> {
+  check: T;
+  /** The GitHub Actions workflow the run belongs to; null for a status or another app. */
+  workflow: string | null;
+  /** ISO time; null, empty or GitHub's zero time when the run hasn't started. */
+  startedAt: string | null;
+  completed: boolean;
+  /** Breaks a tie in start time, larger being newer: a check run's id, or when it completed; null when unknown. */
+  order: number | null;
+  passed: boolean;
+}
+
+/**
+ * The rollup keeps every run of a check on the head, superseded ones included (a run cancelled when an edit re-triggered
+ * its workflow); only the newest of each workflow's check counts, as in `gh pr checks`. A run with no start time is
+ * queued, so the newest, unless it completed (cancelled while queued), so the oldest. A tie in start time goes to the
+ * larger `order`, then to the run that didn't pass.
+ */
+export function newestRuns<T extends { name: string }>(runs: CheckRunOf<T>[]): T[] {
+  const newest = new Map<string, { run: CheckRunOf<T>; at: number }>();
+  const newer = (run: CheckRunOf<T>, at: number, kept: { run: CheckRunOf<T>; at: number }) => {
+    if (at !== kept.at) return at > kept.at;
+    if (run.order !== null && kept.run.order !== null && run.order !== kept.run.order) return run.order > kept.run.order;
+    return kept.run.passed && !run.passed;
+  };
+  for (const run of runs) {
+    const started = Date.parse(run.startedAt ?? "");
+    const at = started > 0 ? started : run.completed ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY;
+    const key = `${run.workflow ?? ""}\0${run.check.name}`;
+    const kept = newest.get(key);
+    if (kept === undefined || newer(run, at, kept)) newest.set(key, { run, at });
+  }
+  return [...newest.values()].map(({ run }) => run.check);
+}
+
+const PASSING = ["SUCCESS", "NEUTRAL", "SKIPPED"];
+
+function checkRun(node: Record<string, unknown>): CheckRunOf<Check>[] {
+  const run = (check: Check, workflow: string | null, startedAt: string | null, order: number | null) => {
+    const completed = check.status === "COMPLETED";
+    return [{ check, workflow, startedAt, completed, order, passed: completed && PASSING.includes(check.conclusion) }];
+  };
   if (node.__typename === "CheckRun") {
     const suite = isObject(node.checkSuite) ? node.checkSuite : {};
-    const run = isObject(suite.workflowRun) ? optInt(suite.workflowRun, "databaseId") : null;
-    const actions = isObject(suite.app) && suite.app.slug === "github-actions" && run !== null;
-    return [
-      {
-        id: `run:${int(node, "databaseId")}`,
-        name: str(node, "name"),
-        status: str(node, "status"),
-        conclusion: optStr(node, "conclusion") ?? "",
-        detailsUrl: optStr(node, "detailsUrl"),
-        runId: actions ? run : null,
-        rerunnable: actions,
-      },
-    ];
+    const workflowRun = isObject(suite.workflowRun) ? suite.workflowRun : null;
+    const runId = workflowRun === null ? null : optInt(workflowRun, "databaseId");
+    const workflow = workflowRun !== null && isObject(workflowRun.workflow) ? optStr(workflowRun.workflow, "name") : null;
+    const actions = isObject(suite.app) && suite.app.slug === "github-actions" && runId !== null;
+    const id = int(node, "databaseId");
+    const check = {
+      id: `run:${id}`,
+      name: str(node, "name"),
+      status: str(node, "status"),
+      conclusion: optStr(node, "conclusion") ?? "",
+      detailsUrl: optStr(node, "detailsUrl"),
+      runId: actions ? runId : null,
+      rerunnable: actions,
+    };
+    return run(check, workflow, optStr(node, "startedAt"), id);
   }
   if (node.__typename === "StatusContext") {
     const name = str(node, "context");
     const state = str(node, "state");
     const pending = state === "PENDING" || state === "EXPECTED";
-    return [
-      {
-        id: `status:${name}:${str(node, "createdAt")}`,
-        name,
-        status: pending ? "PENDING" : "COMPLETED",
-        conclusion: pending ? "" : state,
-        detailsUrl: optStr(node, "targetUrl"),
-        runId: null,
-        rerunnable: false,
-      },
-    ];
+    const createdAt = str(node, "createdAt");
+    const check = {
+      id: `status:${name}:${createdAt}`,
+      name,
+      status: pending ? "PENDING" : "COMPLETED",
+      conclusion: pending ? "" : state,
+      detailsUrl: optStr(node, "targetUrl"),
+      runId: null,
+      rerunnable: false,
+    };
+    return run(check, null, createdAt, null);
   }
   return [];
 }

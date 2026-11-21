@@ -176,6 +176,14 @@ describe("land", () => {
     expect(refusals(queued, "x", fakeGh(queued, { statusCheckRollup: [run("SUCCESS", "2026-11-04T14:07:36Z"), run("", "0001-01-01T00:00:00Z", "QUEUED")] }).gh)).toEqual(["checks not passed: CI / e2e"]);
   });
 
+  test("runs started in the same second count by the one that completed last", () => {
+    const same = "2026-11-04T14:07:36Z";
+    const run = (conclusion: string, completedAt: string) => ({ __typename: "CheckRun", name: "e2e", workflowName: "CI", status: "COMPLETED", conclusion, startedAt: same, completedAt });
+    const s = setup();
+    const rollup = [run("SUCCESS", "2026-11-04T14:12:00Z"), run("CANCELLED", "2026-11-04T14:07:37Z")];
+    expect(land(s.work, "x", fakeGh(s, { statusCheckRollup: rollup }).gh, NOW, "2026-10-25")).toMatchObject({ pr: 7 });
+  });
+
   test("a solo repo with no review requirement lands the user's own PR on their /fbs:land", () => {
     const s = setup();
     expect(land(s.work, "x", fakeGh(s, { reviewDecision: "" }).gh, NOW, "2026-10-25")).toMatchObject({ pr: 7 });

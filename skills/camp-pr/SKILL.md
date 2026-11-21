@@ -1,6 +1,6 @@
 ---
 name: camp-pr
-description: "Work an open PR until it is ready to land: a watcher wakes the agent once per settled round, every review comment and CI failure is verified and triaged together (fix, decline once, follow-up or ask), fixes are built and re-verified before one push per round, a fix budget leads to one checkpoint with the user, replies and resolved threads keep reviewers informed, the draft is marked ready when green, and follow-ups become tickets once, at green. Only adds commits, never merges."
+description: "Work an open PR until it is ready to land: a watcher wakes the agent once per round, not per event, every review comment and CI failure is verified and triaged together (fix, decline once, follow-up or ask), fixes are built and re-verified before one push per round, a fix budget leads to one checkpoint with the user, replies and resolved threads keep reviewers informed, the draft is marked ready when green, and follow-ups become tickets once, at green. Only adds commits, never merges."
 disable-model-invocation: true
 argument-hint: "[feature slug]"
 allowed-tools: Bash(fbs *)
@@ -39,7 +39,7 @@ Its report is the last line of its stdout, one JSON object (progress lines go to
 
 - **0, approved and green:** say it's ready to land and that they can tell you to merge it, and start the watcher again.
 - **2, usage or environment error** (`gh` missing, not signed in, PR not found): report the message, run `fbs camp stop <slug>`, stop.
-- **3, activity:** triage the round (step 4), act on it (step 5), start the watcher again.
+- **3, activity:** triage the round (step 4), act on it (step 5), start the watcher again. A human comment wakes it at once; bot comments once a poll brings no new one, even while checks still run (`pendingChecks` above 0); failing checks on their own once every check has finished. A wake before every check has finished carries the failures seen so far, and a later failure on the same head still wakes it. Only the newest run of each check counts; a bot editing its comment wakes it only when the text changes, not just a link.
 - **4, closed or merged:** report it (a unit in a stack: the stack section's rule instead). Merged: run `fbs stack sync <slug>`, which records a merge done outside `fbs land` (the guard keys on records with an open PR; `fbs land` records its own). Closed without merging: clear the record's link with `fbs status pr <slug> none`, so the record never points at a dead PR. Then run `fbs camp stop <slug>` and stop.
 - **5, timeout, or 7, query error:** report it and say `/fbs:assemble <slug>` resumes the camp. Nothing was marked seen, so the next watch reports it all again.
 - **6, conflict:** the base moved under the PR (step 5, "Base").
@@ -63,7 +63,7 @@ Also:
 
 - **A finding on lines the previous round just changed** is a sign that fix was wrong: rethink it and make a better fix in this round, never a patch on the patch.
 - **Never decline the same finding twice.** If it comes back, fix it, make it a follow-up, or ask the user.
-- **Failing checks:** one with `rerunnable: true` that didn't fail on the previous head (`failedOnPreviousHead: false`) and fails in code the diff never touched gets **one** rerun (`gh run rerun <runId> --failed`); an identical second failure is real. A check that isn't rerunnable is treated as real. A failure caused by the base moving (`git merge-base --is-ancestor origin/<base> HEAD` is false after `git fetch`) is handled as "Base" in step 5.
+- **Failing checks:** one with `rerunnable: true` that didn't fail on the previous head (`failedOnPreviousHead: false`) and fails in code the diff never touched gets **one** rerun (`gh run rerun <runId> --failed`); an identical second failure is real. Hold the rerun while its run still has jobs going (`runInProgress: true`): `gh run rerun` refuses then, and the watcher reports the check again once its run finishes. A check that isn't rerunnable is treated as real. A failure caused by the base moving (`git merge-base --is-ancestor origin/<base> HEAD` is false after `git fetch`) is handled as "Base" in step 5.
 
 By phase. The budget is `autoFixRounds` rounds that fixed something (`.fbs/config.json` `camp.autoFixRounds`, default 2):
 
@@ -77,7 +77,7 @@ By phase. The budget is `autoFixRounds` rounds that fixed something (`.fbs/confi
 2. **Base:** when the base moved or conflicts, and the PR's base is another feature's branch, run `fbs stack sync <slug>` first: when that feature has landed, its `restack` moves this branch onto the default branch (`null`: nothing was due; `done: false`: as assemble's stack paragraph says). Otherwise `git fetch origin` and `git merge origin/<base>` (review fixes never rebase); a merge conflict is a task for implement. Ranges from here on use `git merge-base HEAD origin/<base>`.
 3. **Follow-ups:** record each with `fbs camp followup <slug> --thread <its key> --summary '<the finding>' --why '<why it's out of scope>'` (in a stack, `--unit <unit slug>`). It's kept outside the tree, so the stamp still holds.
 4. **Fix:** the fixes are changes found in review: load `fbs:changes` and follow it (usually build level), then continue into implement in its **review-round** mode, which builds and reviews just these tasks. Then run verify; any change makes the stamp stale.
-5. **Push once for the round:** wait until the checks on the current head have finished (`gh pr checks <pr> --watch`), then `fbs push <slug>`: once the PR is open it only adds commits, never forces. A `refused:` is reported to the user, never forced past.
+5. **Push once for the round:** wait until the checks on the current head have finished (`gh pr checks <pr> --watch`, with Bash `run_in_background` when the report's `pendingChecks` was above 0, since it can outlast a foreground call; its exit wakes you), then `fbs push <slug>`: once the PR is open it only adds commits, never forces. A `refused:` is reported to the user, never forced past.
 6. **Reply**, after the push, so the commits you cite exist: for each comment, write the reply with the Write tool to a file under `<git common dir>/fbs/pr/` (never through a shell command: the guard blocks shell text that mentions landing) and send it with `fbs pr reply <slug> --comment <its key from the report, such as thread:123 or thread:PRRT_…> --body-file <file>`: what was fixed and where (`path:line`, the commit), why it was declined, or that it's recorded for a follow-up.
 7. **Resolve** each thread you fixed, declined or recorded as a follow-up with `fbs pr resolve <slug> --thread <PRRT_… id>`; leave threads waiting on the user open.
 8. **Record** the round: `fbs camp round <slug> --in <n> --fixed <n> --declined <n> --followups <n> --asked <n> --note '<each finding in a few words, with our call>'` (in a stack, `--unit <unit slug>`; the note never names the land command, which the guard denies). It prints how the next round with findings is handled: `continue`, `checkpoint` or `blockers-only`.

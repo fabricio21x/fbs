@@ -2,7 +2,7 @@ import { rmSync } from "node:fs";
 import { markLanded } from "./afk";
 import { campMarkerPath, freshToken, isSlug, type LandRequest, landTokenPath, landTokenSlug, pendingLandRequest, writeLandRequest } from "./guard";
 import { commitTree, fetchBranch, gitCommonDir } from "./git";
-import { GhError, type GhRunner } from "./github";
+import { GhError, type GhRunner, newestRuns } from "./github";
 import { plainFeaturesOn, type Restack, restackAbove, restackUnits } from "./stack";
 import { type FeatureRecord, type OverCheck, featurePr, featureUnits, isUnit, listFeatures, nextToLand, readFeature, StatusError, type UnitRecord, updateFeature } from "./status";
 
@@ -79,8 +79,12 @@ export function readLandFacts(gh: GhRunner, cwd: string, repo: string, pr: numbe
     author: typeof author?.login === "string" ? author.login : "",
     checks: newestRuns(
       raw.statusCheckRollup.map((c: Record<string, unknown>) => {
-        const started = Date.parse(String(c.startedAt));
-        return { check: toCheck(c), at: started > 0 ? started : Number.POSITIVE_INFINITY };
+        const check = toCheck(c);
+        const completed = check.state !== "pending";
+        // gh's JSON has no run id, so a tie in start time goes to the run that completed last, or the one still going.
+        const completedAt = Date.parse(typeof c.completedAt === "string" ? c.completedAt : "");
+        const order = !completed ? Number.POSITIVE_INFINITY : completedAt > 0 ? completedAt : null;
+        return { check, workflow: check.workflow ?? null, startedAt: typeof c.startedAt === "string" ? c.startedAt : null, completed, order, passed: check.state === "passed" };
       }),
     ),
   };
@@ -91,21 +95,6 @@ function toCheck(c: Record<string, unknown>): Check {
   const named = { name: String(c.name), ...(typeof c.workflowName === "string" && c.workflowName !== "" && { workflow: c.workflowName }) };
   if (c.status !== "COMPLETED") return { ...named, state: "pending" };
   return { ...named, state: PASSING.includes(String(c.conclusion)) ? "passed" : c.conclusion === "CANCELLED" ? "cancelled" : "failed" };
-}
-
-/**
- * The rollup keeps every run of a check on the head, superseded ones included (a run cancelled when an edit re-triggered
- * its workflow); only the newest counts, as in `gh pr checks`. A run with no start time is queued, so the newest; a tie
- * keeps the one that didn't pass.
- */
-function newestRuns(runs: { check: Check; at: number }[]): Check[] {
-  const newest = new Map<string, { check: Check; at: number }>();
-  for (const run of runs) {
-    const key = `${run.check.workflow ?? ""}\0${run.check.name}`;
-    const kept = newest.get(key);
-    if (kept === undefined || run.at > kept.at || (run.at === kept.at && kept.check.state === "passed")) newest.set(key, run);
-  }
-  return [...newest.values()].map((run) => run.check);
 }
 
 /** What the base branch's protection and rulesets require of a merge: check names, and why --admin may not merge past them. */

@@ -967,6 +967,7 @@ test("watch-pr --once prints the verdict as one JSON line, exits with its code a
     truncated: false,
     newComments: [{ id: 9, key: "issue:9", kind: "issue", threadId: null, author: "ana", bot: false, path: null, line: null, body: "Why?", createdAt: "2026-10-25T10:00:00Z", updatedAt: "2026-10-25T10:00:00Z", edited: false }],
     failingChecks: [],
+    pendingChecks: 0,
     unresolvedThreads: 0,
   });
   expect(calls.every((c) => c.args.includes("owner=acme") && c.args.includes("repo=app"))).toBe(true);
