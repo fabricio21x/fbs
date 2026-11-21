@@ -61,6 +61,32 @@ describe("fbs commits check", () => {
     expect(check(cwd, "check", "x")).toEqual({ code: 1, out: [`${wip.slice(0, 12)} wip`, `${upper.slice(0, 12)} Feat: capitalised`], err: [] });
   });
 
+  test("the whole message is held to commitlint config-conventional's limits: header and lines of 100 at most, a blank line after the header", () => {
+    const cwd = repo();
+    commit(cwd, `feat: ${"a".repeat(94)}\n\n${"b".repeat(100)}\n\nRefs: ACM-123`);
+    const header = `feat: ${"a".repeat(95)}`;
+    const long = commit(cwd, header);
+    const glued = commit(cwd, "fix: handle an empty list\nThe body starts right under the header.");
+    const body = commit(cwd, `docs: explain the booking window\n\nShort line.\n${"c".repeat(101)}`);
+    const footer = commit(cwd, `fix: retry the sync\n\nBody.\n\nReviewed-by: ${"d".repeat(90)}`);
+    expect(check(cwd, "check", "x")).toEqual({
+      code: 1,
+      out: [
+        `${long.slice(0, 12)} ${header} [header is 101 characters, over 100]`,
+        `${glued.slice(0, 12)} fix: handle an empty list [no blank line after the header]`,
+        `${body.slice(0, 12)} docs: explain the booking window [line 4 is 101 characters, over 100]`,
+        `${footer.slice(0, 12)} fix: retry the sync [line 5 is 103 characters, over 100]`,
+      ],
+      err: [],
+    });
+  });
+
+  test("a subject that isn't conventional and a message over the limits are listed on one line", () => {
+    const cwd = repo();
+    const wip = commit(cwd, `wip\n\n${"e".repeat(120)}`);
+    expect(check(cwd, "check", "x")).toEqual({ code: 1, out: [`${wip.slice(0, 12)} wip [line 3 is 120 characters, over 100]`], err: [] });
+  });
+
   test("merge commits are skipped", () => {
     const cwd = repo();
     commit(cwd, "feat: one");

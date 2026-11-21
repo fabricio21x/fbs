@@ -355,16 +355,19 @@ export function symlinksIn(cwd: string, tree: string): { path: string; target: s
     });
 }
 
-/** The non-merge commits in `from..to` not reachable from any of `excluded`, oldest first, each with its subject line. */
-export function nonMergeCommits(cwd: string, from: string, to: string, excluded: string[] = []): { sha: string; subject: string }[] {
+/** The non-merge commits in `from..to` not reachable from any of `excluded`, oldest first, each with its whole message. */
+export function nonMergeCommits(cwd: string, from: string, to: string, excluded: string[] = []): { sha: string; message: string }[] {
   const revisions = [`${from}..${to}`, ...excluded.map((ref) => `^${ref}`)];
   // A signature check would print into the log, so it's off whatever the user's config says.
-  const result = runGit(cwd, ["log", "--no-merges", "--reverse", "--no-show-signature", "--format=%H %s", "--end-of-options", ...revisions]);
+  const result = runGit(cwd, ["log", "-z", "--no-merges", "--reverse", "--no-show-signature", "--format=%H%n%B", "--end-of-options", ...revisions]);
   if (!result.ok) throw new GitError(`cannot list the commits in ${revisions.join(" ")}: ${firstLine(result.stderr)}`);
   return result.stdout
-    .split("\n")
-    .filter((line) => line !== "")
-    .map((line) => ({ sha: line.slice(0, line.indexOf(" ")), subject: line.slice(line.indexOf(" ") + 1) }));
+    .split("\0")
+    .filter((entry) => entry !== "")
+    .map((entry) => {
+      const at = entry.indexOf("\n");
+      return { sha: entry.slice(0, at), message: entry.slice(at + 1).replace(/\n+$/, "") };
+    });
 }
 
 /** True when `ancestor` is reachable from `commit`, or is it. */

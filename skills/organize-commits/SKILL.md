@@ -1,6 +1,6 @@
 ---
 name: organize-commits
-description: "Fold a feature branch's fix rounds and plan-status commits into their task commits, so a reviewer reads one commit per task, and make every subject a conventional commit. Non-interactive autosquash, then the stamp proves the code didn't change; on any doubt it keeps the history as it was. Never touches another branch."
+description: "Fold a feature branch's fix rounds and plan-status commits into their task commits, so a reviewer reads one commit per task, and make every message a conventional commit within commitlint's limits. Non-interactive autosquash, then the stamp proves the code didn't change; on any doubt it keeps the history as it was. Never touches another branch."
 disable-model-invocation: true
 argument-hint: "[feature slug]"
 allowed-tools: Bash(fbs *)
@@ -8,7 +8,7 @@ allowed-tools: Bash(fbs *)
 
 # Organize commits
 
-A reviewer should read the branch one task at a time, not through every fix round. Implement already wrote the history so it can fold itself: each task's commit carries a `Task:` trailer, fix rounds are `fixup!` commits of it, and plan-status updates are `fixup!` commits of the plan. This stage folds them, and rewords any subject that isn't a conventional commit. It is cosmetic: when anything doesn't go cleanly, the history stays as it was.
+A reviewer should read the branch one task at a time, not through every fix round. Implement already wrote the history so it can fold itself: each task's commit carries a `Task:` trailer, fix rounds are `fixup!` commits of it, and plan-status updates are `fixup!` commits of the plan. This stage folds them, and rewords any message that isn't a conventional commit within commitlint's limits. It is cosmetic: when anything doesn't go cleanly, the history stays as it was.
 
 Plugin root: `${CLAUDE_PLUGIN_ROOT}` (if this shows unexpanded, use the plugin root the calling skill gave you).
 
@@ -44,13 +44,13 @@ Run `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base>`. It is non-inte
 
 - **Conflict or failure:** `git rebase --abort`, then confirm `git rev-parse HEAD` is the recorded head. Say the history stays as it was, and why, in one line, and skip to section 4: subjects are only reworded on a folded branch.
 
-## 3. Conventional subjects
+## 3. Conventional messages
 
-Every commit follows Conventional Commits 1.0, whatever the project's history looks like. Run `fbs commits check <slug>`. On `ok`, go on. Otherwise, for each `<sha> <subject>` line it prints, write the subject it should have had (`<type>[(<scope>)]: <description>`, the type from what the commit does, its body kept) and reword it with an empty commit that the fold applies:
+Every commit follows Conventional Commits 1.0 and commitlint config-conventional's limits (a header and every line of 100 characters at most, a blank line after the header), whatever the project's history looks like; open-pr pushes right after this stage. Run `fbs commits check <slug>`, and when the repo has its own commitlint config (`commitlint.config.*`, `.commitlintrc*`, or a `commitlint` key in `package.json`) also its commitlint (`npx --no-install commitlint --from <base> --to HEAD`, or its package manager's equivalent). When both pass, go on. Otherwise, for each `<sha> <header> [<what breaks>]` line and each commit commitlint flags, write the message it should have had (a `<type>[(<scope>)]: <description>` header, the type from what the commit does; its body kept, wrapped at 100 characters) and reword it with an empty commit that the fold applies:
 
-`git commit --allow-empty -m 'amend! <its sha>' -m '<the new subject>' -m '<the old body, if any, trailers included>'`, writing each `'` inside as `'\''`
+`git commit --allow-empty -m 'amend! <its sha>' -m '<the new header>' -m '<the body, if any, trailers included>'`, writing each `'` inside as `'\''`
 
-Then fold again (`GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base>`) and run `fbs commits check <slug>` once more. On a failed fold, `git rebase --abort`; on a failed fold or anything but `ok`, `git reset --hard <recorded head>` and say which subjects stay unconventional. That never blocks the PR: land squash-merges under the PR's title, so only the title reaches the default branch.
+Then fold again (`GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base>`) and run both checks once more. On a failed fold, `git rebase --abort`; on a failed fold or a check that still fails, `git reset --hard <recorded head>` and say which commits still fail. The repo's commitlint failing means its CI will likely fail too: say so. Otherwise it never blocks the PR: land squash-merges under the PR's title, so only the title reaches the default branch.
 
 ## 4. Prove the code didn't change
 

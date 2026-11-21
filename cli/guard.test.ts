@@ -14,6 +14,8 @@ const ctx = (overrides: Partial<GuardContext> = {}): GuardContext => ({
   hasFreshToken: () => false,
   isCommit: () => false,
   isStepAbove: () => false,
+  sameTreeAsOrigin: () => false,
+  hasRewriteToken: () => false,
   ...overrides,
 });
 
@@ -115,6 +117,48 @@ describe("commandDenials", () => {
     expect(commandDenials("git push origin feat/x", open)).toEqual([]);
     expect(commandDenials("fbs push x", open)).toEqual([]);
     expect(commandDenials("git push --force-with-lease origin feat/x", ctx({ openPrs: () => { throw new Error("broken"); } }))).toEqual([]);
+  });
+
+  test("a lease push to an open PR's branch passes when the commit pushed has the tree origin's tip has", () => {
+    const pushed: string[] = [];
+    const sameTree = (source: string) => (src: string, branch: string) => {
+      pushed.push(`${src} -> ${branch}`);
+      return src === source && branch === "feat/x";
+    };
+    const open = (source: string) => ctx({ openPrs: () => [{ slug: "x", branch: "feat/x" }], sameTreeAsOrigin: sameTree(source) });
+    expect(commandDenials("git push --force-with-lease", open("HEAD"))).toEqual([]);
+    expect(commandDenials("git push --force-with-lease origin feat/x", open("feat/x"))).toEqual([]);
+    expect(commandDenials("git push --force-with-lease origin HEAD:feat/x", open("HEAD"))).toEqual([]);
+    expect(commandDenials("git push --force-with-lease=feat/x origin abc123:refs/heads/feat/x", open("abc123"))).toEqual([]);
+    expect(pushed).toEqual(["HEAD -> feat/x", "feat/x -> feat/x", "HEAD -> feat/x", "abc123 -> feat/x"]);
+    expect(commandDenials("git push --force-with-lease origin HEAD:feat/x", open("feat/x")).join("\n")).toContain("rewrites feat/x");
+  });
+
+  test("the tree pass needs the lease on origin's tip, read where the trees are: no explicit expected value, -C, other git dir or cd", () => {
+    const same = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x" }], sameTreeAsOrigin: () => true });
+    for (const command of [
+      "git push --force-with-lease=feat/x:abc123 origin feat/x",
+      "git -C ../other push --force-with-lease origin feat/x",
+      "git --git-dir=../other/.git push --force-with-lease origin feat/x",
+      "GIT_DIR=../other/.git git push --force-with-lease origin feat/x",
+      "cd ../other && git push --force-with-lease origin feat/x",
+    ]) {
+      expect(commandDenials(command, same).join("\n")).toContain("rewrites feat/x");
+    }
+  });
+
+  test("a rewrite token lets a lease push through; --force, -f and a + refspec stay denied with it or the same tree", () => {
+    const allowed = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x" }], hasRewriteToken: () => true, sameTreeAsOrigin: () => true });
+    expect(commandDenials("git push --force-with-lease origin feat/x", allowed)).toEqual([]);
+    for (const command of ["git push --force origin feat/x", "git push -f origin feat/x", "git push origin +feat/x", "git push --force-with-lease --force origin feat/x", "git push --force-with-lease origin +HEAD:feat/x"]) {
+      expect(commandDenials(command, allowed).join("\n")).toContain("use --force-with-lease alone");
+    }
+  });
+
+  test("a lease push's denial names the two ways through: a messages-only amend, or the user's own words", () => {
+    const reason = commandDenials("git push --force-with-lease origin feat/x", ctx({ openPrs: () => [{ slug: "x", branch: "feat/x" }] })).join("\n");
+    expect(reason).toContain("only messages changed");
+    expect(reason).toContain("ask the user in plain words");
   });
 
   test("a nested claude run can't answer a land request: no resumed or continued session, no land prompt", () => {
@@ -697,6 +741,109 @@ describe("a plain-words request to land", () => {
   });
 });
 
+describe("rewriting an open PR's branch", () => {
+  const say = (cwd: string, prompt: string, session: unknown = "s1") => guardReply(JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: session, transcript_path: "/t.jsonl", cwd, prompt }), cwd, NOW);
+  const push = (cwd: string, command = "git push --force-with-lease origin feat/x", session = "s1") => guardToolUse(JSON.stringify({ hook_event_name: "PreToolUse", session_id: session, cwd, tool_name: "Bash", tool_input: { command } }), cwd, NOW).deny;
+
+  /** A repo on feat/x, the branch of x's open PR, whose tip origin has. */
+  function prBranch(): { dir: string; git: (...args: string[]) => string } {
+    const dir = repo();
+    const git = (...args: string[]) => {
+      const result = Bun.spawnSync(["git", "-c", "user.name=fbs", "-c", "user.email=fbs@example.com", "-c", "commit.gpgsign=false", ...args], { cwd: dir, env: isolatedGitEnv(), stdout: "pipe", stderr: "pipe" });
+      expect(result.exitCode).toBe(0);
+      return result.stdout.toString().trim();
+    };
+    git("switch", "-q", "-c", "feat/x");
+    writeFileSync(join(dir, "a.txt"), "one\n");
+    git("add", "a.txt");
+    git("commit", "-q", "-m", `fix: a body line that is far too long\n\n${"x".repeat(120)}`);
+    git("update-ref", "refs/remotes/origin/feat/x", "HEAD");
+    prRecord(dir, "x");
+    return { dir, git };
+  }
+
+  /** prBranch with the tip's tree changed under the same message: a rewrite only the user's go lets through. */
+  function rewritten(): string {
+    const { dir, git } = prBranch();
+    writeFileSync(join(dir, "a.txt"), "two\n");
+    git("commit", "-q", "--amend", "-a", "--no-edit");
+    return dir;
+  }
+
+  test("a messages-only amend passes on its own; a change to the tree is denied", () => {
+    const { dir, git } = prBranch();
+    git("commit", "-q", "--amend", "-m", "fix: a body line that fits");
+    expect(push(dir)).toEqual([]);
+    expect(push(dir, "git push --force-with-lease")).toEqual([]);
+    expect(push(dir, "git push --force origin feat/x").join("\n")).toContain("use --force-with-lease alone");
+    writeFileSync(join(dir, "a.txt"), "two\n");
+    git("commit", "-q", "--amend", "-a", "--no-edit");
+    expect(push(dir).join("\n")).toContain("rewrites feat/x");
+  });
+
+  test.each(["go ahead and amend it", "force push it", "squash those commits", "rebase it onto main", "you can rewrite the history", "please do the amendment on the commit, I give you permission to execute it this time"])("%p lets one lease push through from this session", (prompt) => {
+    const dir = rewritten();
+    expect(push(dir)).toHaveLength(1);
+    const note = say(dir, prompt);
+    expect(note).toContain("may ask to rewrite");
+    expect(note).toContain("--force-with-lease alone");
+    expect(push(dir, "git push --force-with-lease origin feat/x", "s2")).toHaveLength(1);
+    expect(push(dir)).toEqual([]);
+    expect(push(dir)).toHaveLength(1);
+  });
+
+  test("a denied push leaves the token, and a push the tree or another branch lets through doesn't spend it", () => {
+    const { dir, git } = prBranch();
+    say(dir, "go ahead and force push it");
+    expect(push(dir, "git push --force origin feat/x")).toHaveLength(1);
+    expect(push(dir, "git push --force-with-lease origin feat/other")).toEqual([]);
+    git("commit", "-q", "--amend", "-m", "fix: reworded");
+    expect(push(dir)).toEqual([]);
+    writeFileSync(join(dir, "a.txt"), "two\n");
+    git("commit", "-q", "--amend", "-a", "--no-edit");
+    expect(push(dir)).toEqual([]);
+    expect(push(dir)).toHaveLength(1);
+  });
+
+  test("the go lasts until the user's next message that doesn't ask for it; notifications and other sessions keep it", () => {
+    const dir = rewritten();
+    say(dir, "rebase it onto main");
+    expect(say(dir, "<task-notification><summary>watcher: green</summary></task-notification>")).toBeNull();
+    expect(say(dir, "rename the button", "s2")).toBeNull();
+    expect(push(dir)).toEqual([]);
+    say(dir, "and squash it while you're at it");
+    expect(say(dir, "also fix the typo")).toBeNull();
+    expect(push(dir)).toHaveLength(1);
+  });
+
+  test.each(["don't force push", "do not rebase it", "never amend a pushed commit", "squash-merge the PR", "squash and merge it", "rewrite the landing page copy", "/fbs:camp-pr x", "<task-notification>force push it</task-notification>", `${"context ".repeat(60)}force push it`])("%p writes no rewrite token", (prompt) => {
+    const dir = rewritten();
+    expect(say(dir, prompt) ?? "").not.toContain("rewrite");
+    expect(push(dir)).toHaveLength(1);
+  });
+
+  test("no open PR or no session writes nothing", () => {
+    const dir = repo();
+    record(dir, "x");
+    expect(say(dir, "force push it")).toBeNull();
+    expect(existsSync(join(dir, ".git", "fbs", "land"))).toBe(false);
+    const open = rewritten();
+    for (const session of [null, "", 3]) expect(say(open, "force push it", session)).toBeNull();
+    expect(push(open)).toHaveLength(1);
+  });
+
+  test("a scheduled prompt that asks to rewrite is denied like a land ask, in an fbs repo before any PR opens", () => {
+    const dir = repo();
+    record(dir, "x", false);
+    const tool = (tool_name: string, tool_input: Record<string, unknown>) => guardToolUse(JSON.stringify({ hook_event_name: "PreToolUse", cwd: dir, tool_name, tool_input }), dir, NOW).deny;
+    expect(tool("CronCreate", { cron: "0 9 * * *", prompt: "rebase it onto main and force push it" }).join("\n")).toContain("only the user asks");
+    expect(tool("Skill", { skill: "loop", args: "10m squash those commits" }).join("\n")).toContain("only the user asks");
+    expect(tool("CronCreate", { cron: "0 9 * * *", prompt: "run the nightly report" })).toEqual([]);
+    prRecord(dir, "y");
+    expect(tool("Bash", { command: "claude -p 'go ahead and force push it'" })[0]).toContain("claude run");
+  });
+});
+
 describe("afkDenials", () => {
   const RUN: AfkGuardRun = { slug: "seo", worktree: "/wt", branch: "fbs/seo", protectedFiles: ["e2e/home.spec.ts", "e2e/a.spec.ts", "e2e/x.ts", "e2e/n.ipynb", "src/app.test.ts"], deny: ["prod.db.internal"], kept: "k".repeat(40), status: "running", ownsCall: true };
   const deny = (tool: string, input: Record<string, unknown>, cwd = "/wt", run: Partial<AfkGuardRun> = {}, refs: string[] = [], above: string[] = []) =>
@@ -1098,6 +1245,8 @@ describe("guardToolUse during an afk run", () => {
     expect(outcome(dir, "yes")).toEqual([0, "", ""]);
     expect(outcome(dir, "rename the button")).toEqual([0, "", ""]);
     for (const prompt of ["go ahead and merge it", "Land #7", "ship it"]) expect(outcome(dir, prompt)).toEqual([0, "called\n", ""]);
+    for (const prompt of ["go ahead and amend it", "do the amendment", "Force-push it", "squash those commits", "rebase it onto main", "you can rewrite the history"]) expect(outcome(dir, prompt)).toEqual([0, "called\n", ""]);
+    expect(outcome(none, "force push it")).toEqual([0, "", ""]);
     writeLandRequest(join(dir, ".git"), { slug: "x", pr: 7, tree: TREE, at: NOW, session: "s1" });
     expect(outcome(dir, "yes")).toEqual([0, "called\n", ""]);
     // A token outstanding: any prompt may be the one that drops it.
@@ -1117,6 +1266,8 @@ describe("guardToolUse during an afk run", () => {
     record(dir, "x", false);
     expect(hook(dir, "CronCreate", { cron: "0 * * * *", prompt: "merge it when approved" })).toBe(2);
     expect(hook(dir, "Skill", { skill: "loop", args: "5m land it" })).toBe(2);
+    expect(hook(dir, "CronCreate", { cron: "0 * * * *", prompt: "rebasing onto main, then force-push it" })).toBe(2);
+    expect(hook(dir, "Skill", { skill: "loop", args: "10m squash those commits" })).toBe(2);
     expect(hook(dir, "CronCreate", { cron: "0 * * * *", prompt: "run the nightly report" })).toBe(0);
     expect(hook(dir, "Bash", { command: "git merge main" })).toBe(0);
     expect(hook(repo(), "CronCreate", { cron: "0 * * * *", prompt: "merge it when approved" })).toBe(0);

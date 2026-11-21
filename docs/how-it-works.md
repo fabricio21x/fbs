@@ -79,7 +79,8 @@ Every feature lives on its own branch from the moment it has a record, so no sta
 - The stages follow the repo's convention: `fbs branch --types` gives the types to pick from, which are `branches.types` from `.fbs/config.json` when set (then no other type is accepted, and a `--ticket` rename before the PR moves a branch into an allowed type), else the family the repo's 50 most recently committed typed branches use, else `feature`, `bugfix`, `hotfix` and `chore`.
 - A feature built on another feature's unmerged work branches from it (`--parent`), and its PR stacks on that one. The default branch, or any other, is used only when you name it for that feature (`--use`).
 - `fbs push <slug>` pushes only the feature's branch, never the default branch. Before the PR opens it overwrites only what fbs pushed last; after, it only adds commits.
-- Commits are Conventional Commits. `organize-commits` rewords any subject that isn't one before the PR opens, and the PR title is one too, because land squash-merges under it.
+- Commits are Conventional Commits within commitlint config-conventional's limits (a header and every line of 100 characters at most). `organize-commits` rewords any message that breaks them before the PR opens, camp-pr checks each round's commits before it pushes, and both also run the repo's own commitlint when it has a config. The PR title is a Conventional Commit too, because land squash-merges under it.
+- Once the PR is open its branch only gains commits. A `--force-with-lease` push that keeps origin's tree (only messages changed) passes; any other rewrite needs you to ask for it in your own words ("go ahead and force push it"), which lets one such push through.
 
 ## The verify stamp
 

@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { type Run, runConfig } from "./afk";
-import { commitOf, currentBranch, gitCommonDir, mergeBase, originDefaultBranch } from "./git";
+import { commitOf, commitTree, currentBranch, gitCommonDir, mergeBase, originDefaultBranch } from "./git";
 import { type FeatureRecord, featureUnits, isUnit, listFeatures, nextToLand, type OverCheck, readFeature, readOverChecks, recordPath } from "./status";
 
 const SLUG = /^[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -88,10 +88,14 @@ export interface LandToken {
 }
 
 export function writeLandToken(commonDir: string, token: LandToken): void {
-  const path = landTokenPath(commonDir, token.slug);
-  mkdirSync(join(commonDir, "fbs", "land"), { recursive: true });
+  writeJson(landTokenPath(commonDir, token.slug), token);
+}
+
+/** Write `value` to `path` whole or not at all, so the guard never reads half a token or request. */
+function writeJson(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.${process.pid}.tmp`;
-  writeFileSync(temp, `${JSON.stringify(token)}\n`);
+  writeFileSync(temp, `${JSON.stringify(value)}\n`);
   renameSync(temp, path);
 }
 
@@ -132,11 +136,7 @@ export interface LandRequest {
 
 /** One pending request per repo; requestLand refuses a second feature while one is live, and the same feature refreshes it. */
 export function writeLandRequest(commonDir: string, request: LandRequest): void {
-  const path = landRequestPath(commonDir);
-  mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.${process.pid}.tmp`;
-  writeFileSync(temp, `${JSON.stringify(request)}\n`);
-  renameSync(temp, path);
+  writeJson(landRequestPath(commonDir), request);
 }
 
 /** What the push and land rules need to know about the repo. */
@@ -149,6 +149,31 @@ export interface GuardContext {
   isCommit: (ref: string) => boolean;
   /** True when `ref`, read in `dir`, is a commit above `kept`: an unchecked step. */
   isStepAbove: (dir: string, ref: string, kept: string) => boolean;
+  /** True when `source` (what a push sends) has the tree of origin's `branch`: only messages changed. */
+  sameTreeAsOrigin: (source: string, branch: string) => boolean;
+  /** True when this session's user gave a go to rewrite an open PR's branch that is still fresh. */
+  hasRewriteToken: () => boolean;
+}
+
+/** The one-time go to rewrite an open PR's branch; `_` keeps it apart from every slug's land token. */
+export function rewriteTokenPath(commonDir: string): string {
+  return join(commonDir, "fbs", "land", "_rewrite.token");
+}
+
+/** Written from the user's own message asking to amend, rebase, squash or force-push; only that session's next lease push takes it. */
+export interface RewriteToken {
+  session: string;
+  at: number;
+}
+
+function freshRewriteToken(commonDir: string, now: number): RewriteToken | null {
+  try {
+    const token = JSON.parse(readFileSync(rewriteTokenPath(commonDir), "utf8"));
+    const fresh = typeof token.session === "string" && token.session !== "" && Number.isInteger(token.at) && token.at <= now && now - token.at < TOKEN_TTL_MS;
+    return fresh ? { session: token.session, at: token.at } : null;
+  } catch {
+    return null;
+  }
 }
 
 const DEFAULT_BRANCHES = ["main", "master"];
@@ -191,12 +216,12 @@ function stringsIn(value: unknown): string[] {
 // These come back later as an unframed prompt in a session, where a merge request or a yes would write a land token.
 const PROMPT_SENDERS = ["CronCreate", "ScheduleWakeup", "RemoteTrigger"];
 
-/** A scheduled prompt (or a /loop) that asks to land or says yes: denied in an fbs repo even before a PR opens, since it fires later. */
+/** A scheduled prompt (or a /loop) that asks to land or rewrite, or says yes: denied in an fbs repo even before a PR opens, since it fires later. */
 export function promptSenderDenials(toolName: string, toolInput: Record<string, unknown>): string[] {
   const loop = toolName === "Skill" && typeof toolInput.skill === "string" && /(^|:)loop$/.test(toolInput.skill);
   if (!PROMPT_SENDERS.includes(toolName) && !loop) return [];
-  const asks = stringsIn(toolInput).some((text) => landIntent(stripLoop(text)) || landAnswer(stripLoop(text)) !== null);
-  return asks ? [`${toolName} would send a request to merge, or a yes, as if the user typed it; only the user asks to land`] : [];
+  const asks = stringsIn(toolInput).some((text) => landIntent(stripLoop(text)) || rewriteIntent(stripLoop(text)) || landAnswer(stripLoop(text)) !== null);
+  return asks ? [`${toolName} would send a request to merge or rewrite a branch, or a yes, as if the user typed it; only the user asks to land or rewrite`] : [];
 }
 
 /** The text after a /loop and an interval such as `5m`. */
@@ -251,8 +276,10 @@ export function commandDenials(command: string, ctx: GuardContext): string[] {
   }
   const segments = text.split(SEGMENT_BREAK).map((segment) => segment.trim().split(/\s+/).filter((t) => t !== ""));
   const echoed = segments.some((tokens) => echoesReply(tokens));
+  // The trees are read in the hook's cwd, so a push run from anywhere else gets no pass from them.
+  const elsewhere = segments.some((tokens) => tokens[0] === "cd" || tokens[0] === "pushd") || /\bGIT_(DIR|WORK_TREE)=|(^|\s)(-C|--git-dir|--work-tree)(\s|=)/.test(text);
   for (const tokens of segments) {
-    for (const reason of [...ghMerge(tokens), ...gitPush(tokens, ctx), ...fbsLand(tokens, ctx), ...claudeSession(tokens, echoed)]) reasons.add(reason);
+    for (const reason of [...ghMerge(tokens), ...gitPush(tokens, ctx, elsewhere), ...fbsLand(tokens, ctx), ...claudeSession(tokens, echoed)]) reasons.add(reason);
   }
   return [...reasons];
 }
@@ -265,9 +292,9 @@ function claudeSession(tokens: string[], echoed: boolean): string[] {
   if (at === -1) return [];
   const args = tokens.slice(at + 1);
   const words = args.filter((a) => !a.startsWith("-"));
-  const answers = echoed || words.some(isScheduledReply) || isScheduledReply(words.join(" ")) || landIntent(words.join(" "));
+  const answers = echoed || words.some(isScheduledReply) || isScheduledReply(words.join(" ")) || landIntent(words.join(" ")) || rewriteIntent(words.join(" "));
   if (!args.some((a) => RESUME_FLAG.test(a)) && !answers) return [];
-  return ["a claude run that resumes a session or carries a land answer could answer the land request as if the user typed it; only the user answers it"];
+  return ["a claude run that resumes a session or carries a land answer or a rewrite ask could answer as if the user typed it; only the user answers it"];
 }
 
 function echoesReply(tokens: string[]): boolean {
@@ -275,7 +302,7 @@ function echoesReply(tokens: string[]): boolean {
   if (at === -1) return false;
   // The quotes and backslashes are stripped by now, so printf's `land\n` reads `landn`.
   const said = tokens.slice(at + 1).filter((a) => !a.startsWith("-")).join(" ").replace(/%s/g, "").trim();
-  return isScheduledReply(said) || isScheduledReply(said.replace(/n$/, "")) || landIntent(said);
+  return isScheduledReply(said) || isScheduledReply(said.replace(/n$/, "")) || landIntent(said) || rewriteIntent(said);
 }
 
 function ghMerge(tokens: string[]): string[] {
@@ -291,7 +318,7 @@ function ghMerge(tokens: string[]): string[] {
 
 const GIT_OPTIONS_WITH_VALUE = ["-C", "-c", "--git-dir", "--work-tree", "--namespace"];
 
-function gitPush(tokens: string[], ctx: GuardContext): string[] {
+function gitPush(tokens: string[], ctx: GuardContext, elsewhere: boolean): string[] {
   const git = tokens.findIndex((t) => basename(t) === "git");
   if (git === -1) return [];
   let i = git + 1;
@@ -314,11 +341,36 @@ function gitPush(tokens: string[], ctx: GuardContext): string[] {
   if (unsafe !== undefined) reasons.push(`git push to the default branch (${unsafe ?? "unknown branch"}); ${ONLY_USER}`);
   // fbs land and fbs stack sync lease-push from inside the CLI, which this hook never sees.
   const lease = flags.find((f) => f.startsWith("--force-with-lease") || f === "--force-if-includes");
-  const open = lease === undefined ? undefined : openPrsOf(ctx).find((pr) => pr.branch !== null && targets.includes(pr.branch));
-  if (lease !== undefined && open !== undefined) {
-    reasons.push(`git push ${lease} rewrites ${open.branch}, the branch of ${open.slug}'s open PR, which only gains commits: merge instead of rebasing, and to restack units run fbs stack sync ${open.slug}. If that PR was already merged, run fbs stack sync ${open.slug} first: it records the landing, and this guard then lets the push through`);
+  if (lease === undefined) return reasons;
+  const sources = refspecs.length === 0 ? ["HEAD"] : refspecs.map(source);
+  // An explicit expected value would let a forged origin/<branch> stand in for what the push overwrites.
+  const onOriginTip = !elsewhere && !flags.some((f) => f.startsWith("--force-with-lease=") && f.includes(":"));
+  const open = openPrsOf(ctx);
+  for (const [n, target] of targets.entries()) {
+    const pr = open.find((p) => p.branch !== null && p.branch === target);
+    if (pr === undefined || pr.branch === null) continue;
+    if ((onOriginTip && sameTree(ctx, sources[n], pr.branch)) || rewriteToken(ctx)) continue;
+    reasons.push(
+      `git push ${lease} rewrites ${pr.branch}, the branch of ${pr.slug}'s open PR. A push that keeps the tree origin has (only messages changed, after an amend or a reword), run from this directory, goes through on its own. Any other rewrite (a rebase, a squash, a changed commit) needs the user's go: ask the user in plain words, and their answer naming it ("go ahead and force push it") lets one --force-with-lease push through. To bring in the base, merge instead; to restack units run fbs stack sync ${pr.slug}, and if that PR was already merged, run fbs stack sync ${pr.slug} first: it records the landing, and this guard then lets the push through`,
+    );
   }
   return reasons;
+}
+
+function sameTree(ctx: GuardContext, source: string, branch: string): boolean {
+  try {
+    return source !== "" && ctx.sameTreeAsOrigin(source, branch);
+  } catch {
+    return false;
+  }
+}
+
+function rewriteToken(ctx: GuardContext): boolean {
+  try {
+    return ctx.hasRewriteToken();
+  } catch {
+    return false;
+  }
 }
 
 function openPrsOf(ctx: GuardContext): OpenPr[] {
@@ -327,6 +379,12 @@ function openPrsOf(ctx: GuardContext): OpenPr[] {
   } catch {
     return [];
   }
+}
+
+/** What a refspec pushes: the side before `:`, or the whole refspec. */
+function source(refspec: string): string {
+  const spec = refspec.replace(/^\+/, "");
+  return spec.includes(":") ? spec.slice(0, spec.lastIndexOf(":")) : spec;
 }
 
 function destination(refspec: string): string {
@@ -623,6 +681,11 @@ export function repoContext(cwd: string, commonDir: string, now: number, session
         return false;
       }
     },
+    sameTreeAsOrigin: (source, branch) => {
+      const tree = commitTree(cwd, source);
+      return tree !== null && tree === commitTree(cwd, `refs/remotes/origin/${branch}`);
+    },
+    hasRewriteToken: () => session !== null && freshRewriteToken(commonDir, now)?.session === session,
   };
 }
 
@@ -679,7 +742,12 @@ export function guardToolUse(raw: string, fallbackCwd: string, now: number): Gua
     if (campRules && /mcp__\S*__merge_pull_request/.test(raw)) deny.push(`a merge_pull_request MCP tool merges a PR; ${ASK_TO_LAND}`);
     return { deny };
   }
-  return { deny: [...new Set([...(campRules ? denials(toolName, toolInput, cwd, ctx) : []), ...afkDenials(toolName, toolInput, cwd, commonDir, runs, ctx)])] };
+  const deny = [...new Set([...(campRules ? denials(toolName, toolInput, cwd, ctx) : []), ...afkDenials(toolName, toolInput, cwd, commonDir, runs, ctx)])];
+  // The rewrite token is one push: spent on the call it alone let through.
+  if (deny.length === 0 && campRules && ctx.hasRewriteToken() && denials(toolName, toolInput, cwd, { ...ctx, hasRewriteToken: () => false }).length > 0) {
+    rmSync(rewriteTokenPath(commonDir), { force: true });
+  }
+  return { deny };
 }
 
 const LAND_COMMANDS = ["land", "fbs:land"];
@@ -747,9 +815,30 @@ const INTENT_MAX_LENGTH = 400;
  * mention it; the agent judges whether they ask for it now. "merge main into it" and a negation never count.
  */
 export function landIntent(prompt: string): boolean {
+  return mayAsk(prompt, INTENT);
+}
+
+const REWRITE_INTENT = [
+  /\bamend(?:s|ed|ing|ment)?\b/i,
+  /\bforce[- ]?push|--force\b/i,
+  /\bsquash(?:es|ed|ing)?\b(?![- ]?(?:and[- ])?merge)/i,
+  /\brebas(?:e|es|ed|ing)\b/i,
+  /\breword(?:s|ed|ing)?\b/i,
+  /\brewrit(?:e|es|ing|ten)\b[^.?!]{0,40}\b(?:history|commits?|messages?|branch)\b/i,
+];
+
+/**
+ * Whether a prompt may ask to rewrite a branch ("go ahead and amend it", "force push it", "squash those commits"): like
+ * landIntent, it only says the user's own words mention it, and the agent judges whether they ask for it now.
+ */
+export function rewriteIntent(prompt: string): boolean {
+  return mayAsk(prompt, REWRITE_INTENT);
+}
+
+function mayAsk(prompt: string, patterns: RegExp[]): boolean {
   const text = normalized(prompt);
   if (text === "" || text.length > INTENT_MAX_LENGTH || text.startsWith("/") || NEGATION.test(text)) return false;
-  return INTENT.some((pattern) => pattern.test(text));
+  return patterns.some((pattern) => pattern.test(text));
 }
 
 /** A subagent report, a notification or another session's message, which arrive as prompts but never from the user. */
@@ -767,11 +856,12 @@ function namedPrs(prompt: string): number[] {
   return [...prompt.matchAll(/(?:#|\bpr\s*#?)(\d+)\b/gi)].map((m) => Number(m[1]));
 }
 
-/** Remove this session's land tokens: the user moved on, so a go they gave earlier no longer stands. */
-function dropSessionTokens(commonDir: string, session: string): void {
+/** Remove this session's tokens of one kind: the user moved on, so a go they gave earlier no longer stands. */
+function dropSessionTokens(commonDir: string, session: string, kind: "land" | "rewrite"): void {
   const dir = join(commonDir, "fbs", "land");
   if (!existsSync(dir)) return;
-  for (const name of readdirSync(dir).filter((n) => n.endsWith(".token"))) {
+  const rewrite = basename(rewriteTokenPath(commonDir));
+  for (const name of readdirSync(dir).filter((n) => n.endsWith(".token") && (n === rewrite) === (kind === "rewrite"))) {
     try {
       if (JSON.parse(readFileSync(join(dir, name), "utf8"))?.session === session) rmSync(join(dir, name), { force: true });
     } catch {}
@@ -784,7 +874,8 @@ function dropSessionTokens(commonDir: string, session: string): void {
  * its token (with any confirmed checks); any other prompt there drops it. Otherwise a prompt that may ask to land ("go
  * ahead and merge it") writes the token for the PR it names, else the one open PR flow's, and tells the agent to judge
  * whether the user asks for it now. Every token is bound to the session and lasts until the user's next prompt that
- * doesn't ask to land (watcher wakes are framed, so a go given for "once CI is green" carries). Never throws.
+ * doesn't ask to land (watcher wakes are framed, so a go given for "once CI is green" carries). A prompt that may ask to
+ * rewrite an open PR's branch writes the session's rewrite token the same way (rewriteReply). Never throws.
  */
 export function guardReply(raw: string, fallbackCwd: string, now: number): string | null {
   try {
@@ -795,35 +886,57 @@ export function guardReply(raw: string, fallbackCwd: string, now: number): strin
     if (isFramed(prompt)) return null;
     const cwd = hookCwd(input, fallbackCwd);
     const commonDir = gitCommonDir(cwd);
-    const path = landRequestPath(commonDir);
-    const intent = landIntent(prompt);
-    const answer = landAnswer(prompt);
-    if (existsSync(path)) {
-      const request = liveRequest(cwd, path, now);
-      if (request === null) {
-        rmSync(path, { force: true });
-        if (answer !== null && !intent) return "the land request had expired or gone stale, so no land token was written; run fbs land request <slug> and ask again";
-      } else if (session === request.session) {
-        rmSync(path, { force: true });
-        const other = namedPrs(prompt).find((pr) => pr !== request.pr);
-        if (other !== undefined && answer !== null && !intent) return `the user named PR #${other}, but the land request was for PR #${request.pr} (${request.slug}); no land token was written`;
-        if (other === undefined && (answer !== null || intent)) {
-          writeLandToken(commonDir, { slug: request.slug, at: now, tree: request.tree, session, ...(request.over !== undefined && { over: request.over }) });
-          const over = request.over === undefined ? "" : ` over the failing checks ${request.over.map(describeOver).join(", ")}`;
-          return `the user answered yes to landing ${request.slug} (PR #${request.pr})${over}; its land token is written: run fbs land ${request.slug}`;
-        }
-      }
-    }
-    if (session === null) return null;
-    // A typed /fbs:land writes its own token in the expansion hook, which may run before this one.
-    if (!intent) {
-      if (!/^\/(?:fbs:)?land\b/.test(prompt)) dropSessionTokens(commonDir, session);
-      return null;
-    }
-    return landFromPrompt(cwd, commonDir, prompt, session, now);
+    const notes = [session === null ? null : rewriteReply(commonDir, prompt, session, now), landReply(cwd, commonDir, prompt, session, now)].filter((note) => note !== null);
+    return notes.length === 0 ? null : notes.join("\n");
   } catch {
     return null;
   }
+}
+
+/**
+ * While an fbs PR is open, a prompt that may ask to rewrite writes the session's one-time rewrite token and returns a note
+ * telling the agent to judge whether the user asks for it now; any other prompt from that session drops its token.
+ */
+function rewriteReply(commonDir: string, prompt: string, session: string, now: number): string | null {
+  if (!rewriteIntent(prompt)) {
+    dropSessionTokens(commonDir, session, "rewrite");
+    return null;
+  }
+  const open = openPrRecords(commonDir).filter((pr) => pr.branch !== null);
+  if (open.length === 0) return null;
+  writeJson(rewriteTokenPath(commonDir), { session, at: now } satisfies RewriteToken);
+  const branches = open.map((pr) => `${pr.branch} (${pr.slug})`).join(", ");
+  return `the user's message may ask to rewrite an open fbs PR's branch (${branches}); a one-time rewrite token is written for this session, until it is used or their next message that doesn't ask for it: the guard then lets one git push --force-with-lease to an open fbs PR's branch through. If they are asking you to amend, rebase, squash or force-push it now, do it and push with --force-with-lease alone (never --force, -f or a + refspec). If not (a question, a condition, a later time), don't rewrite: answer them`;
+}
+
+/** The land half of guardReply: a pending land request's answer, or a plain-words ask to land. */
+function landReply(cwd: string, commonDir: string, prompt: string, session: string | null, now: number): string | null {
+  const path = landRequestPath(commonDir);
+  const intent = landIntent(prompt);
+  const answer = landAnswer(prompt);
+  if (existsSync(path)) {
+    const request = liveRequest(cwd, path, now);
+    if (request === null) {
+      rmSync(path, { force: true });
+      if (answer !== null && !intent) return "the land request had expired or gone stale, so no land token was written; run fbs land request <slug> and ask again";
+    } else if (session === request.session) {
+      rmSync(path, { force: true });
+      const other = namedPrs(prompt).find((pr) => pr !== request.pr);
+      if (other !== undefined && answer !== null && !intent) return `the user named PR #${other}, but the land request was for PR #${request.pr} (${request.slug}); no land token was written`;
+      if (other === undefined && (answer !== null || intent)) {
+        writeLandToken(commonDir, { slug: request.slug, at: now, tree: request.tree, session, ...(request.over !== undefined && { over: request.over }) });
+        const over = request.over === undefined ? "" : ` over the failing checks ${request.over.map(describeOver).join(", ")}`;
+        return `the user answered yes to landing ${request.slug} (PR #${request.pr})${over}; its land token is written: run fbs land ${request.slug}`;
+      }
+    }
+  }
+  if (session === null) return null;
+  // A typed /fbs:land writes its own token in the expansion hook, which may run before this one.
+  if (!intent) {
+    if (!/^\/(?:fbs:)?land\b/.test(prompt)) dropSessionTokens(commonDir, session, "land");
+    return null;
+  }
+  return landFromPrompt(cwd, commonDir, prompt, session, now);
 }
 
 /** Write the land token for the open fbs PR a plain-words request names, or say why none was written. */

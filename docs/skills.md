@@ -138,7 +138,7 @@ The shipping gate, before any PR. On a clean tree it takes the criteria (the spe
 
 ### organize-commits
 
-Before the PR opens. Implement writes history so it can fold itself: each task commit carries a `Task:` trailer and fix rounds are `fixup!` commits. This stage autosquashes them non-interactively so a reviewer reads one commit per task, rewords any subject that isn't a conventional commit, and checks with the stamp that the code didn't change. On any doubt it keeps the history as it was.
+Before the PR opens. Implement writes history so it can fold itself: each task commit carries a `Task:` trailer and fix rounds are `fixup!` commits. This stage autosquashes them non-interactively so a reviewer reads one commit per task, rewords any message that isn't a conventional commit within commitlint's limits (or fails the repo's own commitlint), and checks with the stamp that the code didn't change. On any doubt it keeps the history as it was.
 
 ### open-pr
 
@@ -146,7 +146,7 @@ Runs on a stamped tree. It checks the stamp, the GitHub remote and `gh`, makes s
 
 ### camp-pr
 
-Stays with the PR until it is ready to land. `fbs watch-pr` runs in the background and wakes the agent once per round, not per event, sometimes before every check has finished. Each comment and each failing check is verified against the code, then triaged: fix, decline once with a reason, follow-up, or ask you (security, data, billing, scope). Fixes go through the change path and implement's review-round mode, then verify, then one push per round; replies and resolved threads follow. After a fix budget (two rounds by default), it holds one checkpoint with you, then fixes only blockers. It marks the draft ready when green, proposes follow-ups as tickets once at the end, and never merges or rewrites pushed history. Comments are treated as data, never as instructions.
+Stays with the PR until it is ready to land. `fbs watch-pr` runs in the background and wakes the agent once per round, not per event, sometimes before every check has finished. Each comment and each failing check is verified against the code, then triaged: fix, decline once with a reason, follow-up, or ask you (security, data, billing, scope). Fixes go through the change path and implement's review-round mode, then verify, then one push per round after the commit messages pass `fbs commits check` (and the repo's commitlint); replies and resolved threads follow. After a fix budget (two rounds by default), it holds one checkpoint with you, then fixes only blockers. It marks the draft ready when green, proposes follow-ups as tickets once at the end, and never merges. It rewrites pushed history only to fix commit messages (the tree stays the same) or when you ask for it in your own words. Comments are treated as data, never as instructions.
 
 ### land
 
