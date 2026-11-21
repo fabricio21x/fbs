@@ -69,6 +69,7 @@ Only when the problem or the goal is genuinely unclear, or you challenged the pr
 **Q3. <short title>** (business fact, decides the design)
 <The fact, asked directly.>
 → Recommendation: find out from <who could know> before the design is approved, because <answer A> would mean <X> and <answer B> would mean <Y>.
+(When only the user can answer it, the action is "settle this before the design is approved", never "decide it yourself" or "your call".)
 ```
 
 - Ask one fact per question: "how many customers" and "what stage" are two questions. In plain text, every question ends with a line that starts exactly `→ Recommendation`; keep the formats' wording.
