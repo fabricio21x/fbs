@@ -313,6 +313,13 @@ export function branchNames(cwd: string): string[] {
   return [...new Set(names.filter((name) => name !== "HEAD"))];
 }
 
+/** The tree of each commit in `from..to`, children first; null when either isn't a commit here. */
+export function commitTrees(cwd: string, from: string, to: string): string[] | null {
+  // Topological order follows the graph alone, so commits rewritten with new dates list in the same order.
+  const result = runGit(cwd, ["log", "--topo-order", "--no-show-signature", "--format=%T", "--end-of-options", `${from}..${to}`]);
+  return result.ok ? result.stdout.split("\n").filter((line) => line !== "") : null;
+}
+
 /** The tree of `commit`; null when the commit isn't here. */
 export function commitTree(cwd: string, commit: string): string | null {
   const result = runGit(cwd, ["rev-parse", "--verify", "--quiet", `${commit}^{tree}`]);
@@ -366,7 +373,7 @@ export function nonMergeCommits(cwd: string, from: string, to: string, excluded:
     .filter((entry) => entry !== "")
     .map((entry) => {
       const at = entry.indexOf("\n");
-      return { sha: entry.slice(0, at), message: entry.slice(at + 1).replace(/\n+$/, "") };
+      return { sha: entry.slice(0, at), message: entry.slice(at + 1).replace(/(\r?\n)+$/, "") };
     });
 }
 

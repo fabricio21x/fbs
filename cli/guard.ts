@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { type Run, runConfig } from "./afk";
-import { commitOf, commitTree, currentBranch, gitCommonDir, mergeBase, originDefaultBranch } from "./git";
+import { commitOf, commitTrees, currentBranch, gitCommonDir, mergeBase, originDefaultBranch } from "./git";
 import { type FeatureRecord, featureUnits, isUnit, listFeatures, nextToLand, type OverCheck, readFeature, readOverChecks, recordPath } from "./status";
 
 const SLUG = /^[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -124,6 +124,8 @@ export function landTokenSlug(cwd: string, slug: string): string {
 
 /** Written by `fbs land request`; the user's yes, as their next message in that session, turns it into the land token. */
 export interface LandRequest {
+  /** Absent on a land request; a rewrite request says "rewrite". */
+  kind?: undefined;
   slug: string;
   pr: number;
   tree: string;
@@ -134,8 +136,22 @@ export interface LandRequest {
   over?: OverCheck[];
 }
 
-/** One pending request per repo; requestLand refuses a second feature while one is live, and the same feature refreshes it. */
-export function writeLandRequest(commonDir: string, request: LandRequest): void {
+/** Written by `fbs rewrite request`; the user's yes, as their next message in that session, turns it into the rewrite token. */
+export interface RewriteRequest {
+  kind: "rewrite";
+  slug: string;
+  pr: number;
+  /** The PR's branch, as the record had it when the agent asked. */
+  branch: string;
+  at: number;
+  session: string;
+}
+
+/** The one question the agent asked last and the user's next message answers: a land or a rewrite. */
+export type PendingRequest = LandRequest | RewriteRequest;
+
+/** One pending request per repo; a request refuses while another feature's waits, and the same feature's refreshes it. */
+export function writePendingRequest(commonDir: string, request: PendingRequest): void {
   writeJson(landRequestPath(commonDir), request);
 }
 
@@ -149,8 +165,8 @@ export interface GuardContext {
   isCommit: (ref: string) => boolean;
   /** True when `ref`, read in `dir`, is a commit above `kept`: an unchecked step. */
   isStepAbove: (dir: string, ref: string, kept: string) => boolean;
-  /** True when `source` (what a push sends) has the tree of origin's `branch`: only messages changed. */
-  sameTreeAsOrigin: (source: string, branch: string) => boolean;
+  /** True when `source` (what a push sends) differs from origin's `branch` only in commit messages: the same base and the same tree for every commit. */
+  onlyMessagesChanged: (source: string, branch: string) => boolean;
   /** True when this session's user gave a go to rewrite an open PR's branch that is still fresh. */
   hasRewriteToken: () => boolean;
 }
@@ -276,10 +292,10 @@ export function commandDenials(command: string, ctx: GuardContext): string[] {
   }
   const segments = text.split(SEGMENT_BREAK).map((segment) => segment.trim().split(/\s+/).filter((t) => t !== ""));
   const echoed = segments.some((tokens) => echoesReply(tokens));
-  // The trees are read in the hook's cwd, so a push run from anywhere else gets no pass from them.
-  const elsewhere = segments.some((tokens) => tokens[0] === "cd" || tokens[0] === "pushd") || /\bGIT_(DIR|WORK_TREE)=|(^|\s)(-C|--git-dir|--work-tree)(\s|=)/.test(text);
+  // The hook reads the refs before the command runs and in its own cwd: only a push that is the whole command, run there, pushes what it read.
+  const pushAlone = segments.filter((tokens) => tokens.length > 0).length === 1 && !/[(){}`]|\bGIT_(DIR|WORK_TREE)=|(^|\s)(-C|--git-dir|--work-tree)(\s|=)/.test(text);
   for (const tokens of segments) {
-    for (const reason of [...ghMerge(tokens), ...gitPush(tokens, ctx, elsewhere), ...fbsLand(tokens, ctx), ...claudeSession(tokens, echoed)]) reasons.add(reason);
+    for (const reason of [...ghMerge(tokens), ...gitPush(tokens, ctx, pushAlone), ...fbsLand(tokens, ctx), ...claudeSession(tokens, echoed)]) reasons.add(reason);
   }
   return [...reasons];
 }
@@ -317,17 +333,26 @@ function ghMerge(tokens: string[]): string[] {
 }
 
 const GIT_OPTIONS_WITH_VALUE = ["-C", "-c", "--git-dir", "--work-tree", "--namespace"];
+const PUSH_OPTIONS_WITH_VALUE = ["-o", "--push-option", "--repo", "--receive-pack", "--exec"];
 
-function gitPush(tokens: string[], ctx: GuardContext, elsewhere: boolean): string[] {
+function gitPush(tokens: string[], ctx: GuardContext, pushAlone: boolean): string[] {
   const git = tokens.findIndex((t) => basename(t) === "git");
   if (git === -1) return [];
   let i = git + 1;
   while (i < tokens.length && tokens[i].startsWith("-")) i += GIT_OPTIONS_WITH_VALUE.includes(tokens[i]) ? 2 : 1;
   if (tokens[i] !== "push") return [];
 
-  const args = tokens.slice(i + 1);
-  const flags = args.filter((a) => a.startsWith("-"));
-  const [, ...refspecs] = args.filter((a) => !a.startsWith("-"));
+  const flags: string[] = [];
+  const positionals: string[] = [];
+  for (let j = i + 1; j < tokens.length; j++) {
+    if (!tokens[j].startsWith("-")) {
+      positionals.push(tokens[j]);
+      continue;
+    }
+    flags.push(tokens[j]);
+    if (PUSH_OPTIONS_WITH_VALUE.includes(tokens[j])) j++;
+  }
+  const [, ...refspecs] = positionals;
   const reasons: string[] = [];
   // --force-with-lease alone is the only overwrite allowed; --force or a + refspec beside it still forces.
   if (flags.some((f) => f === "--force" || /^-[a-zA-Z]*f[a-zA-Z]*$/.test(f)) || refspecs.some((r) => r.startsWith("+"))) {
@@ -344,22 +369,24 @@ function gitPush(tokens: string[], ctx: GuardContext, elsewhere: boolean): strin
   if (lease === undefined) return reasons;
   const sources = refspecs.length === 0 ? ["HEAD"] : refspecs.map(source);
   // An explicit expected value would let a forged origin/<branch> stand in for what the push overwrites.
-  const onOriginTip = !elsewhere && !flags.some((f) => f.startsWith("--force-with-lease=") && f.includes(":"));
+  const onOriginTip = pushAlone && !flags.some((f) => f.startsWith("--force-with-lease=") && f.includes(":"));
   const open = openPrsOf(ctx);
   for (const [n, target] of targets.entries()) {
-    const pr = open.find((p) => p.branch !== null && p.branch === target);
-    if (pr === undefined || pr.branch === null) continue;
-    if ((onOriginTip && sameTree(ctx, sources[n], pr.branch)) || rewriteToken(ctx)) continue;
-    reasons.push(
-      `git push ${lease} rewrites ${pr.branch}, the branch of ${pr.slug}'s open PR. A push that keeps the tree origin has (only messages changed, after an amend or a reword), run from this directory, goes through on its own. Any other rewrite (a rebase, a squash, a changed commit) needs the user's go: ask the user in plain words, and their answer naming it ("go ahead and force push it") lets one --force-with-lease push through. To bring in the base, merge instead; to restack units run fbs stack sync ${pr.slug}, and if that PR was already merged, run fbs stack sync ${pr.slug} first: it records the landing, and this guard then lets the push through`,
-    );
+    // A refspec built by the shell ($VAR, $(…)) may name any branch, so it may be any open PR's.
+    const unknown = refspecs[n]?.includes("$") === true;
+    for (const pr of open.filter((p) => p.branch !== null && (unknown || p.branch === target))) {
+      if (pr.branch === null || (!unknown && onOriginTip && onlyMessages(ctx, sources[n], pr.branch)) || rewriteToken(ctx)) continue;
+      reasons.push(
+        `git push ${lease} rewrites ${pr.branch}, the branch of ${pr.slug}'s open PR. When only messages changed (every commit keeps its tree and base, after an amend or a reword), the push goes through on its own as its own Bash call, run from this directory. Any other rewrite (a rebase, a squash, a dropped or changed commit) needs the user's go: run fbs rewrite request ${pr.slug} and ask the user, and their yes lets one --force-with-lease push through. To bring in the base, merge instead; to restack units run fbs stack sync ${pr.slug}, and if that PR was already merged, run fbs stack sync ${pr.slug} first: it records the landing, and this guard then lets the push through`,
+      );
+    }
   }
   return reasons;
 }
 
-function sameTree(ctx: GuardContext, source: string, branch: string): boolean {
+function onlyMessages(ctx: GuardContext, source: string, branch: string): boolean {
   try {
-    return source !== "" && ctx.sameTreeAsOrigin(source, branch);
+    return source !== "" && ctx.onlyMessagesChanged(source, branch);
   } catch {
     return false;
   }
@@ -681,9 +708,13 @@ export function repoContext(cwd: string, commonDir: string, now: number, session
         return false;
       }
     },
-    sameTreeAsOrigin: (source, branch) => {
-      const tree = commitTree(cwd, source);
-      return tree !== null && tree === commitTree(cwd, `refs/remotes/origin/${branch}`);
+    onlyMessagesChanged: (source, branch) => {
+      const main = `refs/remotes/origin/${originDefaultBranch(cwd) ?? "main"}`;
+      const pushed = `refs/remotes/origin/${branch}`;
+      const base = mergeBase(cwd, main, source);
+      if (base === null || base !== mergeBase(cwd, main, pushed)) return false;
+      const trees = commitTrees(cwd, base, source);
+      return trees !== null && trees.length > 0 && JSON.stringify(trees) === JSON.stringify(commitTrees(cwd, base, pushed));
     },
     hasRewriteToken: () => session !== null && freshRewriteToken(commonDir, now)?.session === session,
   };
@@ -815,30 +846,35 @@ const INTENT_MAX_LENGTH = 400;
  * mention it; the agent judges whether they ask for it now. "merge main into it" and a negation never count.
  */
 export function landIntent(prompt: string): boolean {
-  return mayAsk(prompt, INTENT);
+  const text = normalized(prompt);
+  return askable(text) && !NEGATION.test(text) && INTENT.some((pattern) => pattern.test(text));
 }
 
 const REWRITE_INTENT = [
   /\bamend(?:s|ed|ing|ment)?\b/i,
   /\bforce[- ]?push|--force\b/i,
-  /\bsquash(?:es|ed|ing)?\b(?![- ]?(?:and[- ])?merge)/i,
+  /\bpush\b(?:\s+\S+){0,3}?\s+-f\b/i,
+  /\b(?:auto)?squash(?:es|ed|ing)?\b(?![- ]?(?:and[- ])?merge)/i,
+  /\bfold\b.{0,30}\bfix-?ups?\b/i,
   /\brebas(?:e|es|ed|ing)\b/i,
   /\breword(?:s|ed|ing)?\b/i,
-  /\brewrit(?:e|es|ing|ten)\b[^.?!]{0,40}\b(?:history|commits?|messages?|branch)\b/i,
+  /\brewrit(?:e|es|ing|ten)\b.{0,40}\b(?:history|commits?|messages?|branch)\b/i,
 ];
+const CLAUSE_BREAK = /[,.;:!?]+|\s(?:but|though|however)\s/i;
 
 /**
  * Whether a prompt may ask to rewrite a branch ("go ahead and amend it", "force push it", "squash those commits"): like
- * landIntent, it only says the user's own words mention it, and the agent judges whether they ask for it now.
+ * landIntent, it only says the user's own words mention it, and the agent judges whether they ask for it now. A negation
+ * counts only in the clause that holds the ask, so "amend the message, don't touch the code" asks and "don't force push" doesn't.
  */
 export function rewriteIntent(prompt: string): boolean {
-  return mayAsk(prompt, REWRITE_INTENT);
+  const text = normalized(prompt);
+  return askable(text) && text.split(CLAUSE_BREAK).some((clause) => !NEGATION.test(clause) && REWRITE_INTENT.some((pattern) => pattern.test(clause)));
 }
 
-function mayAsk(prompt: string, patterns: RegExp[]): boolean {
-  const text = normalized(prompt);
-  if (text === "" || text.length > INTENT_MAX_LENGTH || text.startsWith("/") || NEGATION.test(text)) return false;
-  return patterns.some((pattern) => pattern.test(text));
+/** A short chat message the user typed, not a slash command. */
+function askable(text: string): boolean {
+  return text !== "" && text.length <= INTENT_MAX_LENGTH && !text.startsWith("/");
 }
 
 /** A subagent report, a notification or another session's message, which arrive as prompts but never from the user. */
@@ -886,7 +922,7 @@ export function guardReply(raw: string, fallbackCwd: string, now: number): strin
     if (isFramed(prompt)) return null;
     const cwd = hookCwd(input, fallbackCwd);
     const commonDir = gitCommonDir(cwd);
-    const notes = [session === null ? null : rewriteReply(commonDir, prompt, session, now), landReply(cwd, commonDir, prompt, session, now)].filter((note) => note !== null);
+    const notes = [session === null ? null : rewriteReply(commonDir, prompt, session, now), requestOrLandReply(cwd, commonDir, prompt, session, now)].filter((note) => note !== null);
     return notes.length === 0 ? null : notes.join("\n");
   } catch {
     return null;
@@ -904,13 +940,17 @@ function rewriteReply(commonDir: string, prompt: string, session: string, now: n
   }
   const open = openPrRecords(commonDir).filter((pr) => pr.branch !== null);
   if (open.length === 0) return null;
-  writeJson(rewriteTokenPath(commonDir), { session, at: now } satisfies RewriteToken);
+  writeRewriteToken(commonDir, session, now);
   const branches = open.map((pr) => `${pr.branch} (${pr.slug})`).join(", ");
   return `the user's message may ask to rewrite an open fbs PR's branch (${branches}); a one-time rewrite token is written for this session, until it is used or their next message that doesn't ask for it: the guard then lets one git push --force-with-lease to an open fbs PR's branch through. If they are asking you to amend, rebase, squash or force-push it now, do it and push with --force-with-lease alone (never --force, -f or a + refspec). If not (a question, a condition, a later time), don't rewrite: answer them`;
 }
 
-/** The land half of guardReply: a pending land request's answer, or a plain-words ask to land. */
-function landReply(cwd: string, commonDir: string, prompt: string, session: string | null, now: number): string | null {
+function writeRewriteToken(commonDir: string, session: string, now: number): void {
+  writeJson(rewriteTokenPath(commonDir), { session, at: now } satisfies RewriteToken);
+}
+
+/** The rest of guardReply: the answer to a pending land or rewrite request, else a plain-words ask to land. */
+function requestOrLandReply(cwd: string, commonDir: string, prompt: string, session: string | null, now: number): string | null {
   const path = landRequestPath(commonDir);
   const intent = landIntent(prompt);
   const answer = landAnswer(prompt);
@@ -922,11 +962,20 @@ function landReply(cwd: string, commonDir: string, prompt: string, session: stri
     } else if (session === request.session) {
       rmSync(path, { force: true });
       const other = namedPrs(prompt).find((pr) => pr !== request.pr);
-      if (other !== undefined && answer !== null && !intent) return `the user named PR #${other}, but the land request was for PR #${request.pr} (${request.slug}); no land token was written`;
-      if (other === undefined && (answer !== null || intent)) {
-        writeLandToken(commonDir, { slug: request.slug, at: now, tree: request.tree, session, ...(request.over !== undefined && { over: request.over }) });
-        const over = request.over === undefined ? "" : ` over the failing checks ${request.over.map(describeOver).join(", ")}`;
-        return `the user answered yes to landing ${request.slug} (PR #${request.pr})${over}; its land token is written: run fbs land ${request.slug}`;
+      if (request.kind === "rewrite") {
+        const yes = (answer !== null && !intent) || rewriteIntent(prompt);
+        if (yes && other !== undefined) return `the user named PR #${other}, but the rewrite request was for PR #${request.pr} (${request.slug}); no rewrite token was written`;
+        if (yes) {
+          writeRewriteToken(commonDir, session, now);
+          return `the user answered yes to rewriting ${request.branch} (PR #${request.pr}); a one-time rewrite token is written for this session: push with git push --force-with-lease alone (never --force, -f or a + refspec)`;
+        }
+      } else {
+        if (other !== undefined && answer !== null && !intent) return `the user named PR #${other}, but the land request was for PR #${request.pr} (${request.slug}); no land token was written`;
+        if (other === undefined && (answer !== null || intent)) {
+          writeLandToken(commonDir, { slug: request.slug, at: now, tree: request.tree, session, ...(request.over !== undefined && { over: request.over }) });
+          const over = request.over === undefined ? "" : ` over the failing checks ${request.over.map(describeOver).join(", ")}`;
+          return `the user answered yes to landing ${request.slug} (PR #${request.pr})${over}; its land token is written: run fbs land ${request.slug}`;
+        }
       }
     }
   }
@@ -966,7 +1015,7 @@ export function describeOver(check: OverCheck): string {
 }
 
 /** The pending land request still waiting for an answer, if any. */
-export function pendingLandRequest(cwd: string, now: number): LandRequest | null {
+export function pendingRequest(cwd: string, now: number): PendingRequest | null {
   try {
     return liveRequest(cwd, landRequestPath(gitCommonDir(cwd)), now);
   } catch {
@@ -974,18 +1023,22 @@ export function pendingLandRequest(cwd: string, now: number): LandRequest | null
   }
 }
 
-/** The request at `path` if it is well formed, from a session, younger than 10 minutes, and its record still has that PR, unlanded, at that stamp. */
-function liveRequest(cwd: string, path: string, now: number): LandRequest | null {
+/**
+ * The request at `path` if it is well formed, from a session, within REQUEST_TTL_MS, and its record still has that PR,
+ * unlanded: a land request at that stamp, a rewrite request on that branch.
+ */
+function liveRequest(cwd: string, path: string, now: number): PendingRequest | null {
   try {
     const request = JSON.parse(readFileSync(path, "utf8"));
-    const fresh =
-      typeof request.slug === "string" && SLUG.test(request.slug) && Number.isInteger(request.pr) && typeof request.tree === "string" && typeof request.session === "string" && request.session !== "" && Number.isInteger(request.at) && request.at <= now && now - request.at < REQUEST_TTL_MS;
-    const over = request.over === undefined ? undefined : readOverChecks(request.over);
-    if (!fresh || over === null) return null;
+    const fresh = typeof request.slug === "string" && SLUG.test(request.slug) && Number.isInteger(request.pr) && typeof request.session === "string" && request.session !== "" && Number.isInteger(request.at) && request.at <= now && now - request.at < REQUEST_TTL_MS;
+    if (!fresh) return null;
     const rec = readFeature(cwd, request.slug);
-    const current = rec.landed === undefined && rec.pr === request.pr && rec.stamp?.tree === request.tree;
-    if (!current) return null;
-    return { slug: request.slug, pr: request.pr, tree: request.tree, at: request.at, session: request.session, ...(over !== undefined && { over }) };
+    if (rec.landed !== undefined || rec.pr !== request.pr) return null;
+    const asked = { slug: request.slug, pr: request.pr, at: request.at, session: request.session };
+    if (request.kind === "rewrite") return typeof request.branch === "string" && rec.branch?.name === request.branch ? { kind: "rewrite", ...asked, branch: request.branch } : null;
+    const over = request.over === undefined ? undefined : readOverChecks(request.over);
+    if (request.kind !== undefined || over === null || typeof request.tree !== "string" || rec.stamp?.tree !== request.tree) return null;
+    return { ...asked, tree: request.tree, ...(over !== undefined && { over }) };
   } catch {
     return null;
   }

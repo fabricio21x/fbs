@@ -171,7 +171,7 @@ Short rules a stage or agent loads at the step where they apply.
 
 ## Safety
 
-- **The agent never merges.** While a PR flow or an autopilot run is active in a repo, a `PreToolUse` hook denies `gh pr merge`, merge APIs and MCP merge tools, pushes to the default branch and force pushes.
+- **The agent never merges.** While a PR flow or an autopilot run is active in a repo, a `PreToolUse` hook denies `gh pr merge`, merge APIs and MCP merge tools, pushes to the default branch and force pushes. On an open PR's branch, a `--force-with-lease` push passes only when it changes nothing but commit messages, or once after you ask for the rewrite in your own words or say yes to the agent's rewrite request.
 - **Only you land.** `fbs land` needs a one-time token that a hook writes from your own message: when you ask the agent to merge or land the PR in plain words, answer its land question with a yes, or type `/fbs:land`. It also refuses unless the PR is approved (or it is your own solo repo), green (no checks at all is fine when the base branch requires none), clean, and its head carries exactly the verified tree.
 - **The verify stamp.** A passing verdict is bound to the git tree hash. Any code change makes it stale; `open-pr` and `land` refuse without a current one.
 - **Approvals are bound to the document.** Editing an approved spec or design makes its approval stale until you approve it again.

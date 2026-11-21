@@ -1,6 +1,6 @@
 import { rmSync } from "node:fs";
 import { markLanded } from "./afk";
-import { campMarkerPath, freshToken, isSlug, type LandRequest, landTokenPath, landTokenSlug, pendingLandRequest, writeLandRequest } from "./guard";
+import { campMarkerPath, freshToken, isSlug, type LandRequest, landTokenPath, landTokenSlug, type PendingRequest, pendingRequest, type RewriteRequest, writePendingRequest } from "./guard";
 import { commitTree, fetchBranch, gitCommonDir } from "./git";
 import { GhError, type GhRunner, newestRuns } from "./github";
 import { plainFeaturesOn, type Restack, restackAbove, restackUnits } from "./stack";
@@ -399,8 +399,8 @@ export function requestLand(cwd: string, typed: string, now: number, session: st
   if (!isUnit(rec) && rec.landed !== undefined) problems.push(`${slug} has landed already`);
   if (session === null || session === "") problems.push(`no Claude Code session ($CLAUDE_CODE_SESSION_ID is empty), so no answer can be matched to the request: the user asks you to land it, or types /fbs:land ${typed}`);
   // A request for another feature still waiting would be answered by an answer meant for it.
-  const pending = pendingLandRequest(cwd, now);
-  if (pending !== null && pending.slug !== slug) problems.push(`a land request for ${pending.slug} (PR #${pending.pr}) is waiting for the user's answer; ask again after they reply`);
+  const pending = pendingRequest(cwd, now);
+  if (pending !== null && (pending.kind === "rewrite" || pending.slug !== slug)) problems.push(waiting(pending));
   if (problems.length > 0 || rec.pr === null || !rec.stamp || session === null) throw new LandRefusedError(problems);
   // Nothing to answer in a GitHub stack: the user merges it with GitHub's command, which needs no land token.
   const stack = gh === undefined || rec.repo === undefined ? null : openStack(gh, cwd, rec.repo, rec.pr);
@@ -408,11 +408,36 @@ export function requestLand(cwd: string, typed: string, now: number, session: st
   const over = overFailing && gh !== undefined ? redChecks(cwd, slug, gh) : [];
   // The user may be reading the list already; a refresh may drop checks from it, never add one they weren't asked about.
   const key = (o: OverCheck) => `${o.name}\0${o.workflow ?? ""}\0${o.state}`;
-  if (pending !== null && pending.slug === slug && over.some((o) => !(pending.over ?? []).some((p) => key(p) === key(o)))) {
+  if (pending !== null && pending.kind === undefined && pending.slug === slug && over.some((o) => !(pending.over ?? []).some((p) => key(p) === key(o)))) {
     throw new LandRefusedError([`a land request for ${slug} with fewer failing checks is waiting for the user's answer; ask again after they reply`]);
   }
   const request = { slug, pr: rec.pr, tree: rec.stamp.tree, at: now, session, ...(over.length > 0 && { over }) };
-  writeLandRequest(gitCommonDir(cwd), request);
+  writePendingRequest(gitCommonDir(cwd), request);
+  return request;
+}
+
+function waiting(pending: PendingRequest): string {
+  return `a ${pending.kind ?? "land"} request for ${pending.slug} (PR #${pending.pr}) is waiting for the user's answer; ask again after they reply`;
+}
+
+/**
+ * Ask to rewrite an open PR's branch (a rebase, a squash, a changed commit): write the pending request the user's yes,
+ * as their next message in this session, turns into the one-time rewrite token (guardReply). The model may write a
+ * request but never a token.
+ */
+export function requestRewrite(cwd: string, slug: string, now: number, session: string | null): RewriteRequest {
+  if (!isSlug(slug)) throw new StatusError("bad-slug", `${JSON.stringify(slug)} must be lowercase words joined by single hyphens`);
+  const rec = readFeature(cwd, slug);
+  const problems: string[] = [];
+  if (rec.pr === null) problems.push(`no PR recorded for ${slug}`);
+  if (rec.landed !== undefined) problems.push(`${slug} has landed already`);
+  if (rec.branch === undefined) problems.push(`no branch recorded for ${slug}`);
+  if (session === null || session === "") problems.push(`no Claude Code session ($CLAUDE_CODE_SESSION_ID is empty), so no answer can be matched to the request: ask the user to say it in their own words ("go ahead and force push it")`);
+  const pending = pendingRequest(cwd, now);
+  if (pending !== null && !(pending.kind === "rewrite" && pending.slug === slug)) problems.push(waiting(pending));
+  if (problems.length > 0 || rec.pr === null || rec.branch === undefined || session === null) throw new LandRefusedError(problems);
+  const request: RewriteRequest = { kind: "rewrite", slug, pr: rec.pr, branch: rec.branch.name, at: now, session };
+  writePendingRequest(gitCommonDir(cwd), request);
   return request;
 }
 

@@ -80,7 +80,7 @@ Every feature lives on its own branch from the moment it has a record, so no sta
 - A feature built on another feature's unmerged work branches from it (`--parent`), and its PR stacks on that one. The default branch, or any other, is used only when you name it for that feature (`--use`).
 - `fbs push <slug>` pushes only the feature's branch, never the default branch. Before the PR opens it overwrites only what fbs pushed last; after, it only adds commits.
 - Commits are Conventional Commits within commitlint config-conventional's limits (a header and every line of 100 characters at most). `organize-commits` rewords any message that breaks them before the PR opens, camp-pr checks each round's commits before it pushes, and both also run the repo's own commitlint when it has a config. The PR title is a Conventional Commit too, because land squash-merges under it.
-- Once the PR is open its branch only gains commits. A `--force-with-lease` push that keeps origin's tree (only messages changed) passes; any other rewrite needs you to ask for it in your own words ("go ahead and force push it"), which lets one such push through.
+- Once the PR is open its branch only gains commits. A `--force-with-lease` push that changes only commit messages (every commit keeps its tree and the branch its base) passes; any other rewrite needs your go, in your own words ("go ahead and force push it") or as a yes to the agent's `fbs rewrite request`, which lets one such push through.
 
 ## The verify stamp
 

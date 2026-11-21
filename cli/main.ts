@@ -13,7 +13,7 @@ import { isValidDate, localDate } from "./date";
 import { GitError, NotAGitRepoError, rootFor, setGitBinary } from "./git";
 import { COMMENT_KEY_FORMS, type CommentKey, GhError, type GhRunner, ghReader, NotOnPrError, parseCommentKey, replyToComment, repoName, resolveThread, runGh, setGhBinary } from "./github";
 import { guardPrompt, guardReply, guardToolUse } from "./guard";
-import { LandRefusedError, land, requestLand } from "./land";
+import { LandRefusedError, land, requestLand, requestRewrite } from "./land";
 import { checkPolish, type PolishDeps, REAL_POLISH_DEPS, setClaudeBinary } from "./polish";
 import { syncStack } from "./stack";
 import { detectTracker } from "./tracker";
@@ -129,8 +129,10 @@ const USAGE = [
   "                            already covers HEAD, else carried: <old tree> -> <new tree>; only documents changed: <paths>",
   "  commits check <slug>      list each non-merge commit on the feature's branch since its base, leaving out the parent",
   "                            branch's, whose subject isn't a conventional commit or whose message breaks commitlint",
-  "                            config-conventional's limits (a header and every line of 100 characters at most, a blank",
-  "                            line after the header), as <sha> <header> [<what breaks>]; ok, else exit 1",
+  "                            config-conventional's rules (header and lines of 100 characters at most, no spaces around",
+  "                            the header, a subject that doesn't start with a capital or end with a full stop), as <sha>",
+  "                            <header> [<what breaks>]; a missing blank line after the header is a warning; fixup!,",
+  "                            squash! and amend! commits are skipped; ok when nothing fails, else exit 1",
   "  commits title <text>      check a PR title the same way; ok, else title: <text> and exit 1",
   "                            conventional: <type>[(<scope>)][!]: <description>, with one of commitlint config-conventional's",
   "                            lowercase types: build, chore, ci, docs, feat, fix, perf, refactor, revert, style, test",
@@ -201,6 +203,11 @@ const USAGE = [
   "                            any other failure, accepts UNSTABLE, and on BLOCKED merges with --admin only for a repo",
   "                            admin, every required check passed or confirmed, and every branch protection setting and",
   "                            ruleset rule one fbs understands (else refused, naming it); the landed record keeps over",
+  "  rewrite request <slug>    ask to rewrite the open PR's branch (a rebase, a squash, a changed commit): write a pending",
+  "                            request the user's yes, as their next message in the session that asked",
+  "                            ($CLAUDE_CODE_SESSION_ID, required), turns into the one-time rewrite token, one lease push",
+  "                            to an open PR's branch; anything else they say drops it; prints {requested,slug,pr,branch};",
+  "                            refused with no PR or branch recorded, landed, and while another request waits",
   "  stack sync <slug>         keep every unlanded unit of the feature (or of a unit's feature) holding the tip of the unit",
   "                            below it, or origin's default branch once that unit landed, bottom-up; first asks gh for",
   "                            each unlanded unit's PR and records one merged outside fbs land as landed (by: outside);",
@@ -226,8 +233,9 @@ const USAGE = [
   "                            --reply writes it when the user's message may ask to land (for the PR it names, else the",
   "                            one open PR flow's, bound to the session) or says yes to a pending land request, and",
   "                            writes the session's one-time rewrite token when it may ask to amend, rebase, squash or",
-  "                            force-push while an fbs PR is open; a lease push to an open PR's branch passes with that",
-  "                            token, or when the commit pushed has origin's tree (only messages changed)",
+  "                            force-push while an fbs PR is open, or says yes to a pending rewrite request; a lease push",
+  "                            to an open PR's branch passes with that token, or as the whole command when only commit",
+  "                            messages changed (the same base and the same tree for every commit)",
   "  ask-check                 hook entry on AskUserQuestion: deny an Assuming, Confirm or Approve question, or one that",
   "                            says \"above\", when its message wrote no text in the chat before the call",
   "  afk start <slug> --spec <file> [--session <id>] [--restart]",
@@ -284,6 +292,7 @@ export function run(argv: string[], io: Io, deps: PrDeps = REAL_PR_DEPS, afkDeps
     if (command === "pr") return runPr(rest, io, deps);
     if (command === "camp") return runCamp(rest, io);
     if (command === "land") return runLand(rest, io, deps, afkDeps);
+    if (command === "rewrite") return runRewrite(rest, io, deps, afkDeps);
     if (command === "stack") return runStack(rest, io, deps);
     if (command === "afk") return runAfk(rest, io, deps, afkDeps);
     if (command === "afk-guard") return runAfkGuard(rest, io);
@@ -577,8 +586,10 @@ function runCommits(args: string[], io: Io): number {
   return refusingOnStdout(io, () => {
     try {
       const problems = commitProblems(io.cwd, arg);
-      for (const line of problems.length > 0 ? problems : ["ok"]) io.out(line);
-      return problems.length > 0 ? 1 : 0;
+      for (const { line } of problems) io.out(line);
+      if (problems.some((problem) => problem.fails)) return 1;
+      io.out("ok");
+      return 0;
     } catch (e) {
       if (!(e instanceof CommitsRefusedError)) throw e;
       io.out(`refused: ${e.reason}`);
@@ -773,6 +784,24 @@ function runAskCheck(args: string[], io: Io, deps: PrDeps): number {
   if (reason === null) return 0;
   io.err(`blocked by fbs: ${reason}`);
   return 2;
+}
+
+function runRewrite(args: string[], io: Io, deps: PrDeps, afkDeps: AfkDeps): number {
+  if (args.length !== 2 || args[0] !== "request") {
+    io.err(`unknown command: rewrite ${args.join(" ")}`.trimEnd());
+    return 2;
+  }
+  return refusingOnStdout(io, () => {
+    try {
+      const { slug, pr, branch } = requestRewrite(io.cwd, args[1], deps.now(), afkDeps.sessionId());
+      io.out(JSON.stringify({ requested: true, slug, pr, branch }));
+      return 0;
+    } catch (e) {
+      if (!(e instanceof LandRefusedError)) throw e;
+      for (const reason of e.reasons) io.out(`refused: ${reason}`);
+      return 1;
+    }
+  });
 }
 
 function runLand(args: string[], io: Io, deps: PrDeps, afkDeps: AfkDeps): number {

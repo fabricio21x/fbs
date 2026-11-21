@@ -66,19 +66,68 @@ describe("fbs commits check", () => {
     commit(cwd, `feat: ${"a".repeat(94)}\n\n${"b".repeat(100)}\n\nRefs: ACM-123`);
     const header = `feat: ${"a".repeat(95)}`;
     const long = commit(cwd, header);
-    const glued = commit(cwd, "fix: handle an empty list\nThe body starts right under the header.");
     const body = commit(cwd, `docs: explain the booking window\n\nShort line.\n${"c".repeat(101)}`);
     const footer = commit(cwd, `fix: retry the sync\n\nBody.\n\nReviewed-by: ${"d".repeat(90)}`);
     expect(check(cwd, "check", "x")).toEqual({
       code: 1,
       out: [
         `${long.slice(0, 12)} ${header} [header is 101 characters, over 100]`,
-        `${glued.slice(0, 12)} fix: handle an empty list [no blank line after the header]`,
         `${body.slice(0, 12)} docs: explain the booking window [line 4 is 101 characters, over 100]`,
         `${footer.slice(0, 12)} fix: retry the sync [line 5 is 103 characters, over 100]`,
       ],
       err: [],
     });
+  });
+
+  test("no blank line after the header is a warning, as config-conventional has it: listed, but the check passes", () => {
+    const cwd = repo();
+    const glued = commit(cwd, "fix: handle an empty list\nThe body starts right under the header.");
+    expect(check(cwd, "check", "x")).toEqual({ code: 0, out: [`${glued.slice(0, 12)} fix: handle an empty list [warning: no blank line after the header]`, "ok"], err: [] });
+    const long = commit(cwd, `fix: retry\n${"f".repeat(101)}`);
+    expect(check(cwd, "check", "x")).toEqual({
+      code: 1,
+      out: [`${glued.slice(0, 12)} fix: handle an empty list [warning: no blank line after the header]`, `${long.slice(0, 12)} fix: retry [line 2 is 101 characters, over 100; warning: no blank line after the header]`],
+      err: [],
+    });
+  });
+
+  test("a subject in sentence or start case, one ending in a full stop, and a header with spaces around it fail, as in config-conventional", () => {
+    const cwd = repo();
+    const capital = commit(cwd, "feat: Add the booking window");
+    const start = commit(cwd, "fix(api): Retry The Sync");
+    const stop = commit(cwd, "docs: explain the window.");
+    commit(cwd, "feat: add the API client");
+    commit(cwd, "fix: 2 retries are enough");
+    expect(check(cwd, "check", "x").out).toEqual([
+      `${capital.slice(0, 12)} feat: Add the booking window [subject starts with a capital letter]`,
+      `${start.slice(0, 12)} fix(api): Retry The Sync [subject starts with a capital letter]`,
+      `${stop.slice(0, 12)} docs: explain the window. [subject ends with a full stop]`,
+    ]);
+    const cwd2 = repo();
+    const padded = Bun.spawnSync(["git", "-c", "user.name=fbs", "-c", "user.email=fbs@example.com", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "--cleanup=verbatim", "-m", "feat: trailing space "], { cwd: cwd2, env: isolatedGitEnv() });
+    expect(padded.exitCode).toBe(0);
+    const sha = git(cwd2, "rev-parse", "HEAD");
+    expect(check(cwd2, "check", "x")).toEqual({ code: 1, out: [`${sha.slice(0, 12)} feat: trailing space  [header has spaces around it]`], err: [] });
+  });
+
+  test("fixup!, squash! and amend! commits are skipped, as commitlint skips them", () => {
+    const cwd = repo();
+    const target = commit(cwd, "feat: one");
+    commit(cwd, `fixup! feat: one\n\n${"g".repeat(120)}`);
+    commit(cwd, "squash! feat: one");
+    commit(cwd, `amend! ${target}\n\nfeat: the one`);
+    expect(check(cwd, "check", "x")).toEqual({ code: 0, out: ["ok"], err: [] });
+  });
+
+  test("lines ending in CRLF are measured without the carriage return", () => {
+    const cwd = repo();
+    const file = join(cwd, "..", `msg-${Date.now()}.txt`);
+    writeFileSync(file, `fix: windows line endings\r\n\r\n${"h".repeat(100)}\r\n`);
+    dirs.push(file);
+    const result = Bun.spawnSync(["git", "-c", "user.name=fbs", "-c", "user.email=fbs@example.com", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "--cleanup=verbatim", "-F", file], { cwd, env: isolatedGitEnv() });
+    expect(result.exitCode).toBe(0);
+    expect(git(cwd, "log", "-1", "--format=%B")).toContain("\r");
+    expect(check(cwd, "check", "x")).toEqual({ code: 0, out: ["ok"], err: [] });
   });
 
   test("a subject that isn't conventional and a message over the limits are listed on one line", () => {

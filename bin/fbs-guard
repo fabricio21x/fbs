@@ -14,7 +14,7 @@ open_pr() {
   return 1
 }
 # Loose on purpose: the CLI decides; these only keep Bun from starting for prompts that can't ask to rewrite a branch.
-rewrite_words='amend[a-z]*|squash[a-z]*|rebas[a-z]*|reword[a-z]*|rewrit[a-z]*|force[a-z-]*'
+rewrite_words='amend[a-z]*|[a-z]*squash[a-z]*|rebas[a-z]*|reword[a-z]*|rewrit[a-z]*|force[a-z-]*|fold|folds|folded|folding|push|pushed|pushing'
 scheduled_ask() {
   printf '%s' "$input" | grep -qE '"tool_name"[[:space:]]*:[[:space:]]*"(CronCreate|ScheduleWakeup|RemoteTrigger|Skill)"' &&
     ls "$common"/fbs/features/*.json >/dev/null 2>&1 && printf '%s' "$input" | grep -qiwE "land|merge|ship|yes|yep|yeah|y|ok|okay|sure|go|lgtm|$rewrite_words"

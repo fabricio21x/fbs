@@ -14,7 +14,7 @@ Input: the feature slug given in the arguments, or the one the hook's note names
 
 Run every `fbs` command as its own Bash call, with nothing chained, piped or redirected.
 
-Never `gh pr merge`, `gh stack merge`, the GitHub MCP's merge, or any other merge path: from the moment a PR is recorded, the guard denies them, and any force-push to its branch.
+Never `gh pr merge`, `gh stack merge`, the GitHub MCP's merge, or any other merge path: from the moment a PR is recorded, the guard denies them, and any force-push to its branch except a `--force-with-lease` push that only changes commit messages, or one the user's own go allows (camp-pr's "Rewriting the PR's branch").
 
 ## The user's go
 
