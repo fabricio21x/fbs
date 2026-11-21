@@ -790,6 +790,13 @@ test("the help lists both ways to approve", () => {
   expect(out.join("\n")).toContain("status approve <slug> design --auto <why the agent may approve it>");
 });
 
+test("the help lists renumbering a unit and moving a feature to another repo", () => {
+  const out: string[] = [];
+  expect(run(["help"], io(out, []))).toBe(0);
+  expect(out.join("\n")).toContain("status unit <unit slug> --move <n>");
+  expect(out.join("\n")).toContain("status move <slug> --to <path> [--remove-source]");
+});
+
 test("the help lists the stamp commands", () => {
   const out: string[] = [];
   expect(run(["help"], io(out, []))).toBe(0);
@@ -1536,13 +1543,14 @@ describe("work units", () => {
     return repo;
   }
 
-  test("status init --unit-of prints the unit record, numbered next or as --unit says", () => {
+  test("status init --unit-of prints the unit record, numbered next or as --unit says, a taken number shifting the units up", () => {
     const repo = unitRepo();
     const r = status(repo, "init", "f-api", "--unit-of", "f");
     expect(r.code).toBe(0);
     expect(JSON.parse(r.out.join("\n"))).toEqual({ slug: "f-api", dir: `${DIR}/units/f-api`, size: "big", approvals: {}, pr: null, unitOf: "f", unit: 1 });
     expect(JSON.parse(status(repo, "init", "f-ui", "--unit-of", "f", "--unit", "2").out.join("\n")).unit).toBe(2);
-    expect(status(repo, "init", "f-x", "--unit-of", "f", "--unit", "2")).toEqual({ code: 1, out: ["error: unit-taken: unit 2 of f is f-ui"], err: [] });
+    expect(JSON.parse(status(repo, "init", "f-x", "--unit-of", "f", "--unit", "2").out.join("\n")).unit).toBe(2);
+    expect(JSON.parse(readFileSync(join(repo, RECORDS, "f-ui.json"), "utf8")).unit).toBe(3);
     expect(status(repo, "init", "f-y", "--unit-of", "f-api")).toEqual({ code: 1, out: [expect.stringMatching(/^error: is-unit: /)], err: [] });
   });
 
@@ -1571,7 +1579,7 @@ describe("work units", () => {
     expect(JSON.parse(status(repo, "show", "f-api").out.join("\n")).approvals.design.current).toBe(false);
   });
 
-  test("status show on a feature lists its units in order with branch, PR, stamp and landed", () => {
+  test("status show on a feature lists its units in order with branch, PR, stamp and landed, marking an independent one", () => {
     const repo = unitRepo();
     expect(JSON.parse(status(repo, "show", "f").out.join("\n")).units).toBeUndefined();
     status(repo, "init", "f-ui", "--unit-of", "f", "--unit", "2");
@@ -1583,10 +1591,10 @@ describe("work units", () => {
     expect(stamp(repo, "set", "f-api", "--verdict", verdict).code).toBe(0);
     const record = JSON.parse(readFileSync(join(repo, RECORDS, "f-ui.json"), "utf8"));
     const landed = { pr: 8, repo: "acme/app", commit: "c".repeat(40), at: "2026-10-25" };
-    writeRecordFile(repo, "f-ui.json", JSON.stringify({ ...record, branch: { name: "feature/f-ui", parent: "feature/f-api", base: "d".repeat(40) }, landed }));
+    writeRecordFile(repo, "f-ui.json", JSON.stringify({ ...record, branch: { name: "feature/f-ui", parent: "main", base: "d".repeat(40) }, landed, independent: true }));
     expect(JSON.parse(status(repo, "show", "f").out.join("\n")).units).toEqual([
       { slug: "f-api", unit: 1, branch: null, pr: null, stamp: { current: true }, landed: false },
-      { slug: "f-ui", unit: 2, branch: "feature/f-ui", pr: null, stamp: null, landed: true },
+      { slug: "f-ui", unit: 2, branch: "feature/f-ui", pr: null, stamp: null, landed: true, independent: true },
     ]);
     writeFileSync(join(repo, DIR, "design.md"), `${DESIGN}edited\n`);
     git(repo, "commit", "-q", "-am", "edit design");

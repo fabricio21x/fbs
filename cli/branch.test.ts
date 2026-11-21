@@ -1668,3 +1668,139 @@ describe("a unit's branch", () => {
     expect(enter(work, { use: "feature/wit-1464" }, "f-ui").result).toMatchObject({ branch: "feature/wit-1464", parent: "main", base: landed });
   });
 });
+
+describe("an independent unit", () => {
+  const SPEC = "## Facts\n- Two beta clients (.fbs/context.md)\n## Assumptions\nNone\n## Open questions\nNone\n";
+  const unitLines = (deps: string[]) =>
+    ["Api", "Ui", "Mail", "Late"].map((name, i) => `### U${i + 1}: ${name}\n- Covers: none\n- Depends on: ${deps[i]}\n`).join("");
+  const DESIGN = `${SPEC}## Work units\n${unitLines(["none", "U1", "none", "U2"])}`;
+  const DOCS = "docs/features/2026-10-21-f";
+
+  /** Big feature f on feature/f with local documents (`design`, approved) and units f-api, f-ui, f-mail and f-late. */
+  function units(work: string, design = DESIGN): void {
+    writeFileSync(join(work, ".git/info/exclude"), "docs/features/\n");
+    initFeature(work, "f", "big", "2026-10-21");
+    enter(work, {}, "f");
+    writeFileSync(join(work, DOCS, "spec.md"), SPEC);
+    writeFileSync(join(work, DOCS, "design.md"), design);
+    approve(work, "f", "spec", "spec ok", "2026-10-21");
+    approve(work, "f", "design", "design ok", "2026-10-21");
+    for (const slug of ["f-api", "f-ui", "f-mail", "f-late"]) initUnit(work, slug, "f");
+  }
+
+  /** Branch f-api and f-ui, one commit each; returns f-ui's tip. */
+  function lowerUnits(work: string): string {
+    enter(work, {}, "f-api");
+    commitFile(work, "api.txt", "api\n");
+    enter(work, {}, "f-ui");
+    return commitFile(work, "ui.txt", "ui\n");
+  }
+
+  function landed(work: string, slug: string): void {
+    updateFeature(work, slug, (rec) => ({ ...rec, landed: { pr: 21, repo: "acme/app", commit: "c".repeat(40), at: "2026-10-25" } }));
+  }
+
+  test("--parent <default> cuts a unit that depends on no unit below from origin's default branch and records it independent", () => {
+    const { origin, work } = cloned();
+    units(work);
+    const ui = lowerUnits(work);
+    const main = pushFromElsewhere(origin);
+    expect(enter(work, { parent: "main" }, "f-mail").result).toEqual({ branch: "feature/f-mail", parent: "main", base: main, created: true, switched: true, moved: false, renamed: false });
+    expect(git(work, "rev-parse", "HEAD")).toBe(main);
+    expect(readFeature(work, "f-mail")).toMatchObject({ independent: true, branch: { name: "feature/f-mail", parent: "main", base: main } });
+    expect(enter(work, {}, "f-late").result).toMatchObject({ parent: "feature/f-ui", base: ui });
+  });
+
+  test("a unit that depends on a unit still to land is refused, and allowed once that unit landed", () => {
+    const { work } = cloned();
+    units(work, `${SPEC}## Work units\n${unitLines(["none", "U1", "none", "U1"])}`);
+    enter(work, {}, "f-api");
+    commitFile(work, "api.txt", "api\n");
+    expect(refusal(() => enter(work, { parent: "main" }, "f-ui"))).toBe("U2 depends on U1, which hasn't landed, so f-ui stays in the stack; --parent main is only for a unit that depends on no unit still to land and that no later unit depends on");
+    expect(readFeature(work, "f-ui").branch).toBeUndefined();
+    landed(work, "f-api");
+    expect(enter(work, { parent: "main" }, "f-ui").result).toMatchObject({ branch: "feature/f-ui", parent: "main" });
+    expect(readFeature(work, "f-ui").independent).toBe(true);
+  });
+
+  test("--parent takes only the default branch, never for unit 1, and refuses a unit a unit above depends on", () => {
+    const { work } = cloned();
+    units(work, `${SPEC}## Work units\n${unitLines(["none", "U1", "none", "U2, U3"])}`);
+    lowerUnits(work);
+    expect(refusal(() => enter(work, { parent: "feature/f-api" }, "f-mail"))).toBe("f-mail is unit 3 of f; its stack sets its parent, so --parent takes only the default branch main, to make it independent, or for an independent unit the branch of the unit below, to put it back");
+    expect(refusal(() => enter(work, { parent: "main" }, "f-api"))).toBe("f-api is unit 1 of f; its stack sets its parent, so --parent isn't used");
+    expect(refusal(() => enter(work, { parent: "main" }, "f-mail"))).toBe("U4 depends on U3, so f-mail stays in the stack; --parent main is only for a unit that depends on no unit still to land and that no later unit depends on");
+  });
+
+  test("--parent needs the design's approval to be current, since the design is what allows it", () => {
+    const { work } = cloned();
+    units(work);
+    lowerUnits(work);
+    writeFileSync(join(work, DOCS, "design.md"), `${DESIGN}edited\n`);
+    expect(refusal(() => enter(work, { parent: "main" }, "f-mail"))).toBe(`${DOCS}/design.md doesn't match its approval here; approve the amended design first`);
+  });
+
+  test("with tracked documents, a unit can't be independent before unit 1 lands, since its PR carries the spec and design", () => {
+    const { work } = cloned();
+    initFeature(work, "f", "big", "2026-10-21");
+    enter(work, {}, "f");
+    commitFile(work, `${DOCS}/spec.md`, SPEC);
+    commitFile(work, `${DOCS}/design.md`, DESIGN);
+    approve(work, "f", "spec", "spec ok", "2026-10-21");
+    approve(work, "f", "design", "design ok", "2026-10-21");
+    for (const slug of ["f-api", "f-ui", "f-mail"]) initUnit(work, slug, "f");
+    lowerUnits(work);
+    expect(refusal(() => enter(work, { parent: "main" }, "f-mail"))).toBe("the feature's documents are tracked and ship with unit 1, so a unit based on main would lack them until f-api lands");
+  });
+
+  test("a recorded unit branch with no PR moves onto the default branch; one with a PR, or a unit stacked on it, is refused", () => {
+    const { work } = cloned();
+    units(work);
+    const ui = lowerUnits(work);
+    enter(work, {}, "f-mail");
+    commitFile(work, "mail.txt", "mail\n");
+    enter(work, {}, "f-late");
+    expect(refusal(() => enter(work, { parent: "main" }, "f-mail"))).toBe("f-late is stacked on feature/f-mail; it can't leave the stack");
+    updateFeature(work, "f-late", ({ branch: _, ...rec }) => rec);
+    git(work, "switch", "-q", "feature/f-mail");
+    git(work, "branch", "-q", "-D", "feature/f-late");
+    setPr(work, "f-mail", 14, "acme/app");
+    expect(refusal(() => enter(work, { parent: "main" }, "f-mail"))).toBe("feature/f-mail has an open PR; it can't move");
+    updateFeature(work, "f-mail", ({ repo: _, ...rec }) => ({ ...rec, pr: null }));
+    const main = git(work, "rev-parse", "origin/main");
+    expect(enter(work, { parent: "main" }, "f-mail").result).toMatchObject({ branch: "feature/f-mail", parent: "main", base: main, moved: true });
+    expect(git(work, "log", "--format=%s", "main..feature/f-mail").split("\n")).toEqual(["write mail.txt"]);
+    expect(readFeature(work, "f-mail")).toMatchObject({ independent: true, branch: { parent: "main", base: main } });
+    expect(enter(work, {}, "f-late").result).toMatchObject({ parent: "feature/f-ui", base: ui });
+  });
+
+  test("a unit that depends on an independent unit still to land is refused a branch until it lands", () => {
+    const { work } = cloned();
+    units(work);
+    lowerUnits(work);
+    enter(work, { parent: "main" }, "f-mail");
+    writeFileSync(join(work, DOCS, "design.md"), `${SPEC}## Work units\n${unitLines(["none", "U1", "none", "U2, U3"])}`);
+    approve(work, "f", "design", "design ok again", "2026-10-22");
+    expect(refusal(() => enter(work, {}, "f-late"))).toBe("U4 depends on U3, f-mail, which is independent and hasn't landed; land f-mail first");
+    landed(work, "f-mail");
+    expect(enter(work, {}, "f-late").result).toMatchObject({ parent: "feature/f-ui" });
+  });
+
+  test("--parent <the branch of the unit below> puts an independent unit with no PR back in the stack", () => {
+    const { work } = cloned();
+    units(work);
+    const ui = lowerUnits(work);
+    enter(work, { parent: "main" }, "f-mail");
+    commitFile(work, "mail.txt", "mail\n");
+    expect(refusal(() => enter(work, { parent: "feature/f-api" }, "f-mail"))).toBe("f-mail goes back onto feature/f-ui, the branch of the unit below it in the stack");
+    setPr(work, "f-mail", 14, "acme/app");
+    expect(refusal(() => enter(work, { parent: "feature/f-ui" }, "f-mail"))).toBe(
+      "f-mail has PR #14 open against main; land what it depends on first, or close that PR, clear it with fbs status pr f-mail none, and run this again",
+    );
+    updateFeature(work, "f-mail", ({ repo: _, ...rec }) => ({ ...rec, pr: null }));
+    expect(enter(work, { parent: "feature/f-ui" }, "f-mail").result).toMatchObject({ branch: "feature/f-mail", parent: "feature/f-ui", base: ui, moved: true });
+    expect(git(work, "log", "--format=%s", "feature/f-ui..feature/f-mail").split("\n")).toEqual(["write mail.txt"]);
+    expect(readFeature(work, "f-mail").independent).toBeUndefined();
+    expect(enter(work, {}, "f-late").result).toMatchObject({ parent: "feature/f-mail" });
+  });
+});

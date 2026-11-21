@@ -20,7 +20,25 @@ import {
 } from "./git";
 import { BRANCH_FAMILY, BRANCH_TYPES, COMMIT_FAMILY, CONFIG_PATH, projectConfig } from "./config";
 import { protectedBranches } from "./guard";
-import { type FeatureBranch, type FeatureRecord, isBranchName, isUnit, listFeatures, readFeature, StatusError, type UnitRecord, unitBelow, updateFeature } from "./status";
+import {
+  docPath,
+  docsMode,
+  type FeatureBranch,
+  type FeatureRecord,
+  featureUnits,
+  independenceProblems,
+  isApprovalCurrent,
+  isBranchName,
+  isUnit,
+  listFeatures,
+  plannedUnit,
+  plannedUnits,
+  readFeature,
+  StatusError,
+  type UnitRecord,
+  unitBelow,
+  updateFeature,
+} from "./status";
 
 /** A switch fbs won't make, such as one that would overwrite uncommitted changes. */
 export class BranchRefusedError extends Error {
@@ -55,7 +73,8 @@ export interface PushResult {
 /**
  * `type` and `ticket` name a new branch, `<type>/<ticket>-<slug>` or `<type>/<slug>`; `type` is ignored once one is recorded and both with `use`;
  * a new branch takes the record's ticket when `ticket` is unset; a recorded branch fbs cut is renamed to carry an explicit `ticket`;
- * `parent` is where a new branch starts, or where a recorded one moves to; a unit's comes from its stack instead;
+ * `parent` is where a new branch starts, or where a recorded one moves to; a unit's comes from its stack instead, but
+ * the default branch makes a unit independent when its design allows (assertIndependent);
  * `existing` never creates a branch; `use` adopts a branch the user named instead.
  */
 export interface BranchChoice {
@@ -141,7 +160,7 @@ export function enterFeatureBranch(cwd: string, slug: string, choice: BranchChoi
   }
   const withTicket = (rec: FeatureRecord): BranchChoice => ({ ...choice, ticket: choice.ticket ?? rec.ticket?.id });
   const known = readFeature(cwd, slug);
-  if (isUnit(known) && choice.parent !== undefined) throw new BranchRefusedError(`${slug} is unit ${known.unit} of ${known.unitOf}; its stack sets its parent, so --parent isn't used`);
+  const parentMove = isUnit(known) && choice.parent !== undefined ? unitParentMove(cwd, known, choice.parent as string) : null;
   // Only a new branch takes the record's ticket; a recorded one is renamed only for an explicit --ticket.
   const naming = known.branch === undefined ? withTicket(known) : choice;
   const configured = projectConfig(cwd).branches?.types;
@@ -157,12 +176,56 @@ export function enterFeatureBranch(cwd: string, slug: string, choice: BranchChoi
       step = resume(cwd, rec.branch, rec.pr !== null, choice.parent, origin, note);
       if (newName !== null) step = rename(cwd, step, newName, note);
     } else if (choice.existing) throw new BranchRefusedError(`no branch recorded for ${slug}`);
-    else if (isUnit(rec)) step = createUnit(cwd, newBranchName(slug, withTicket(rec), configured), rec, origin, note);
+    else if (isUnit(rec) && parentMove !== "leave") step = createUnit(cwd, newBranchName(slug, withTicket(rec), configured), rec, origin, note);
     else step = create(cwd, newBranchName(slug, withTicket(rec), configured), choice.parent ?? defaultBranch(cwd), origin, note);
     result = step.result;
-    return { ...rec, branch: step.branch };
+    const { independent: _, ...inStack } = rec;
+    return { ...(parentMove === "rejoin" ? inStack : rec), branch: step.branch, ...(parentMove === "leave" && { independent: true as const }) };
   });
   return result as BranchResult;
+}
+
+/**
+ * What `--parent` does to a unit: the default branch takes it out of the stack (`leave`, assertIndependent), and for an
+ * independent unit with no PR the branch of the unit below puts it back (`rejoin`). Anything else is refused.
+ */
+function unitParentMove(cwd: string, unit: UnitRecord, parent: string): "leave" | "rejoin" {
+  const { slug, unitOf, unit: n } = unit;
+  if (n === 1) throw new BranchRefusedError(`${slug} is unit 1 of ${unitOf}; its stack sets its parent, so --parent isn't used`);
+  const main = defaultBranch(cwd);
+  if (parent === main) {
+    assertIndependent(cwd, unit, main);
+    return "leave";
+  }
+  if (!unit.independent) {
+    throw new BranchRefusedError(`${slug} is unit ${n} of ${unitOf}; its stack sets its parent, so --parent takes only the default branch ${main}, to make it independent, or for an independent unit the branch of the unit below, to put it back`);
+  }
+  const below = stackedOn(cwd, unit);
+  if (below === null || parent !== below.name) throw new BranchRefusedError(`${slug} goes back onto ${below?.name ?? main}, the branch of the unit below it in the stack`);
+  if (unit.pr !== null) throw new BranchRefusedError(`${slug} has PR #${unit.pr} open against ${main}; land what it depends on first, or close that PR, clear it with fbs status pr ${slug} none, and run this again`);
+  return "rejoin";
+}
+
+/**
+ * Refuse to take a unit out of the stack unless the approved design lets it stand apart (independenceProblems) and
+ * nothing is stacked on its branch. With tracked documents, unit 1 must have landed too, since its PR is what carries
+ * the spec and design.
+ */
+function assertIndependent(cwd: string, unit: UnitRecord, main: string): void {
+  const { slug, unitOf, unit: n } = unit;
+  if (!isApprovalCurrent(cwd, unit, "design")) throw new BranchRefusedError(`${docPath(cwd, unit, "design")} doesn't match its approval here; approve the amended design first`);
+  const planned = plannedUnits(cwd, unit);
+  if (!planned.some((entry) => entry.number === n)) throw new BranchRefusedError(`${docPath(cwd, unit, "design")} lists no U${n} under Work units`);
+  const units = featureUnits(cwd, unitOf);
+  const problems = independenceProblems(unit, units, planned);
+  if (problems.length > 0) throw new BranchRefusedError(`${problems.join(", and ")}, so ${slug} stays in the stack; --parent ${main} is only for a unit that depends on no unit still to land and that no later unit depends on`);
+  const first = units.find((other) => other.unit === 1);
+  if (docsMode(cwd, unit) === "tracked" && first?.landed === undefined) {
+    throw new BranchRefusedError(`the feature's documents are tracked and ship with unit 1, so a unit based on ${main} would lack them until ${first?.slug ?? "unit 1"} lands`);
+  }
+  const name = unit.branch?.name;
+  const stacked = name === undefined ? undefined : listFeatures(cwd, () => {}).find((other) => other.slug !== slug && other.branch?.parent === name);
+  if (stacked !== undefined) throw new BranchRefusedError(`${stacked.slug} is stacked on ${name}; it can't leave the stack`);
 }
 
 type Step = { branch: FeatureBranch; result: BranchResult };
@@ -223,7 +286,7 @@ function namesOnOrigin(cwd: string, rec: FeatureRecord, choice: BranchChoice, co
     return [recorded.name, ...(newName !== null ? [newName] : []), ...parent];
   }
   if (choice.existing) return [];
-  if (isUnit(rec)) return [newBranchName(slug, choice, configured), stackedOn(cwd, rec)?.name ?? defaultBranch(cwd)];
+  if (isUnit(rec)) return [newBranchName(slug, choice, configured), (choice.parent === undefined ? stackedOn(cwd, rec)?.name : undefined) ?? defaultBranch(cwd)];
   return [newBranchName(slug, choice, configured), ...(choice.parent !== undefined ? [choice.parent] : defaultNames(cwd))];
 }
 
@@ -282,10 +345,22 @@ function tipOf(cwd: string, below: FeatureBranch): string {
   return ref;
 }
 
-/** The recorded branch a unit stacks on: its feature's for unit 1, else unit k-1's; null once that one has landed. */
+/**
+ * The recorded branch a unit stacks on: its feature's for unit 1, else the nearest lower unit's that isn't independent;
+ * null once that one has landed. Refused while the unit depends on an independent unit that hasn't landed, whose work
+ * the stack doesn't hold.
+ */
 function stackedOn(cwd: string, unit: UnitRecord): FeatureBranch | null {
+  const units = featureUnits(cwd, unit.unitOf);
+  const deps = (plannedUnit(cwd, unit)?.dependsOn ?? []).map((dep) => units.find((other) => other.unit === dep));
+  const waiting = deps.find((dep) => dep?.independent && dep.landed === undefined);
+  if (waiting !== undefined) throw new BranchRefusedError(`U${unit.unit} depends on U${waiting.unit}, ${waiting.slug}, which is independent and hasn't landed; land ${waiting.slug} first`);
   const below = unit.unit === 1 ? readFeature(cwd, unit.unitOf) : unitBelow(cwd, unit);
-  if (below === null) throw new BranchRefusedError(`unit ${unit.unit - 1} of ${unit.unitOf} has no record; ${unit.slug} stacks on it`);
+  if (below === null) {
+    let missing = unit.unit - 1;
+    while (units.find((other) => other.unit === missing)?.independent) missing--;
+    throw new BranchRefusedError(`unit ${missing} of ${unit.unitOf} has no record; ${unit.slug} stacks on it`);
+  }
   if (below.landed !== undefined) return null;
   if (below.branch === undefined) throw new BranchRefusedError(`${below.slug} has no branch yet; ${unit.slug} stacks on it, so run fbs branch ${below.slug} first`);
   return below.branch;

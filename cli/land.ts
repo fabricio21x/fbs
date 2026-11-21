@@ -4,7 +4,7 @@ import { campMarkerPath, freshToken, isSlug, type LandRequest, landTokenPath, la
 import { commitTree, fetchBranch, gitCommonDir } from "./git";
 import { GhError, type GhRunner, newestRuns } from "./github";
 import { plainFeaturesOn, type Restack, restackAbove, restackUnits } from "./stack";
-import { type FeatureRecord, type OverCheck, featurePr, featureUnits, isUnit, listFeatures, nextToLand, readFeature, StatusError, type UnitRecord, updateFeature } from "./status";
+import { type FeatureRecord, type OverCheck, featurePr, featureUnits, independenceProblem, isUnit, listFeatures, nextToLand, readFeature, StatusError, type UnitRecord, updateFeature } from "./status";
 
 export class LandRefusedError extends Error {
   readonly reasons: string[];
@@ -281,7 +281,7 @@ function noChecksProblem(gh: GhRunner, cwd: string, repo: string, pr: number, fa
 
 /**
  * Land the feature's PR if everything holds; throws LandRefusedError with every reason otherwise. A feature with units
- * lands its next unit, and a unit lands only when it is the next: bottom-up.
+ * lands its next unit, and a unit lands only when it is the next: bottom-up. An independent unit lands whenever it's ready.
  */
 export function land(cwd: string, typed: string, gh: GhRunner, now: number, today: string, session: string | null = null, sleep: (ms: number) => void = () => {}): LandResult {
   if (!isSlug(typed)) throw new StatusError("bad-slug", `${JSON.stringify(typed)} must be lowercase words joined by single hyphens`);
@@ -379,7 +379,9 @@ function localProblems(cwd: string, typed: string, slug: string): { rec: Feature
   if (isUnit(rec)) {
     const next = nextToLand(cwd, rec.unitOf);
     if (rec.landed !== undefined) problems.push(`${slug} has landed already`);
-    else if (next !== null && next.slug !== slug) problems.push(`land bottom-up: unit ${next.unit} of ${rec.unitOf}, ${next.slug}, lands before ${slug}`);
+    else if (!rec.independent && next !== null && next.slug !== slug) problems.push(`land bottom-up: unit ${next.unit} of ${rec.unitOf}, ${next.slug}, lands before ${slug}`);
+    const apart = independenceProblem(cwd, rec);
+    if (apart !== null) problems.push(apart);
   }
   if (rec.pr === null) problems.push(`no PR recorded for ${slug}`);
   if (!rec.stamp) problems.push(`${slug} has no verify stamp`);
@@ -483,11 +485,15 @@ function adminProblems(gh: GhRunner, cwd: string, repo: string, facts: LandFacts
   return problems;
 }
 
-/** The unlanded units stacked on `unit`, lowest first: the one above when its PR is open, and each above that on the one below. */
+/**
+ * The unlanded units stacked on `unit`, lowest first: the one above when its PR is open, and each above that on the one
+ * below; independent units are skipped, and nothing is stacked on one.
+ */
 function unitsOn(cwd: string, unit: UnitRecord): UnitRecord[] {
+  if (unit.independent) return [];
   const chain: UnitRecord[] = [];
   let below: UnitRecord = unit;
-  for (const next of featureUnits(cwd, unit.unitOf).filter((other) => other.unit > unit.unit)) {
+  for (const next of featureUnits(cwd, unit.unitOf).filter((other) => other.unit > unit.unit && !other.independent)) {
     const open = chain.length > 0 || (next.pr !== null && next.repo !== undefined);
     if (!open || next.landed !== undefined || next.branch === undefined || next.branch.parent !== below.branch?.name) break;
     chain.push(next);

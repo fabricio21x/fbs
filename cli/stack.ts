@@ -29,7 +29,7 @@ import {
 } from "./git";
 import type { GhRunner } from "./github";
 import { campMarkerPath } from "./guard";
-import { clearPr, type FeatureBranch, type FeatureRecord, featureUnits, isUnit, listFeatures, readFeature, type UnitRecord, updateFeature } from "./status";
+import { clearPr, type FeatureBranch, type FeatureRecord, featureUnits, independenceProblem, isUnit, listFeatures, readFeature, type UnitRecord, updateFeature } from "./status";
 
 /** A unit or feature that landed below: the PR head its merge took (null when unknown) and the squash commit on the default branch. */
 export interface LandedBelow {
@@ -40,9 +40,10 @@ export interface LandedBelow {
 /**
  * Why a unit couldn't be synced or restacked, for a skill to branch on; `reason` says it for a person. `gone`: its
  * branch or origin's default branch is missing; `missing-below`: the branch it stacks on is; `not-merged-yet`: the
- * squash commit isn't on origin's default branch; `error`: an unexpected git failure during land's restack.
+ * squash commit isn't on origin's default branch; `error`: an unexpected git failure during land's restack;
+ * `not-independent`: the design no longer lets an independent unit stand apart, so sync leaves it as it is.
  */
-export type StopKind = "conflict" | "dirty" | "diverged" | "gone" | "missing-below" | "not-merged-yet" | "push-rejected" | "retarget-failed" | "error";
+export type StopKind = "conflict" | "dirty" | "diverged" | "gone" | "missing-below" | "not-merged-yet" | "push-rejected" | "retarget-failed" | "error" | "not-independent";
 
 /**
  * What the restack of a branch stacked on a moved one did; it never fails the land. `treeChanged` is against what was
@@ -279,7 +280,8 @@ export interface SyncResult {
 
 /**
  * Keep every unlanded unit of a feature holding the tip of the unit below it, bottom-up; a unit's slug stands for its
- * feature. A unit whose PR was merged outside fbs land is recorded as landed first. A unit still stacked on a landed
+ * feature. An independent unit is skipped in the chain, the unit above it holding the one below it, and is only
+ * fast-forwarded, in a pass of its own; one the design no longer lets stand apart is reported, not touched. A unit whose PR was merged outside fbs land is recorded as landed first. A unit still stacked on a landed
  * unit is rebased onto the default branch, pushed and retargeted, and the units above it are rebased onto it in turn;
  * a unit whose parent is the default branch is only fast-forwarded. It stops at the first unit it can't sync, and
  * before the first unit with no branch yet. A feature without units is synced as a plain feature (syncPlain).
@@ -303,6 +305,7 @@ export function syncStack(cwd: string, slug: string, gh: GhRunner, today: string
   if (parent !== null && "kind" in parent) outside.push(parent);
   const parentLanded = parent !== null && !("kind" in parent) ? parent : null;
   for (const unit of units) {
+    if (unit.independent) continue;
     if (unit.landed !== undefined) {
       below = unit;
       continue;
@@ -314,7 +317,13 @@ export function syncStack(cwd: string, slug: string, gh: GhRunner, today: string
     below = readFeature(cwd, unit.slug);
     moved = result.moved;
   }
-  return { units: synced, outside };
+  // Nothing stacks on an independent unit, so it is synced in a pass of its own, which the stack stopping never skips.
+  for (const unit of units.filter((u) => u.independent && u.landed === undefined && u.branch !== undefined)) {
+    const reason = independenceProblem(cwd, unit);
+    const kept = { slug: unit.slug, unit: unit.unit, fastForwarded: false, merged: null, treeChanged: false, retargeted: false, pushNeeded: false };
+    synced.push(reason === null ? syncUnit(cwd, gh, unit, null, null, null, main, landedHeads).unit : { ...kept, done: false, kind: "not-independent", reason });
+  }
+  return { units: synced.sort((a, b) => a.unit - b.unit), outside };
 }
 
 /**

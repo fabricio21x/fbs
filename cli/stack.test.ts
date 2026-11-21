@@ -59,8 +59,9 @@ interface Stack {
 /**
  * Feature f with units f-a, f-b and f-c stacked in order, each rewriting the same line of shared.txt, pushed to a bare
  * origin with their PRs recorded and stamped. `verdict` commits a verdict on f-a after the units above were cut.
+ * `independent` cuts f-b from main instead, writing b.txt, and records it independent, so f-c stacks on f-a.
  */
-function stack(options: { verdict?: boolean; on?: string; outside?: string } = {}): Stack {
+function stack(options: { verdict?: boolean; on?: string; outside?: string; independent?: boolean } = {}): Stack {
   const origin = join(tempDir(), "origin.git");
   git(dirname(origin), "init", "-q", "--bare", "-b", "main", origin);
   const work = join(tempDir(), "work");
@@ -75,6 +76,7 @@ function stack(options: { verdict?: boolean; on?: string; outside?: string } = {
   const dir = "docs/features/2026-10-21-f";
   mkdirSync(join(common, "fbs", "features"), { recursive: true });
   writeFileSync(join(common, "fbs", "features", "f.json"), JSON.stringify({ slug: "f", dir, size: "big", approvals: {}, pr: null }));
+  const init = base;
   let parent = "main";
   if (options.outside !== undefined) {
     git(work, "switch", "-q", "-c", options.outside);
@@ -83,10 +85,14 @@ function stack(options: { verdict?: boolean; on?: string; outside?: string } = {
     parent = options.outside;
   }
   for (const u of UNITS) {
-    git(work, "switch", "-q", "-c", u.branch);
-    const tip = commitFile(work, "shared.txt", `a\n${u.line}\nc\n`, `feat: ${u.slug}`, "--author", AUTHOR, "--date", AUTHOR_DATE);
-    const record = { slug: u.slug, dir: `${dir}/units/${u.slug}`, size: "big", approvals: {}, pr: u.pr, repo: "acme/app", unitOf: "f", unit: u.unit, branch: { name: u.branch, parent, base } };
+    const alone = options.independent === true && u.slug === "f-b";
+    git(work, "switch", "-q", "-c", u.branch, alone ? "main" : parent);
+    const authored = ["--author", AUTHOR, "--date", AUTHOR_DATE];
+    const tip = alone ? commitFile(work, "b.txt", "B2\n", `feat: ${u.slug}`, ...authored) : commitFile(work, "shared.txt", `a\n${u.line}\nc\n`, `feat: ${u.slug}`, ...authored);
+    const branch = alone ? { name: u.branch, parent: "main", base: init } : { name: u.branch, parent, base };
+    const record = { slug: u.slug, dir: `${dir}/units/${u.slug}`, size: "big", approvals: {}, pr: u.pr, repo: "acme/app", unitOf: "f", unit: u.unit, branch, ...(alone && { independent: true }) };
     writeFileSync(join(common, "fbs", "features", `${u.slug}.json`), JSON.stringify(record));
+    if (alone) continue;
     parent = u.branch;
     base = tip;
   }
@@ -223,6 +229,46 @@ test("a restack that carries a local commit nobody stamped reports the tree chan
   expect(show(s, originTip(s, "f-b"), "wip.txt")).toBe("wip");
 });
 
+test("an independent unit lands before the units below it and restacks nothing; the unit above it is restacked when the one below lands", () => {
+  const s = stack({ independent: true });
+  const { gh } = fakeGh(s);
+  const above = originTip(s, "f-c");
+  expect(landUnit(s, gh, "f-b")).toMatchObject({ slug: "f-b", unit: 2, restack: null });
+  expect(originTip(s, "f-c")).toBe(above);
+  expect(landUnit(s, gh, "f-a")).toMatchObject({ slug: "f-a", restack: { slug: "f-c", done: true, treeChanged: true } });
+  expect(ownCommits(s, "feature/f-c")).toEqual(["feat: f-c"]);
+  expect(show(s, originTip(s, "f-c"), "b.txt")).toBe("B2");
+  expect(readFeature(s.work, "f-c").branch).toMatchObject({ parent: "main" });
+  expect(show(s, "main", "b.txt")).toBe("B2");
+});
+
+/** Write feature f's design into the checkout with `deps` as each unit's Depends on, as an amendment would. */
+function design(s: Stack, deps: string[]): void {
+  const units = deps.map((dep, i) => `### U${i + 1}: Part ${i + 1}\n- Covers: none\n- Depends on: ${dep}\n`).join("");
+  mkdirSync(join(s.work, "docs/features/2026-10-21-f"), { recursive: true });
+  writeFileSync(join(s.work, "docs/features/2026-10-21-f/design.md"), `## Work units\n${units}`);
+}
+
+const NO_LONGER = "f-b is independent, but U2 depends on U1, which hasn't landed; put it back in the stack (fbs branch f-b --parent <the branch of the unit below>, once it has no PR), or amend the design";
+
+test("an independent unit the design now makes depend on a unit still to land is refused, and sync reports it without touching it", () => {
+  const s = stack({ independent: true });
+  design(s, ["none", "U1", "U1"]);
+  const { gh } = fakeGh(s);
+  let reasons: string[] = [];
+  try {
+    landUnit(s, gh, "f-b");
+  } catch (e) {
+    reasons = (e as { reasons: string[] }).reasons;
+  }
+  expect(reasons).toEqual([NO_LONGER]);
+  const before = originTip(s, "f-b");
+  expect(syncStack(s.work, "f", gh, "2026-10-25").units.find((unit) => unit.slug === "f-b")).toMatchObject({ done: false, kind: "not-independent", reason: NO_LONGER });
+  expect(originTip(s, "f-b")).toBe(before);
+  design(s, ["none", "none", "U1"]);
+  expect(landUnit(s, gh, "f-b")).toMatchObject({ slug: "f-b", restack: null });
+});
+
 test("land leaves a unit above alone when it isn't stacked on the landed unit", () => {
   const s = stack();
   updateFeature(s.work, "f-b", (rec) => ({ ...rec, branch: { ...(rec.branch as NonNullable<typeof rec.branch>), parent: "main" } }));
@@ -280,6 +326,29 @@ describe("fbs stack sync", () => {
     const before = tips(s);
     expect(sync(s.work, "f", fakeGh(s).gh)).toEqual(first.map((unit) => ({ ...unit, merged: null })));
     expect(tips(s)).toEqual(before);
+  });
+
+  test("the unit above an independent unit holds the unit below it, skipping the independent one, which is only kept up with origin", () => {
+    const s = stack({ independent: true, verdict: true });
+    expect(sync(s.work, "f", fakeGh(s).gh)).toEqual([
+      { slug: "f-a", unit: 1, ...quiet, pushNeeded: false },
+      { slug: "f-b", unit: 2, ...quiet, pushNeeded: false },
+      { slug: "f-c", unit: 3, ...quiet, merged: "feature/f-a", treeChanged: true, pushNeeded: true },
+    ]);
+    expect(git(s.work, "show", `${local(s, "f-c")}:docs/features/2026-10-21-f/units/f-a/verdict.md`)).toBe("Verdict: pass");
+    expect(() => git(s.work, "show", `${local(s, "f-c")}:b.txt`)).toThrow();
+    const squash = landedWithoutRestack(s, "f-a");
+    expect(sync(s.work, "f", fakeGh(s).gh)).toEqual([
+      { slug: "f-b", unit: 2, ...quiet, pushNeeded: false },
+      { slug: "f-c", unit: 3, ...quiet, merged: "origin/main", retargeted: true, treeChanged: true, pushNeeded: false },
+    ]);
+    expect(readFeature(s.work, "f-c").branch).toMatchObject({ parent: "main", base: squash });
+  });
+
+  test("an independent unit is synced even when the stack stops below it", () => {
+    const s = stack({ independent: true });
+    updateFeature(s.work, "f-a", ({ branch: _, ...rec }) => rec);
+    expect(sync(s.work, "f", fakeGh(s).gh)).toEqual([{ slug: "f-b", unit: 2, ...quiet, pushNeeded: false }]);
   });
 
   test("after land restacked units 2 and 3, sync has nothing left to do", () => {

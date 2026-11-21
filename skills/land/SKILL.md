@@ -26,7 +26,7 @@ Never `gh pr merge`, `gh stack merge`, the GitHub MCP's merge, or any other merg
 
 ## 1. Find the PR
 
-The arguments may carry the user's own words after the command ("it's ready, merge it"): their first word is the slug only when `fbs status show <it>` finds that feature. Run `fbs status show <slug>` and take `pr`. No slug given: run `fbs status list` and take the one feature whose PR is open (work units count as their feature); with several, ask which. No `pr`: say there's nothing to land and stop. A feature with work units (its record lists `units`) lands one unit per go, bottom-up: `fbs land <feature>` takes its lowest unit with an open PR.
+The arguments may carry the user's own words after the command ("it's ready, merge it"): their first word is the slug only when `fbs status show <it>` finds that feature. Run `fbs status show <slug>` and take `pr`. No slug given: run `fbs status list` and take the one feature whose PR is open (work units count as their feature); with several, ask which. No `pr`: say there's nothing to land and stop. A feature with work units (its record lists `units`) lands one unit per go, bottom-up: `fbs land <feature>` takes its lowest unit with an open PR. An independent unit (its record has `independent`) lands by its own slug whenever it's ready.
 
 ## 2. Land it
 

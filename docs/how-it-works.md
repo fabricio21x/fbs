@@ -118,6 +118,12 @@ Units share the feature's spec and design, so an amendment aimed at one unit doe
 
 Only the lowest unit can land, since only it is based on the default branch. After it lands, `fbs land` rebases the unit above onto the default branch, force-pushes it once with a lease from inside the CLI, and retargets its PR, so the next PR lists only its own commits. When replaying a unit's commits conflicts across the merges that brought the unit below in, the restack folds the unit's own change into one commit on its new base instead, and says so; only when that conflicts too does it stop. When a rebase changes a unit's tree, its stamp no longer holds and it is verified again. A feature cut from a branch made outside fbs is restacked the same way once `fbs stack sync` finds that branch's PR merged and the branch deleted on origin; while the branch still exists, as a long-lived `develop` does, sync only says so.
 
+A unit doesn't have to wait on the stack when the design says it depends on no unit still to land and no later unit depends on it. `fbs branch <unit> --parent <default branch>` makes it independent: it is cut from the default branch, its PR opens against it, and it lands whenever it's ready. The stack goes on without it: the unit above it stacks on the unit below it, and sync and land skip it. The CLI checks the approved design before allowing it, and again when it lands, syncs or is renumbered: once a design change gives it a dependency still to land, or makes a later unit depend on it, land refuses it until `fbs branch <unit> --parent <the branch of the unit below>` puts it back in the stack (before it has a PR).
+
+When an amended design inserts or reorders units, `fbs status init <unit> --unit-of <feature> --unit <n>` inserts one, shifting the units at and above it, and `fbs status unit <unit> --move <n>` renumbers one. Both refuse a change that would put a different unit under a unit whose branch is already cut.
+
+A feature that turns out to belong in another repo moves with `fbs status move <slug> --to <path>`: its records and documents go across, without the branches, PRs and stamps, which belong to the old repo. A feature with a landed unit stays where it shipped.
+
 ## The issue tracker
 
 When a project uses Linear or GitHub Issues, the `tracker` building block plans with it.

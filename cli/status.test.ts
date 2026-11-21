@@ -20,14 +20,20 @@ import {
   initUnit,
   isApprovalCurrent,
   listFeatures,
+  independenceProblems,
+  moveUnit,
+  nextToLand,
   plannedUnit,
+  plannedUnits,
   readFeature,
   recordRollout,
   RecordError,
   setTicket,
   unitAbove,
   unitBelow,
+  updateFeature,
 } from "./status";
+import { run } from "./main";
 import { isolatedGitEnv } from "./test-env";
 
 const PASSING_SPEC = "## Facts\n- Two beta clients (.fbs/context.md)\n## Assumptions\nNone\n## Open questions\nNone\n";
@@ -751,13 +757,6 @@ test("initUnit refuses a number the design's Work units don't list, given or nex
   expect(() => initUnit(repo, "g-one", "g")).toThrow(/bad-unit: .*lists no U1 under Work units/);
 });
 
-test("initUnit refuses a number another unit has, and records nothing", () => {
-  designApprovedFeature();
-  initUnit(repo, "f-api", "f");
-  expect(() => initUnit(repo, "f-ui", "f", 1)).toThrow(/unit-taken: unit 1 of f is f-api/);
-  expect(existsSync(join(repo, RECORDS, "f-ui.json"))).toBe(false);
-});
-
 test("initUnit refuses a missing feature, a feature that isn't big, and a unit of a unit", () => {
   expect(() => initUnit(repo, "u", "nope")).toThrow(/missing/);
   initFeature(repo, "m", "mid", "2026-10-21");
@@ -825,4 +824,154 @@ test("plannedUnit reads the unit's entry from the feature's design, or null with
   expect(plannedUnit(repo, extra)).toBeNull();
   rmSync(join(repo, readFeature(repo, "f").dir, "design.md"));
   expect(plannedUnit(repo, api)).toBeNull();
+});
+
+test("readFeature reads independent on a unit, and refuses it anywhere else or with another value", () => {
+  const unit = { ...VALID, size: "big", unitOf: "f", unit: 2, independent: true };
+  writeRecordFile("x.json", unit);
+  expect(readFeature(repo, "x")).toEqual(unit as FeatureRecord);
+  writeRecordFile("x.json", { ...VALID, independent: true });
+  expect(() => readFeature(repo, "x")).toThrow(/independent/);
+  writeRecordFile("x.json", { ...unit, independent: false });
+  expect(() => readFeature(repo, "x")).toThrow(/independent/);
+});
+
+/** Mark a unit independent, based on main, as fbs branch --parent main would. */
+function independent(slug: string): void {
+  updateFeature(repo, slug, (rec) => ({ ...rec, independent: true, branch: { name: `feature/${slug}`, parent: "main", base: "d".repeat(40) } }));
+}
+
+test("unitBelow skips an independent unit: the unit above it stacks on the nearest unit in the chain", () => {
+  designApprovedFeature();
+  const api = initUnit(repo, "f-api", "f");
+  initUnit(repo, "f-ui", "f");
+  const extra = initUnit(repo, "f-extra", "f");
+  independent("f-ui");
+  expect(unitBelow(repo, extra)).toEqual(api);
+});
+
+test("nextToLand takes the lowest unit of the chain with an open PR, and an independent one only when the chain has none", () => {
+  designApprovedFeature();
+  for (const slug of ["f-api", "f-ui", "f-extra"]) initUnit(repo, slug, "f");
+  independent("f-api");
+  for (const [slug, pr] of [["f-api", 11], ["f-extra", 13]] as const) updateFeature(repo, slug, (rec) => ({ ...rec, pr, repo: "acme/app" }));
+  expect(nextToLand(repo, "f")?.slug).toBe("f-extra");
+  updateFeature(repo, "f-extra", (rec) => ({ ...rec, landed: { pr: 13, repo: "acme/app", commit: "c".repeat(40), at: "2026-10-25" } }));
+  expect(nextToLand(repo, "f")?.slug).toBe("f-api");
+});
+
+const FOUR_DESIGN = `${UNITS_DESIGN}### U4: More\n- Covers: none\n- Depends on: U3\n`;
+
+/** A big feature f with a four-unit design approved and units 1 to 3 recorded: f-api, f-ui, f-extra. */
+function fourUnits(): void {
+  initFeature(repo, "f", "big", "2026-10-21");
+  writeDoc("f", "spec.md", PASSING_SPEC);
+  writeDoc("f", "design.md", FOUR_DESIGN);
+  approve(repo, "f", "spec", "spec ok", "2026-10-21");
+  approve(repo, "f", "design", "design ok", "2026-10-21");
+  for (const slug of ["f-api", "f-ui", "f-extra"]) initUnit(repo, slug, "f");
+}
+
+const numbers = () => featureUnits(repo, "f").map((unit) => [unit.slug, unit.unit]);
+
+/** Record a branch on `slug` cut from `parent`, with a PR when given. */
+function branched(slug: string, parent: string, pr?: number): void {
+  updateFeature(repo, slug, (rec) => ({ ...rec, branch: { name: `feature/${slug}`, parent, base: "d".repeat(40) }, ...(pr !== undefined && { pr, repo: "acme/app" }) }));
+}
+
+test("moveUnit renumbers a unit and shifts the units between, down and up", () => {
+  fourUnits();
+  expect(moveUnit(repo, "f-extra", 1).map((unit) => [unit.slug, unit.unit])).toEqual([["f-extra", 1], ["f-api", 2], ["f-ui", 3]]);
+  expect(numbers()).toEqual([["f-extra", 1], ["f-api", 2], ["f-ui", 3]]);
+  moveUnit(repo, "f-extra", 3);
+  expect(numbers()).toEqual([["f-api", 1], ["f-ui", 2], ["f-extra", 3]]);
+  moveUnit(repo, "f-ui", 4);
+  expect(numbers()).toEqual([["f-api", 1], ["f-extra", 2], ["f-ui", 4]]);
+  expect(moveUnit(repo, "f-ui", 4).map((unit) => unit.unit)).toEqual([1, 2, 4]);
+});
+
+test("moveUnit refuses a move that would stack a branched unit on another unit than it was cut from, and changes nothing", () => {
+  fourUnits();
+  branched("f-api", "main");
+  branched("f-ui", "feature/f-api", 12);
+  expect(() => moveUnit(repo, "f-extra", 2)).toThrow("breaks-stack: f-ui's branch feature/f-ui (PR #12) was cut from f-api, but this would put f-extra below it; renumber only units above f-ui, or land it first");
+  expect(() => moveUnit(repo, "f-ui", 3)).toThrow(/breaks-stack: f-ui's branch feature\/f-ui \(PR #12\) was cut from f-api, but this would put f-extra below it/);
+  expect(numbers()).toEqual([["f-api", 1], ["f-ui", 2], ["f-extra", 3]]);
+  expect(moveUnit(repo, "f-extra", 4).map((unit) => unit.unit)).toEqual([1, 2, 4]);
+});
+
+const SPLIT_DESIGN = `${PASSING_SPEC}## Work units\n${[["Api", "none"], ["Mail", "none"], ["Ui", "U1"], ["More", "none"]]
+  .map(([name, deps], i) => `### U${i + 1}: ${name}\n- Covers: none\n- Depends on: ${deps}\n`)
+  .join("")}`;
+
+test("moveUnit moves an independent unit only onto a design entry that lets it stand apart, and never below the whole stack", () => {
+  initFeature(repo, "f", "big", "2026-10-21");
+  writeDoc("f", "spec.md", PASSING_SPEC);
+  writeDoc("f", "design.md", SPLIT_DESIGN);
+  approve(repo, "f", "spec", "spec ok", "2026-10-21");
+  approve(repo, "f", "design", "design ok", "2026-10-21");
+  for (const slug of ["f-api", "f-mail", "f-ui"]) initUnit(repo, slug, "f");
+  branched("f-api", "main");
+  independent("f-mail");
+  branched("f-ui", "feature/f-api", 13);
+  moveUnit(repo, "f-mail", 4);
+  expect(numbers()).toEqual([["f-api", 1], ["f-ui", 2], ["f-mail", 4]]);
+  expect(() => moveUnit(repo, "f-mail", 3)).toThrow("breaks-stack: f-mail is independent, but as U3: U3 depends on U1, which hasn't landed; number it elsewhere, or put it back in the stack first");
+  expect(() => moveUnit(repo, "f-mail", 1)).toThrow("breaks-stack: f-mail is independent, but as U1: U3 depends on U1, and no unit of the stack is below U1; number it elsewhere, or put it back in the stack first");
+  expect(numbers()).toEqual([["f-api", 1], ["f-ui", 2], ["f-mail", 4]]);
+});
+
+test("independenceProblems says why the design no longer lets a unit stand apart, and nothing without a design", () => {
+  designApprovedFeature();
+  for (const slug of ["f-api", "f-ui", "f-extra"]) initUnit(repo, slug, "f");
+  independent("f-ui");
+  const [api, ui] = featureUnits(repo, "f");
+  const planned = plannedUnits(repo, ui);
+  expect(independenceProblems(ui, featureUnits(repo, "f"), planned)).toEqual(["U2 depends on U1, which hasn't landed", "U3 depends on U2"]);
+  expect(independenceProblems(ui, featureUnits(repo, "f"), [])).toEqual([]);
+  expect(independenceProblems({ ...api, independent: true }, featureUnits(repo, "f"), planned)).toEqual(["U2 depends on U1", "no unit of the stack is below U1"]);
+});
+
+test("moveUnit refuses a number the design doesn't list, a record that isn't a unit, and a stale design approval", () => {
+  fourUnits();
+  expect(() => moveUnit(repo, "f-api", 5)).toThrow(/bad-unit: .*lists no U5 under Work units/);
+  expect(() => moveUnit(repo, "f-api", 0)).toThrow(/bad-unit/);
+  expect(() => moveUnit(repo, "f", 2)).toThrow("not-unit: f isn't a work unit");
+  writeDoc("f", "design.md", `${FOUR_DESIGN}edited\n`);
+  expect(() => moveUnit(repo, "f-api", 2)).toThrow(/design-not-approved/);
+  expect(numbers()).toEqual([["f-api", 1], ["f-ui", 2], ["f-extra", 3]]);
+});
+
+test("initUnit at a taken number inserts the unit there, shifting the units at and above it", () => {
+  fourUnits();
+  expect(initUnit(repo, "f-new", "f", 2).unit).toBe(2);
+  expect(numbers()).toEqual([["f-api", 1], ["f-new", 2], ["f-ui", 3], ["f-extra", 4]]);
+});
+
+test("initUnit at a taken number is refused when the design has no room or a branched unit would stack on the new one", () => {
+  fourUnits();
+  initUnit(repo, "f-more", "f");
+  expect(() => initUnit(repo, "f-new", "f", 2)).toThrow(/bad-unit: .*lists no U5 under Work units; amend the design to add it first/);
+  rmSync(join(repo, RECORDS, "f-more.json"));
+  branched("f-api", "main");
+  branched("f-ui", "feature/f-api");
+  expect(() => initUnit(repo, "f-new", "f", 2)).toThrow("breaks-stack: f-ui's branch feature/f-ui was cut from f-api, but this would put f-new below it; renumber only units above f-ui, or land it first");
+  expect(existsSync(join(repo, RECORDS, "f-new.json"))).toBe(false);
+  expect(numbers()).toEqual([["f-api", 1], ["f-ui", 2], ["f-extra", 3]]);
+  initUnit(repo, "f-new", "f", 3);
+  expect(numbers()).toEqual([["f-api", 1], ["f-ui", 2], ["f-new", 3], ["f-extra", 4]]);
+});
+
+test("fbs status unit --move prints the units renumbered, and refuses on stdout with exit 1", () => {
+  fourUnits();
+  const out: string[] = [];
+  const io = { cwd: repo, today: "2026-10-25", out: (line: string) => out.push(line), err: (line: string) => out.push(`err ${line}`) };
+  expect(run(["status", "unit", "f-extra", "--move", "1"], io)).toBe(0);
+  expect(JSON.parse(out.join("\n"))).toEqual([{ slug: "f-extra", unit: 1 }, { slug: "f-api", unit: 2 }, { slug: "f-ui", unit: 3 }]);
+  out.length = 0;
+  expect(run(["status", "unit", "f-extra", "--move", "9"], io)).toBe(1);
+  expect(out).toEqual([expect.stringMatching(/^error: bad-unit: /)]);
+  out.length = 0;
+  expect(run(["status", "unit", "f-extra"], io)).toBe(2);
+  expect(run(["status", "unit", "f-extra", "--move", "x"], io)).toBe(2);
 });

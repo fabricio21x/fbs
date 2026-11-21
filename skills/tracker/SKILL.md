@@ -51,7 +51,7 @@ After the approval the calling stage names (Big: the design; Mid: its single app
 
 ## 4. Update after a change
 
-`fbs:changes` calls this once a change is approved, when `tracker.md` is `created`. For each issue the change moves (the criteria it covers, what it ships, a unit added, merged or dropped), with the adapter:
+`fbs:changes` calls this once a change is approved, when `tracker.md` is `created`. For each issue the change moves (the criteria it covers, what it ships, a unit added, merged, dropped or renumbered), with the adapter:
 
 - rewrite its body to match the amended documents;
 - add a comment saying what changed and why, in two or three lines, citing change C<n>;

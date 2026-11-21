@@ -15,6 +15,7 @@ import { GitError, NotAGitRepoError, rootFor, setGitBinary } from "./git";
 import { COMMENT_KEY_FORMS, commentOnPr, GhError, type GhRunner, ghReader, NotOnPrError, parseCommentKey, replyToComment, repoName, resolveThread, runGh, setGhBinary } from "./github";
 import { guardPrompt, guardReply, guardToolUse } from "./guard";
 import { LandRefusedError, land, requestLand, requestRewrite } from "./land";
+import { moveFeature } from "./move";
 import { checkPolish, type PolishDeps, REAL_POLISH_DEPS, setClaudeBinary } from "./polish";
 import { reconcileLandings, syncStack } from "./stack";
 import { detectTracker } from "./tracker";
@@ -40,6 +41,7 @@ import {
   isApprovalCurrent,
   isUnit,
   listFeatures,
+  moveUnit,
   parsePrRef,
   plannedUnit,
   readFeature,
@@ -78,9 +80,26 @@ const USAGE = [
   "  status init <slug> --size <tiny|bug|mid|big>",
   "  status init <unit slug> --unit-of <feature> [--unit <n>]",
   "                            record a work unit of a big feature whose design approval is current, numbered next",
-  "                            in its stack unless --unit names a free number; its dir is <feature dir>/units/<unit slug>",
-  "                            and it goes by the feature's spec, design and approvals (approve and gate refuse a unit)",
-  "  status show <slug>        a unit adds covers and dependsOn from the design; a feature lists its units",
+  "                            in its stack unless --unit names a number (a taken one is freed by shifting the units at",
+  "                            and above it up one); its dir is <feature dir>/units/<unit slug> and it goes by the",
+  "                            feature's spec, design and approvals (approve and gate refuse a unit); every number must",
+  "                            be listed in the design, and a shift that would put another unit under an unlanded unit",
+  "                            whose branch is cut, or leave an independent unit on a design entry that doesn't let it",
+  "                            stand apart or below every unit of the stack, is refused with breaks-stack",
+  "  status unit <unit slug> --move <n>",
+  "                            renumber the unit to n, shifting the units between one place toward its old number;",
+  "                            prints [{slug,unit}]; n must be listed in the approved design; breaks-stack as above",
+  "  status move <slug> --to <path> [--remove-source]",
+  "                            copy the feature's record and its units' into the git repo at path (relative to the",
+  "                            checkout), without pr, repo, branch, stamp, landed and independent, and its documents into",
+  "                            that repo's features dir, local or tracked as its git ignores them; --remove-source then",
+  "                            removes the records and documents here; refused for a unit, an unlanded PR (open-pr), any",
+  "                            landed unit (has-landed), an approved document not in this checkout (doc-missing), a slug",
+  "                            the target has (exists) or a path that isn't another repo (bad-target); prints",
+  "                            {slug,to,dir,docs,docsRoot,units,sourceRemoved,deletionToCommit}, the last the tracked",
+  "                            folder --remove-source deleted, to commit, else null",
+  "  status show <slug>        a unit adds covers and dependsOn from the design; a feature lists its units, an",
+  "                            independent one with independent: true",
   "  status list",
   "  status gate <slug> <spec|design>",
   "                            a design's Work units are checked against the spec: units numbered U1..N, one Covers and",
@@ -131,7 +150,13 @@ const USAGE = [
   "                            cut to carry it, refused while its PR is open, origin has commits fbs didn't push, the",
   "                            new name is taken or another feature is stacked on it; the next push deletes the old",
   "                            name on origin; a type branches.types leaves out becomes an allowed one in that rename",
-  "                            (feature and feat, bugfix or hotfix and fix, swap; else the first listed)",
+  "                            (feature and feat, bugfix or hotfix and fix, swap; else the first listed); a unit's",
+  "                            parent comes from its stack, the nearest lower unit that isn't independent; --parent",
+  "                            <default branch> makes a unit above unit 1 independent, cut from or moved onto the default",
+  "                            branch, when the approved design says it depends on no unit still to land and no later",
+  "                            unit depends on it, nothing is stacked on it and, with tracked documents, unit 1 landed;",
+  "                            --parent <the branch of the unit below> puts an independent unit with no PR back in the",
+  "                            stack; a unit that depends on an independent unit still to land is refused a branch",
   "  branch --types            print the types to pick --type from as one JSON line: {types,from,seen}, from config",
   "                            (branches.types), else branches (the family, conventional branch or Conventional Commit",
   "                            types, that the 50 most recently committed local and remote branch names with a type prefix",
@@ -226,7 +251,10 @@ const USAGE = [
   "                            command}}, each open PR checked as land would ({pr,slug,ready,reasons?}), upTo the highest",
   "                            ready one with only ready ones below, command gh stack merge <upTo> --squash for the user;",
   "                            a feature with units lands its lowest unit with an open PR, and a unit lands only when it",
-  "                            is that one (bottom-up); /fbs:land on the feature or that unit writes the unit's token;",
+  "                            is that one (bottom-up), an independent unit whenever it's ready (the feature's slug takes",
+  "                            one only when no other unit has an open PR) unless the design no longer lets it stand",
+  "                            apart; /fbs:land on the feature or that unit writes",
+  "                            the unit's token;",
   "                            then the unit above, when its PR is open, is restacked in a temporary worktree: git rebase",
   "                            --onto origin/<default> <landed head>, a push with --force-with-lease on origin's tip and",
   "                            gh pr edit --base <default>; each unit above it is rebased onto the one below the same way,",
@@ -272,7 +300,10 @@ const USAGE = [
   "                            is unit 1 when its parent is a branch no fbs record owns and gh pr list --head finds that",
   "                            branch's PR merged into the default branch, holding the commit unit 1 was cut at, and the",
   "                            branch is gone from origin (still there: an outside note, kind parent-kept); a",
-  "                            unit based on the default branch is only fast-forwarded, since camp merges a moved base; prints",
+  "                            unit based on the default branch is only fast-forwarded, since camp merges a moved base; an",
+  "                            independent unit is skipped in the chain (the unit above it holds the unit below it), is",
+  "                            only fast-forwarded in a pass of its own, never skipped when the stack stops, and one the",
+  "                            design no longer lets stand apart is left alone with kind not-independent; prints",
   "                            {units:[{slug,unit,fastForwarded,merged,treeChanged,retargeted,squashed?,squashedFrom?,pushNeeded,done,kind?,reason?}],",
   "                            outside?:[{slug,pr,parent?,kind,reason,stacked?}]}, kind landed, closed, merged-elsewhere,",
   "                            gh-failed or parent-kept, stacked the plain features restacked on a landed one as land does,",
@@ -286,7 +317,7 @@ const USAGE = [
   "                            kind, on a unit or restack not done: conflict, dirty, diverged, gone (its branch or origin's",
   "                            default branch is missing), missing-below (the branch it stacks on is), not-merged-yet (the",
   "                            squash commit isn't on origin's default branch), push-rejected, retarget-failed, error (an",
-  "                            unexpected git failure in land's restack)",
+  "                            unexpected git failure in land's restack), not-independent (see above)",
   "  guard [--prompt|--reply]  hook entry: deny merges and default-branch pushes while a PR flow runs (a camp, or any",
   "                            feature with an open PR); --prompt writes the land token when the user types /fbs:land;",
   "                            --reply writes it when the user's message may ask to land (for the PR it names, else the",
@@ -509,6 +540,20 @@ function dispatchStatus(args: string[], io: Io, deps: PrDeps): number {
     } else return usage();
     return 0;
   }
+  if (subcommand === "unit") {
+    const move = parseOptions(rest, ["--move"], []);
+    const to = move?.values["--move"];
+    if (!move || move.positionals.length !== 1 || to === undefined || !/^[1-9][0-9]*$/.test(to)) return usage();
+    io.out(JSON.stringify(moveUnit(io.cwd, move.positionals[0], Number(to)).map(({ slug, unit }) => ({ slug, unit }))));
+    return 0;
+  }
+  if (subcommand === "move") {
+    const move = parseOptions(rest, ["--to"], ["--remove-source"]);
+    const to = move?.values["--to"];
+    if (!move || move.positionals.length !== 1 || to === undefined) return usage();
+    io.out(JSON.stringify(moveFeature(io.cwd, move.positionals[0], resolve(io.cwd, to), move.flags.includes("--remove-source"))));
+    return 0;
+  }
   const valued: Record<string, string[]> = { approve: ["--quote", "--auto"], ticket: ["--url"], rollout: ["--note"] };
   const parsed = parseFlags(rest, valued[subcommand] ?? []);
   if (!parsed) return usage();
@@ -587,6 +632,7 @@ function shown(cwd: string, rec: FeatureRecord): object {
     pr: unit.pr,
     stamp: unit.stamp ? { current: stampProblems(cwd, unit).length === 0 } : null,
     landed: unit.landed !== undefined,
+    ...(unit.independent && { independent: true }),
   }));
   return { ...rec, docs, docsRoot, approvals, stamp, ...(units.length > 0 && { units }), ...waiting([rec, ...unitRecords]) };
 }
