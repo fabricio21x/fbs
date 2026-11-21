@@ -68,6 +68,72 @@ test("unknown subcommand is a usage error", () => {
   expect(err.join("\n")).toContain("unknown command: nope");
 });
 
+describe("per-command help", () => {
+  const COMMANDS = ["context", "status", "tracker", "branch", "push", "stamp", "commits", "watch-pr", "pr", "camp", "land", "stack", "guard", "ask-check", "afk", "afk-guard", "polish"];
+  const CONTINUATION = " ".repeat(28);
+
+  test.each(COMMANDS.flatMap((command) => [[command, "--help"], [command, "-h"]]))("%s %s prints only that command's usage and exits 0", (command, flag) => {
+    const out: string[] = [];
+    const err: string[] = [];
+    expect(run([command, flag], io(out, err, tempDir()))).toBe(0);
+    expect(err).toEqual([]);
+    const [header, ...lines] = out.join("\n").split("\n");
+    expect(header).toBe("usage:");
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines[0]).toStartWith(`  ${command}`);
+    for (const line of lines) expect(line.startsWith(`  ${command} `) || line === `  ${command}` || line.startsWith(CONTINUATION)).toBe(true);
+  });
+
+  test("help is printed wherever --help comes after the command, and holds every line of its entries", () => {
+    const out: string[] = [];
+    expect(run(["push", "x", "--help"], io(out, [], tempDir()))).toBe(0);
+    const text = out.join("\n");
+    expect(text).toContain("  push <slug>");
+    expect(text).toContain("never main, master or origin's default branch");
+    expect(text).not.toContain("stamp set");
+    const camp: string[] = [];
+    expect(run(["camp", "followup", "-h"], io(camp, [], tempDir()))).toBe(0);
+    expect(camp.join("\n")).toContain("  camp followup <slug> --filed <n> --link <url>");
+  });
+
+  test("afk's help leaves out afk-guard, and an unknown command with --help is still a usage error", () => {
+    const out: string[] = [];
+    run(["afk", "--help"], io(out, []));
+    expect(out.join("\n")).toContain("  afk stop-check");
+    expect(out.join("\n")).not.toContain("  afk-guard <slug>");
+    const err: string[] = [];
+    expect(run(["nope", "--help"], io([], err))).toBe(2);
+    expect(err).toEqual(["unknown command: nope"]);
+  });
+});
+
+describe("an option without its value", () => {
+  test.each([
+    [["branch", "x", "--use"], "branch: --use needs a value"],
+    [["branch", "x", "--use", " "], "branch: --use needs a value"],
+    [["branch", "x", "--use", "--existing"], "branch: --use needs a value"],
+    [["status", "init", "x", "--size"], "status: --size needs a value"],
+    [["status", "approve", "x", "spec", "--quote"], "status: --quote needs a value"],
+    [["stamp", "set", "x", "--verdict"], "stamp: --verdict needs a value"],
+    [["stamp", "set", "x", "--verdict", ""], "stamp: --verdict needs a value"],
+    [["watch-pr", "x", "--interval"], "watch-pr: --interval needs a value"],
+    [["pr", "reply", "x", "--comment", "issue:1", "--body-file"], "pr: --body-file needs a value"],
+    [["camp", "followup", "x", "--summary", "s", "--thread"], "camp: --thread needs a value"],
+    [["afk", "stop", "x", "--reason"], "afk: --reason needs a value"],
+  ])("%p says so", (args, message) => {
+    const out: string[] = [];
+    const err: string[] = [];
+    expect(run(args, io(out, err, gitRepo()))).toBe(2);
+    expect({ out, err }).toEqual({ out: [], err: [message] });
+  });
+
+  test("an unknown option is still an unknown command", () => {
+    const err: string[] = [];
+    expect(run(["branch", "x", "--nope", "v"], io([], err, gitRepo()))).toBe(2);
+    expect(err).toEqual(["unknown command: branch x --nope v"]);
+  });
+});
+
 test("context check in a repo with no .fbs reports no context file", () => {
   expect(contextCheck(gitRepo())).toEqual({ code: 0, out: ["ok: no context file"], err: [] });
 });
@@ -246,7 +312,7 @@ test("blocker lines come out as missing, empty, unsourced, unconfirmed, then ope
   writeFileSync(join(repo, "docs/features/2026-10-21-x/spec.md"), spec);
   expect(status(repo, "gate", "x", "spec").out).toEqual([
     "empty section: Assumptions (write None if there are none)",
-    "unsourced: F",
+    "unsourced: F (end the line with its source: (user, YYYY-MM-DD), (spec), (<https url>) or (<file path>[:<line>]), with an optional , <detail> or ; <detail> before the closing parenthesis)",
     "unconfirmed: A",
     "open question: Q1",
   ]);
@@ -630,8 +696,6 @@ test.each([
   [[]],
   [["set", "x"]],
   [["set", "--verdict", VERDICT_PATH]],
-  [["set", "x", "--verdict"]],
-  [["set", "x", "--verdict", ""]],
   [["set", "x", "y", "--verdict", VERDICT_PATH]],
   [["set", "x", "--quote", "q"]],
   [["check"]],

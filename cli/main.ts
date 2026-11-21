@@ -18,7 +18,7 @@ import { LandRefusedError, land, requestLand, requestRewrite } from "./land";
 import { checkPolish, type PolishDeps, REAL_POLISH_DEPS, setClaudeBinary } from "./polish";
 import { syncStack } from "./stack";
 import { detectTracker } from "./tracker";
-import type { GateResult } from "./spec-gate";
+import { type GateResult, SOURCE_FORMS } from "./spec-gate";
 import { carryStamp, checkStamp, setStamp, StampRefusedError, stampProblems } from "./stamp";
 import {
   ApprovalRefusedError,
@@ -73,7 +73,7 @@ const USAGE = [
   "",
   "commands:",
   "  --version                 print the fbs version",
-  "  help                      show this help",
+  "  help                      show this help; fbs <command> --help (or -h) shows that command's part",
   "  context check [--json]    validate .fbs/context.md",
   "  status init <slug> --size <tiny|bug|mid|big>",
   "  status init <unit slug> --unit-of <feature> [--unit <n>]",
@@ -86,7 +86,9 @@ const USAGE = [
   "                            a design's Work units are checked against the spec: units numbered U1..N, one Covers and",
   "                            one Depends on line each, every acceptance criterion covered by exactly one unit (a struck",
   "                            through ~~criterion~~ by none), and dependencies only on existing lower-numbered units;",
-  "                            a big design needs the section, None when it ships as one PR",
+  "                            a big design needs the section, None when it ships as one PR; a fact ends with its source:",
+  "                            (user, YYYY-MM-DD), (spec), (<https url>) or (<file path>[:<line>]), then optionally , <detail>",
+  "                            or ; <detail> inside the parentheses",
   "  status approve <slug> <spec|design> --quote <the user's words>",
   "  status approve <slug> design --auto <why the agent may approve it>",
   "  status pr <slug> <number|url|none>",
@@ -130,7 +132,8 @@ const USAGE = [
   "                            types, that the 50 most recently committed local and remote branch names with a type prefix",
   "                            use more, by the types only it has), else default (feature, bugfix, hotfix, chore; also on",
   "                            a tie); seen counts each type prefix among those 50; reads only",
-  "  push <slug>               push the feature's branch to origin's branch of that name and track it; prints one JSON line",
+  "  push <slug>               push the tip of the feature's recorded branch to origin's branch of that name and track it,",
+  "                            from any worktree and whatever is checked out; prints one JSON line",
   "                            before a PR it overwrites only what fbs pushed last, after one it only adds commits;",
   "                            never main, master or origin's default branch; skipped without an origin remote",
   "  stamp set <slug> --verdict <repo-relative path>",
@@ -188,7 +191,8 @@ const USAGE = [
   "                            declined) and openFollowups (the open ones); a camp file fbs didn't write counts as empty",
   "  camp stop <slug>          remove the camp file, switching the never-merge guard off; follow-ups stay; prints stopped",
   "  camp followup <slug> --thread <key> --summary <text> [--why <text>] [--unit <unit slug>]",
-  "                            record a valid out-of-scope finding (the thread key as pr reply takes it) for a ticket later;",
+  "                            record a valid out-of-scope finding (the thread key as pr reply takes it, or check:<name>",
+  "                            for a failing CI check, which has no thread to reply to or resolve) for a ticket later;",
   "                            kept in <git common dir>/fbs/pr/<slug>.followups.json, outside the tree, which camp stop and",
   "                            land leave; prints it as one JSON line with its number, round and status open",
   "  camp followup <slug> --filed <n> --link <url>",
@@ -301,6 +305,21 @@ const USAGE = [
   "                            in the run's diff since its start; prints one JSON line, exit 1 when flagged, 2 on an error",
 ].join("\n");
 
+/** The usage entries of one top-level command: each starts with the command's name, its continuation lines indented. */
+function commandUsage(command: string): string | null {
+  const section: string[] = [];
+  let inside = false;
+  for (const line of USAGE.split("\n")) {
+    const entry = /^ {2}(\S+)/.exec(line);
+    if (entry !== null) inside = entry[1] === command;
+    else if (!line.startsWith("   ")) inside = false;
+    if (inside) section.push(line);
+  }
+  return section.length > 0 ? ["usage:", ...section].join("\n") : null;
+}
+
+class UsageError extends Error {}
+
 export function run(argv: string[], io: Io, deps: PrDeps = REAL_PR_DEPS, afkDeps: AfkDeps = REAL_AFK_DEPS, polishDeps: PolishDeps = REAL_POLISH_DEPS): number {
   const [command, ...rest] = argv;
   if (command === "--version") {
@@ -314,6 +333,11 @@ export function run(argv: string[], io: Io, deps: PrDeps = REAL_PR_DEPS, afkDeps
   if (command === undefined) {
     io.err(USAGE);
     return 2;
+  }
+  const help = rest.some((arg) => arg === "--help" || arg === "-h") ? commandUsage(command) : null;
+  if (help !== null) {
+    io.out(help);
+    return 0;
   }
   if (command === "guard") return runGuard(rest, io, deps);
   if (command === "ask-check") return runAskCheck(rest, io, deps);
@@ -337,6 +361,10 @@ export function run(argv: string[], io: Io, deps: PrDeps = REAL_PR_DEPS, afkDeps
     if (command === "afk-guard") return runAfkGuard(rest, io);
     if (command === "polish") return runPolish(rest, io, polishDeps);
   } catch (e) {
+    if (e instanceof UsageError) {
+      io.err(`${command}: ${e.message}`);
+      return 2;
+    }
     if (e instanceof ConfigError || e instanceof NotAGitRepoError || e instanceof GitError || e instanceof RecordError || e instanceof GhError) {
       io.err(e.message);
       return 2;
@@ -783,8 +811,9 @@ function runCamp(args: string[], io: Io): number {
       io.err("camp followup takes --thread <key> --summary <text> [--why <text>] [--unit <unit slug>], --filed <n> --link <url>, or --declined <n>");
       return 2;
     }
-    if (thread !== undefined && parseCommentKey(thread) === null) {
-      io.err(`camp followup: --thread takes ${COMMENT_KEY_FORMS}, not ${thread}`);
+    // A failing CI check can be a follow-up's source too; it has no thread, and nothing replies to or resolves a follow-up's key.
+    if (thread !== undefined && parseCommentKey(thread) === null && !/^check:\s*\S/.test(thread)) {
+      io.err(`camp followup: --thread takes ${COMMENT_KEY_FORMS}, or check:<check name> for a failing CI check, not ${thread}`);
       return 2;
     }
     if (closing !== undefined && !/^[1-9][0-9]*$/.test(closing)) {
@@ -1044,7 +1073,10 @@ function refusingOnStdout(io: Io, body: () => number): number {
   }
 }
 
-/** Split args into positionals, `--name <value>` options from `valued` (each at most once) and bare `flags`; null when malformed. */
+/**
+ * Split args into positionals, `--name <value>` options from `valued` (each at most once) and bare `flags`; null when
+ * malformed. Throws a UsageError for a known option with no value: none, a blank one, or another known option.
+ */
 function parseOptions(args: string[], valued: string[], flags: string[]): { positionals: string[]; values: Record<string, string>; flags: string[] } | null {
   const positionals: string[] = [];
   const values: Record<string, string> = {};
@@ -1054,16 +1086,15 @@ function parseOptions(args: string[], valued: string[], flags: string[]): { posi
     if (!arg.startsWith("--")) positionals.push(arg);
     else if (flags.includes(arg) && !seen.includes(arg)) seen.push(arg);
     else {
-      const value = args[i + 1];
-      if (!valued.includes(arg) || arg in values || value === undefined || value.trim() === "") return null;
-      values[arg] = value;
+      if (!valued.includes(arg) || arg in values) return null;
+      values[arg] = optionValue(arg, args[i + 1], [...valued, ...flags]);
       i++;
     }
   }
   return { positionals, values, flags: seen };
 }
 
-/** Split args into positionals and at most one `--flag <value>` from `allowed`; null when the flags are malformed. */
+/** Split args into positionals and at most one `--flag <value>` from `allowed`; null when malformed, a UsageError without its value. */
 function parseFlags(args: string[], allowed: string[]): { positionals: string[]; name: string | undefined; flag: string | undefined } | null {
   const positionals: string[] = [];
   let name: string | undefined;
@@ -1073,13 +1104,17 @@ function parseFlags(args: string[], allowed: string[]): { positionals: string[];
       positionals.push(args[i]);
       continue;
     }
-    const value = args[i + 1];
-    if (!allowed.includes(args[i]) || flag !== undefined || value === undefined || value.trim() === "") return null;
+    if (!allowed.includes(args[i]) || flag !== undefined) return null;
     name = args[i];
-    flag = value;
+    flag = optionValue(args[i], args[i + 1], allowed);
     i++;
   }
   return { positionals, name, flag };
+}
+
+function optionValue(option: string, value: string | undefined, known: string[]): string {
+  if (value === undefined || value.trim() === "" || known.includes(value)) throw new UsageError(`${option} needs a value`);
+  return value;
 }
 
 function stage(rec: FeatureRecord): string {
@@ -1094,7 +1129,7 @@ function blockerLines(result: GateResult): string[] {
   return [
     ...result.missingSections.map((name) => `missing section: ${name}`),
     ...result.emptySections.map((name) => `empty section: ${name} (write None if there are none)`),
-    ...result.unsourced.map((text) => `unsourced: ${text}`),
+    ...result.unsourced.map((text) => `unsourced: ${text} (end the line with its source: ${SOURCE_FORMS})`),
     ...result.unconfirmed.map((text) => `unconfirmed: ${text}`),
     ...result.openQuestions.map((text) => `open question: ${text}`),
     ...result.workUnits.map((text) => `work units: ${text}`),

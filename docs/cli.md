@@ -6,10 +6,10 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 
 ## Conventions
 
-- **Exit codes:** `0` ok; `1` refused, or a record error such as `error: missing` or `error: exists` (reasons on stdout); `2` a usage or environment error (on stderr). `watch-pr` has its own codes, below.
+- **Exit codes:** `0` ok; `1` refused, or a record error such as `error: missing` or `error: exists` (reasons on stdout); `2` a usage or environment error (on stderr), such as `--use needs a value` for an option given without one. `watch-pr` has its own codes, below.
 - **Output:** most commands print one JSON line, or `ok`, or one line per problem.
 - **One command per call.** Skills pre-approve `Bash(fbs *)`, which matches only a bare `fbs …` command, so they never chain, pipe or redirect it.
-- `fbs help` prints the full usage; `fbs --version` the version.
+- `fbs help` prints the full usage; `fbs <command> --help` (or `-h`) prints that command's part of it; `fbs --version` the version.
 
 ## Commands
 
@@ -21,7 +21,7 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 | `status init <unit> --unit-of <feature> [--unit <n>]` | Records a work unit of a big feature whose design approval is current; its folder is `<feature dir>/units/<unit>` |
 | `status show <slug>` | The record as JSON: size, folder, documents mode, branch, approvals and stamp (each with `current`), PR, ticket, rollout criteria with their outcomes, and `pendingRollout` for the ones still waiting (a feature's own and its units'); a feature lists its units, a unit its `covers` and `dependsOn` |
 | `status list` | One line per feature: slug, size, stage |
-| `status gate <slug> spec\|design` | The gate: facts sourced, assumptions accepted, no open questions, every section present; a design's work units checked against the spec |
+| `status gate <slug> spec\|design` | The gate: facts sourced, assumptions accepted, no open questions, every section present; a design's work units checked against the spec. A fact ends with its source in parentheses: `(user, YYYY-MM-DD)`, `(spec)`, a URL or a file path (optionally `:line`), then optionally `, <detail>` or `; <detail>`, as in `(user, 2026-11-18; replaces the old limit)`; an `unsourced:` line lists these forms |
 | `status approve <slug> spec\|design --quote '<words>'` | Records your approval verbatim, bound to the document's sha256; runs the gate first |
 | `status approve <slug> design --auto '<reason>'` | Records the agent's approval of a simple design amendment; refused for a spec |
 | `status pr <slug> <number\|url\|none>` | Records the feature's PR, or clears it |
@@ -44,7 +44,7 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 | `branch <slug> [--type <type>] [--ticket <id>] [--existing] [--parent <branch>]` | Puts the checkout on the feature's branch and records it. Creates `<type>/<ticket>-<slug>` from origin's default branch (or `--parent`, for a stack) when none is recorded; `--existing` never creates; `--ticket` renames a branch fbs cut that has no PR yet, into an allowed type when `branches.types` leaves out its own (`feature` to `feat`, `bugfix` or `hotfix` to `fix`, and back; else the first listed). `<type>` is `feature`, `bugfix`, `hotfix`, `chore` or another Conventional Commit type (`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `revert`); only those in `branches.types` in `.fbs/config.json` when it's set |
 | `branch --types` | The types to pick `--type` from, as one JSON line: `{types, from, seen}`. `from` is `config` (`branches.types`), `branches` (the family, conventional branch or Conventional Commit, that the 50 most recently committed local and remote branches with a type prefix use more; a tie is `default`) or `default` (`feature`, `bugfix`, `hotfix`, `chore`); `seen` counts each type prefix found. Reads only |
 | `branch <slug> --use <branch>` | Adopts a branch you named instead |
-| `push <slug>` | Pushes the feature's branch, never the default branch. Before the PR it overwrites only what fbs pushed last; after, it only adds commits. Skipped without an origin |
+| `push <slug>` | Pushes the tip of the feature's recorded branch, from any worktree and whatever is checked out; never the default branch. Before the PR it overwrites only what fbs pushed last; after, it only adds commits. Skipped without an origin |
 | `commits check <slug>` | Lists the branch's commits whose subject isn't a Conventional Commit or whose message breaks commitlint config-conventional's rules: header and lines of 100 characters at most, no spaces around the header, a subject that doesn't start with a capital or end with a full stop. A missing blank line after the header is listed as a warning that doesn't fail the check. `fixup!`, `squash!` and `amend!` commits and the parent branch's are left out |
 | `commits title <text>` | Checks a PR title the same way |
 
@@ -72,7 +72,7 @@ For `branch --types`, `test/`, `docs/`, `build/` and `style/` branches count as 
 | `camp checkpoint <slug> [--unit <unit>]` | Records that the checkpoint with you was held |
 | `camp show <slug> [--unit <unit>]` | The camp's budget, rounds, follow-ups, and how the next round is handled |
 | `camp stop <slug>` | Ends the camp; follow-ups stay |
-| `camp followup <slug> --thread <key> --summary <text> [--why <text>] [--unit <unit>]` | Records a valid out-of-scope finding for a ticket later |
+| `camp followup <slug> --thread <key> --summary <text> [--why <text>] [--unit <unit>]` | Records a valid out-of-scope finding for a ticket later. The key is a comment's, as `pr reply` takes it, or `check:<check name>` for a failing CI check |
 | `camp followup <slug> --filed <n> --link <url>` / `--declined <n>` | Closes a follow-up |
 
 `watch-pr` exit codes:

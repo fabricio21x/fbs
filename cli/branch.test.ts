@@ -1041,13 +1041,10 @@ describe("fbs branch", () => {
   test.each([
     [[]],
     [["x", "y"]],
-    [["x", "--use"]],
     [["x", "--nope", "a"]],
     [["x", "--use", "a", "--use", "b"]],
     [["x", "--existing", "--existing"]],
-    [["x", "--type"]],
     [["x", "--type", "feature", "--type", "chore"]],
-    [["x", "--type", "feature", "--ticket", ""]],
     [["--types", "x"]],
     [["x", "--types"]],
   ])("%p is a usage error", (args) => {
@@ -1056,6 +1053,15 @@ describe("fbs branch", () => {
     expect(r.code).toBe(2);
     expect(r.out).toEqual([]);
     expect(r.err[0]).toContain("unknown command: branch");
+  });
+
+  test.each([
+    [["x", "--use"], "branch: --use needs a value"],
+    [["x", "--type"], "branch: --type needs a value"],
+    [["x", "--type", "feature", "--ticket", ""], "branch: --ticket needs a value"],
+  ])("%p is a usage error naming the option without its value", (args, message) => {
+    const { work } = cloned();
+    expect(cli(work, ...args)).toEqual({ code: 2, out: [], err: [message] });
   });
 
   test.each([
@@ -1262,12 +1268,39 @@ describe("fbs push", () => {
     expect(() => git(origin, "rev-parse", "--verify", name)).toThrow();
   });
 
-  test("a work tree on another branch is refused", () => {
+  test("the recorded branch's tip is pushed from a work tree on another branch, on a detached HEAD or in another worktree", () => {
+    const { origin, work, tip } = onFeature();
+    git(work, "switch", "-q", "main");
+    expect(push(work)).toEqual({ code: 0, out: pushedJson(tip), err: [] });
+    git(work, "switch", "-q", "feature/x");
+    const next = commitFile(work, "more.txt", "more\n");
+    git(work, "switch", "-q", "--detach", "main");
+    expect(push(work)).toEqual({ code: 0, out: pushedJson(next), err: [] });
+    const wt = join(tempDir(), "wt");
+    git(work, "worktree", "add", "-q", "-b", "elsewhere", wt, "main");
+    git(work, "switch", "-q", "feature/x");
+    const last = commitFile(work, "last.txt", "last\n");
+    expect(push(wt)).toEqual({ code: 0, out: pushedJson(last), err: [] });
+    expect(git(origin, "rev-parse", "feature/x")).toBe(last);
+    expect(readFeature(work, "x").branch?.pushed).toBe(last);
+  });
+
+  test("from another branch, commits someone else pushed are still never overwritten", () => {
+    const { origin, work, tip } = onFeature();
+    push(work);
+    const theirs = pushFromElsewhere(origin, "feature/x");
+    amend(work);
+    git(work, "switch", "-q", "main");
+    expect(push(work)).toEqual({ code: 1, out: ["refused: origin has commits fbs didn't push to feature/x; fetch and look before pushing"], err: [] });
+    expect(git(origin, "rev-parse", "feature/x")).toBe(theirs);
+    expect(readFeature(work, "x").branch?.pushed).toBe(tip);
+  });
+
+  test("a recorded branch with no commit here is refused, saying what to do", () => {
     const { origin, work } = onFeature();
     git(work, "switch", "-q", "main");
-    expect(push(work)).toEqual({ code: 1, out: ["refused: on main, not feature/x"], err: [] });
-    git(work, "switch", "-q", "--detach", "feature/x");
-    expect(push(work).out).toEqual(["refused: on a detached HEAD, not feature/x"]);
+    git(work, "branch", "-q", "-D", "feature/x");
+    expect(push(work)).toEqual({ code: 1, out: ["refused: no commit on feature/x here to push; commit on it, or run fbs branch x to restore it from origin"], err: [] });
     expect(() => git(origin, "rev-parse", "--verify", "feature/x")).toThrow();
   });
 

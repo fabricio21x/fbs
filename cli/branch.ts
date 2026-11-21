@@ -325,18 +325,17 @@ function move(cwd: string, recorded: FeatureBranch, prOpen: boolean, parent: str
 }
 
 /**
- * Push the feature's branch to origin and record the commit pushed. Before a PR it overwrites only what fbs pushed
- * last; after one it only adds commits. Null when there is no origin to push to.
+ * Push the tip of the feature's recorded branch to origin and record the commit pushed, from any worktree or checkout.
+ * Before a PR it overwrites only what fbs pushed last; after one it only adds commits. Null when there is no origin.
  */
 export function pushFeatureBranch(cwd: string, slug: string, note: (line: string) => void): PushResult | null {
   const rec = readFeature(cwd, slug);
   if (rec.branch === undefined) throw new BranchRefusedError(`no branch recorded for ${slug}`);
   const { name, pushed, previous } = rec.branch;
-  const on = currentBranch(cwd);
-  if (on !== name) throw new BranchRefusedError(`on ${on ?? "a detached HEAD"}, not ${name}`);
   if (!hasRemote(cwd, "origin")) return null;
   if (protectedBranches(cwd).includes(name)) throw new BranchRefusedError(`${name} is the default branch; pushing it is the user's call`);
-  const tip = commitOf(cwd, `refs/heads/${name}`) as string;
+  const tip = commitOf(cwd, `refs/heads/${name}`);
+  if (tip === null) throw new BranchRefusedError(`no commit on ${name} here to push; commit on it, or run fbs branch ${slug} to restore it from origin`);
   // The push runs before the lock, so a slow or failing network never holds it.
   // After a rename `pushed` is on the old name, so the new one gets a plain push.
   const lease = rec.pr === null && previous === undefined ? (pushed ?? null) : null;

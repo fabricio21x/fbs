@@ -24,8 +24,11 @@ const FENCE_OPEN = /^(`{3,}(?!.*`)|~{3,})/;
 const IGNORED = /^(?:|-{3,}|\*{3,}|_{3,}|<!--(?:(?!-->).)*-->)$/;
 export const NONE = /^none\.?$/i;
 
-// A source is the user on a date, the spec, a URL, or a file path (optionally :line), then optional ", <detail>".
-const SOURCE = String.raw`(?:user,\s*\d{4}-\d{2}-\d{2}|spec|https?://[^\s()]+|[\w.\-/]*[\w-]\.[A-Za-z]\w*(?::\d+(?:-\d+)?)?)(?:,[^()]*)?`;
+// A source is the user on a date, the spec, a URL, or a file path (optionally :line), then optional ", <detail>" or "; <detail>".
+const SOURCE = String.raw`(?:user,\s*\d{4}-\d{2}-\d{2}|spec|https?://[^\s()]+|[\w.\-/]*[\w-]\.[A-Za-z]\w*(?::\d+(?:-\d+)?)?)(?:[,;][^()]*)?`;
+
+/** SOURCE in words, for the refusal of an unsourced fact. */
+export const SOURCE_FORMS = "(user, YYYY-MM-DD), (spec), (<https url>) or (<file path>[:<line>]), with an optional , <detail> or ; <detail> before the closing parenthesis";
 
 // The one passing line shape per kind: a sourced fact without a checkbox, or an unknown the user accepted on a date.
 const PASSING: Record<SectionKind, RegExp | null> = {

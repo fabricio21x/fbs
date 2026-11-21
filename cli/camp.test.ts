@@ -207,6 +207,18 @@ test("follow-ups are numbered with their round, shown by camp show, outlive camp
   expect(fbs(repo, "camp", "followup", "x", "--filed", "3", "--link", "u")).toEqual({ code: 1, out: ["error: x has no follow-up 3; it has 2"], err: [] });
 });
 
+test("a failing CI check can be a follow-up's source, named check:<its name>, which pr reply still refuses", () => {
+  const repo = campRepo();
+  fbs(repo, "camp", "start", "x");
+  const r = fbs(repo, "camp", "followup", "x", "--thread", "check:CI / test (ubuntu)", "--summary", "Flaky upload step");
+  expect(r.code).toBe(0);
+  expect(JSON.parse(r.out[0])).toMatchObject({ number: 1, thread: "check:CI / test (ubuntu)", status: "open" });
+  expect(show(repo).openFollowups).toHaveLength(1);
+  const reply = fbs(repo, "pr", "reply", "x", "--comment", "check:CI / test (ubuntu)", "--body-file", "reply.md");
+  expect(reply.code).toBe(2);
+  expect(reply.err[0]).toStartWith("pr reply: --comment takes thread:<id>");
+});
+
 test("a follow-up with --unit records the unit and that unit's round, and needs a camp", () => {
   const repo = campRepo();
   const add = () => fbs(repo, "camp", "followup", "x", "--thread", "thread:5", "--summary", "s", "--unit", "x-api");
@@ -221,7 +233,8 @@ test.each([
   [["--thread", "thread:5"], "camp followup takes --thread <key> --summary <text> [--why <text>] [--unit <unit slug>], --filed <n> --link <url>, or --declined <n>"],
   [["--filed", "1"], "camp followup takes --thread <key> --summary <text> [--why <text>] [--unit <unit slug>], --filed <n> --link <url>, or --declined <n>"],
   [["--thread", "thread:5", "--summary", "s", "--filed", "1", "--link", "u"], "camp followup takes --thread <key> --summary <text> [--why <text>] [--unit <unit slug>], --filed <n> --link <url>, or --declined <n>"],
-  [["--thread", "PRRT_a", "--summary", "s"], "camp followup: --thread takes thread:<id>, thread:<node id> (PRRT_… or PRRC_…), issue:<id> or review:<id>, not PRRT_a"],
+  [["--thread", "PRRT_a", "--summary", "s"], "camp followup: --thread takes thread:<id>, thread:<node id> (PRRT_… or PRRC_…), issue:<id> or review:<id>, or check:<check name> for a failing CI check, not PRRT_a"],
+  [["--thread", "check: ", "--summary", "s"], "camp followup: --thread takes thread:<id>, thread:<node id> (PRRT_… or PRRC_…), issue:<id> or review:<id>, or check:<check name> for a failing CI check, not check: "],
   [["--filed", "0", "--link", "u"], "camp followup: --filed takes a follow-up's number, not 0"],
 ])("camp followup usage error %p", (args, message) => {
   expect(fbs(campRepo(), "camp", "followup", "x", ...args)).toEqual({ code: 2, out: [], err: [message] });
