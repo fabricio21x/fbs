@@ -5,7 +5,7 @@ import { AfkError, type AfkDeps, afkGuardRun, checkStep, finalRun, parseSpec, RE
 import { preflight } from "./afk-preflight";
 import { askCheck } from "./ask-check";
 import { BranchRefusedError, branchTypes, enterFeatureBranch, pushFeatureBranch } from "./branch";
-import { addFollowup, CampError, COUNTS, type Counts, closeFollowup, recordCheckpoint, recordRound, showCamp, startCamp, stopCamp } from "./camp";
+import { addFollowup, CampError, COUNTS, type Counts, campOwner, closeFollowup, recordCheckpoint, recordRound, showCamp, startCamp, stopCamp } from "./camp";
 import { CiRefusedError, ciEvidence } from "./ci";
 import { CommitsRefusedError, commitProblems, isConventionalSubject } from "./commits";
 import { ConfigError, projectConfig } from "./config";
@@ -16,7 +16,7 @@ import { COMMENT_KEY_FORMS, commentOnPr, GhError, type GhRunner, ghReader, NotOn
 import { guardPrompt, guardReply, guardToolUse } from "./guard";
 import { LandRefusedError, land, requestLand, requestRewrite } from "./land";
 import { checkPolish, type PolishDeps, REAL_POLISH_DEPS, setClaudeBinary } from "./polish";
-import { syncStack } from "./stack";
+import { reconcileLandings, syncStack } from "./stack";
 import { detectTracker } from "./tracker";
 import { type GateResult, SOURCE_FORMS } from "./spec-gate";
 import { carryStamp, checkStamp, setStamp, StampRefusedError, stampProblems } from "./stamp";
@@ -91,6 +91,11 @@ const USAGE = [
   "                            or ; <detail> inside the parentheses",
   "  status approve <slug> <spec|design> --quote <the user's words>",
   "  status approve <slug> design --auto <why the agent may approve it>",
+  "  status reconcile          ask gh about every record with an open PR: one merged outside fbs land is recorded as landed",
+  "                            (by: outside, its camp markers removed), one closed unmerged has its link cleared as status",
+  "                            pr <slug> none does; nothing is restacked or pushed (stack sync restacks a feature cut from",
+  "                            a landed branch at its next sync); prints {outside:[{slug,pr,kind,reason}]}, kinds as stack",
+  "                            sync's",
   "  status pr <slug> <number|url|none>",
   "  status rollout <slug> AC<n> <pass|fail> [--note <text>]",
   "                            record how a rollout criterion turned out after the deploy: one the record lists in rollout",
@@ -168,7 +173,11 @@ const USAGE = [
   "                            wait for a verdict on the feature's PR; prints one JSON line",
   "                            a feature with units watches each unit's open PR, lowest first, and reports the first",
   "                            with a verdict, adding its slug and unit; a timeout reports the lowest",
-  "                            exit 0 approved-green, 3 activity, 4 closed, 5 timeout, 6 conflict, 7 query-error, 8 ready, 9 waiting",
+  "                            exit 0 approved-green, 3 activity, 4 closed, 5 timeout, 6 conflict, 7 query-error, 8 ready, 9 waiting,",
+  "                            10 taken-over: before each poll, when the slug's camp names a session other than",
+  "                            $CLAUDE_CODE_SESSION_ID, it prints {verdict,pr,session} (the holder) and saves nothing;",
+  "                            session null when the camp it started with is gone (stopped); a watcher with no session,",
+  "                            or a camp that names none, never stops for this",
   "                            --once takes one snapshot (nothing decisive is a timeout)",
   "  pr reply <slug> --comment <thread|issue|review>:<id> --body-file <path>",
   "                            a review thread's key may also be its GraphQL node id, or one of its comments' (thread:PRRT_…,",
@@ -180,18 +189,26 @@ const USAGE = [
   "  camp start <slug> [--auto-fix-rounds <n>]",
   "                            create the PR camp's state (its existence switches on the never-merge guard), or keep its",
   "                            rounds on a resume; the fix budget is --auto-fix-rounds, else the recorded one, else",
-  "                            .fbs/config.json camp.autoFixRounds, else 2; prints the state",
+  "                            .fbs/config.json camp.autoFixRounds, else 2; prints the state, with session its holder;",
+  "                            the camp is held by $CLAUDE_CODE_SESSION_ID (without one, the holder stays), and taken over",
+  "                            from another session, printing takenOverFrom; first asks gh about each unlanded PR it camps",
+  "                            as status reconcile does, printing outside; refused once everything it camps has landed",
   "  camp round <slug> --in <n> --fixed <n> --declined <n> --followups <n> --asked <n> [--note <text>] [--unit <unit slug>]",
   "                            record a round and print what comes next: continue while fewer rounds than the budget fixed",
   "                            something, checkpoint once the budget is spent until camp checkpoint records it, then",
-  "                            blockers-only; --unit counts a stack's rounds per unit, under the feature's camp",
+  "                            blockers-only; --unit counts a stack's rounds per unit, under the feature's camp; refused",
+  "                            (error: camp held by <id>; camp start takes it over) when the camp names another session",
+  "                            than $CLAUDE_CODE_SESSION_ID, and so is camp checkpoint",
   "  camp checkpoint <slug> [--unit <unit slug>]",
   "                            record that the checkpoint was held; prints blockers-only; refused before one is due",
   "  camp show <slug> [--unit <unit slug>]",
   "                            print the state: budget, phase (auto, checkpoint or blockers-only; of --unit when given),",
   "                            each unit's phase, checkpoints held, rounds, followups (each with its status: open, filed or",
   "                            declined) and openFollowups (the open ones); a camp file fbs didn't write counts as empty",
-  "  camp stop <slug>          remove the camp file, switching the never-merge guard off; follow-ups stay; prints stopped",
+  "  camp stop <slug>          remove the camp file, switching the never-merge guard off; follow-ups stay; asks gh about",
+  "                            each PR it camps as status reconcile does, then prints stopped and <kind>: <reason> for each",
+  "                            PR found not open; the camp file goes first, so a failure asking gh leaves it stopped; when",
+  "                            the camp names another session it is refused as camp round is while a PR it camps is open",
   "  camp followup <slug> --thread <key> --summary <text> [--why <text>] [--unit <unit slug>]",
   "                            record a valid out-of-scope finding (the thread key as pr reply takes it, or check:<name>",
   "                            for a failing CI check, which has no thread to reply to or resolve) for a ticket later;",
@@ -378,9 +395,9 @@ export function run(argv: string[], io: Io, deps: PrDeps = REAL_PR_DEPS, afkDeps
     if (command === "branch") return runBranch(rest, io);
     if (command === "push") return runPush(rest, io);
     if (command === "commits") return runCommits(rest, io);
-    if (command === "watch-pr") return runWatchPr(rest, io, deps);
+    if (command === "watch-pr") return runWatchPr(rest, io, deps, afkDeps.sessionId());
     if (command === "pr") return runPr(rest, io, deps);
-    if (command === "camp") return runCamp(rest, io);
+    if (command === "camp") return runCamp(rest, io, deps, afkDeps.sessionId());
     if (command === "land") return runLand(rest, io, deps, afkDeps);
     if (command === "rewrite") return runRewrite(rest, io, deps, afkDeps);
     if (command === "stack") return runStack(rest, io, deps);
@@ -505,6 +522,10 @@ function dispatchStatus(args: string[], io: Io, deps: PrDeps): number {
     case "list":
       if (positionals.length !== 0) return usage();
       for (const rec of listFeatures(io.cwd, io.err)) io.out(`${rec.slug}\t${rec.size}\t${stage(rec)}`);
+      return 0;
+    case "reconcile":
+      if (positionals.length !== 0) return usage();
+      io.out(JSON.stringify({ outside: reconcileLandings(io.cwd, deps.gh, io.today) }));
       return 0;
     case "gate": {
       const [slug, kind] = positionals;
@@ -734,7 +755,7 @@ function runCommits(args: string[], io: Io): number {
   });
 }
 
-function runWatchPr(args: string[], io: Io, deps: PrDeps): number {
+function runWatchPr(args: string[], io: Io, deps: PrDeps, session: string | null): number {
   const parsed = parseOptions(args, ["--interval", "--timeout"], ["--once"]);
   const interval = parsed?.values["--interval"] ?? String(DEFAULT_INTERVAL_SECONDS);
   const timeout = parsed?.values["--timeout"];
@@ -744,8 +765,15 @@ function runWatchPr(args: string[], io: Io, deps: PrDeps): number {
   }
   const [slug] = parsed.positionals;
   const timeoutSeconds = parsed.flags.includes("--once") ? 0 : timeout === undefined ? null : Number(timeout);
-  const options = { intervalSeconds: Number(interval), timeoutSeconds };
   return refusingOnStdout(io, () => {
+    const atStart = campOwner(io.cwd, slug);
+    const takenOver = () => {
+      const now = campOwner(io.cwd, slug);
+      if (now === null) return atStart === null ? null : { session: null };
+      return now.session !== null && now.session !== session ? { session: now.session } : null;
+    };
+    // A watcher with no session can't tell another session's camp from its own, so it watches on as it always has.
+    const options = { intervalSeconds: Number(interval), timeoutSeconds, ...(session !== null && { takenOver }) };
     const rec = readFeature(io.cwd, slug);
     const units = isUnit(rec) ? [] : featureUnits(io.cwd, slug);
     if (units.length > 0) return watchStack(slug, units, options, io, deps);
@@ -818,7 +846,7 @@ function followupKey(thread: string): string {
   return thread.startsWith("check:") ? `check:${thread.slice("check:".length).trim()}` : thread;
 }
 
-function runCamp(args: string[], io: Io): number {
+function runCamp(args: string[], io: Io, deps: PrDeps, session: string | null): number {
   const [subcommand, ...rest] = args;
   const valued = { start: ["--auto-fix-rounds"], round: [...COUNT_FLAGS, "--note", "--unit"], checkpoint: ["--unit"], show: ["--unit"], stop: [], followup: ["--thread", "--summary", "--why", "--unit", "--filed", "--link", "--declined"] }[subcommand] ?? null;
   const parsed = valued === null ? null : parseOptions(rest, valued, []);
@@ -863,12 +891,13 @@ function runCamp(args: string[], io: Io): number {
   }
   return refusingOnStdout(io, () => {
     try {
-      if (subcommand === "start") io.out(JSON.stringify(startCamp(io.cwd, slug, budget === undefined ? undefined : Number(budget), io.err), null, 2));
+      if (subcommand === "start") io.out(JSON.stringify(startCamp(io.cwd, slug, budget === undefined ? undefined : Number(budget), session, deps.gh, io.today, io.err), null, 2));
       else if (subcommand === "show") io.out(JSON.stringify(showCamp(io.cwd, slug, unit, io.err), null, 2));
-      else if (subcommand === "checkpoint") io.out(recordCheckpoint(io.cwd, slug, unit, io.err));
+      else if (subcommand === "checkpoint") io.out(recordCheckpoint(io.cwd, slug, unit, session, io.err));
       else if (subcommand === "stop") {
-        stopCamp(io.cwd, slug);
+        const outside = stopCamp(io.cwd, slug, session, deps.gh, io.today);
         io.out("stopped");
+        for (const found of outside) io.out(`${found.kind}: ${found.reason}`);
       } else if (subcommand === "followup") {
         const followup =
           closing !== undefined
@@ -878,7 +907,7 @@ function runCamp(args: string[], io: Io): number {
       }
       else {
         const counts = Object.fromEntries(COUNTS.map((name) => [name, Number(parsed.values[`--${name}`])])) as Counts;
-        io.out(recordRound(io.cwd, slug, unit, counts, note, io.today, io.err));
+        io.out(recordRound(io.cwd, slug, unit, counts, note, io.today, session, io.err));
       }
       return 0;
     } catch (e) {

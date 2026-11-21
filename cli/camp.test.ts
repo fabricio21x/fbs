@@ -2,6 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { REAL_AFK_DEPS } from "./afk";
 import { campMarkers } from "./guard";
 import { run } from "./main";
 import { isolatedGitEnv } from "./test-env";
@@ -22,6 +23,13 @@ function fbs(cwd: string, ...args: string[]) {
   const err: string[] = [];
   const code = run(args, { cwd, today: "2026-11-01", out: (s) => out.push(s), err: (s) => err.push(s) });
   return { code, out, err };
+}
+
+/** fbs run from the Claude Code session `session`, as bin/fbs passes it. */
+function fbsAs(session: string, cwd: string, ...args: string[]) {
+  const out: string[] = [];
+  const code = run(args, { cwd, today: "2026-11-01", out: (s) => out.push(s), err: () => {} }, undefined, { ...REAL_AFK_DEPS, sessionId: () => session });
+  return { code, out };
 }
 
 /** A repo with feature x, and an optional .fbs/config.json. */
@@ -155,6 +163,58 @@ test.each([
 ])("camp usage error %p", (args, message) => {
   const r = fbs(campRepo(), ...args);
   expect(r).toEqual({ code: 2, out: [], err: [message] });
+});
+
+test("camp start records the session that holds the camp, and camp show prints it", () => {
+  const repo = campRepo();
+  const started = JSON.parse(fbsAs("s1", repo, "camp", "start", "x").out.join("\n"));
+  expect(started.session).toBe("s1");
+  expect("takenOverFrom" in started).toBe(false);
+  expect(show(repo).session).toBe("s1");
+});
+
+test("camp start from another session takes the camp over and says so; the same session, or none, keeps it", () => {
+  const repo = campRepo();
+  fbsAs("s1", repo, "camp", "start", "x");
+  round(repo, 1);
+  expect("takenOverFrom" in JSON.parse(fbsAs("s1", repo, "camp", "start", "x").out.join("\n"))).toBe(false);
+  const taken = JSON.parse(fbsAs("s2", repo, "camp", "start", "x").out.join("\n"));
+  expect(taken).toMatchObject({ session: "s2", takenOverFrom: "s1" });
+  expect(taken.rounds).toHaveLength(1);
+  const anonymous = JSON.parse(fbs(repo, "camp", "start", "x").out.join("\n"));
+  expect(anonymous.session).toBe("s2");
+  expect("takenOverFrom" in anonymous).toBe(false);
+});
+
+test("camp round and camp checkpoint from a session that lost the camp are refused; the holder and a session-less caller go on", () => {
+  const repo = campRepo();
+  fbsAs("s1", repo, "camp", "start", "x", "--auto-fix-rounds", "1");
+  fbsAs("s2", repo, "camp", "start", "x");
+  const counts = ["--in", "1", "--fixed", "1", "--declined", "0", "--followups", "0", "--asked", "0"];
+  const refused = { code: 1, out: ["error: camp held by s2; camp start takes it over"] };
+  expect(fbsAs("s1", repo, "camp", "round", "x", ...counts)).toEqual(refused);
+  expect(show(repo).rounds).toEqual([]);
+  expect(fbsAs("s2", repo, "camp", "round", "x", ...counts)).toEqual({ code: 0, out: ["checkpoint"] });
+  expect(fbsAs("s1", repo, "camp", "checkpoint", "x")).toEqual(refused);
+  expect(fbs(repo, "camp", "checkpoint", "x").out).toEqual(["blockers-only"]);
+});
+
+test("camp stop removes the camp file even when checking the PR fails", () => {
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), "fbs-camp-")));
+  tempDirs.push(repo);
+  // No origin, main or master: the default branch can't be told, so asking about the PR throws.
+  git(repo, "init", "-q", "-b", "trunk");
+  git(repo, "commit", "-q", "--allow-empty", "-m", "chore: init");
+  expect(fbs(repo, "status", "init", "x", "--size", "mid").code).toBe(0);
+  fbs(repo, "camp", "start", "x");
+  const rec = JSON.parse(readFileSync(recordFile(repo, "x"), "utf8"));
+  writeFileSync(recordFile(repo, "x"), JSON.stringify({ ...rec, pr: 7, repo: "acme/app" }));
+  const err: string[] = [];
+  const gh = () => ({ code: 0, stdout: JSON.stringify({ state: "OPEN" }), stderr: "" });
+  const code = run(["camp", "stop", "x"], { cwd: repo, today: "2026-11-01", out: () => {}, err: (s) => err.push(s) }, { gh, now: () => 0, sleep: () => {}, stdin: () => "" });
+  expect(code).toBe(2);
+  expect(err[0]).toContain("cannot tell the default branch");
+  expect(existsSync(campFile(repo))).toBe(false);
 });
 
 const LANDED = { pr: 7, repo: "acme/app", commit: "a".repeat(40), at: "2026-11-01" };

@@ -24,6 +24,8 @@ Run every `fbs` command as its own Bash call, with nothing chained, piped or red
 
 ## 2. Read where it stands
 
+On a resume, first run `fbs status reconcile`: it records every PR merged outside fbs as landed and clears the link of one closed without merging, so the records and the guard match GitHub. Tell the user each `outside` entry in one line. By `kind`: `landed`, that feature is done (in a stack, the rules below carry on with the units left, and `fbs stack sync` restacks what stood on it); `closed`, its record has no PR now: ask the user before opening another; any other kind changes nothing. Then read the record again.
+
 From the record and the feature's folder (`dir`, read under `docsRoot`, which `fbs status show` prints with `docs`), in this order, the first that applies is the starting point:
 
 1. **A running or met afk run with no PR yet:** `fbs afk show <slug>` prints a run whose `status` is `running` or `met`, and the record has no `pr`: afk, which resumes it. A stopped run, or `none` (the feature never had one), falls through to the rules below.

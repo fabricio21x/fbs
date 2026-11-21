@@ -25,9 +25,9 @@ export interface Cursor {
   approvedReportedFor: string | null;
 }
 
-export type Verdict = "approved-green" | "ready" | "waiting" | "conflict" | "activity" | "closed" | "timeout" | "query-error";
+export type Verdict = "approved-green" | "ready" | "waiting" | "conflict" | "activity" | "closed" | "timeout" | "query-error" | "taken-over";
 
-export const EXIT_CODES: Record<Verdict, number> = { "approved-green": 0, activity: 3, closed: 4, timeout: 5, conflict: 6, "query-error": 7, ready: 8, waiting: 9 };
+export const EXIT_CODES: Record<Verdict, number> = { "approved-green": 0, activity: 3, closed: 4, timeout: 5, conflict: 6, "query-error": 7, ready: 8, waiting: 9, "taken-over": 10 };
 
 /** Verdicts whose report the agent acts on in full; the others leave the cursor alone, so nothing is lost. */
 const SAVING: readonly Verdict[] = ["approved-green", "ready", "waiting", "activity", "closed"];
@@ -53,7 +53,7 @@ export interface FailingCheck {
 }
 
 export interface Report {
-  verdict: Exclude<Verdict, "query-error">;
+  verdict: Exclude<Verdict, "query-error" | "taken-over">;
   pr: number;
   state: Snapshot["state"];
   head: string;
@@ -72,6 +72,13 @@ export interface QueryErrorReport {
   verdict: "query-error";
   pr: number;
   error: string;
+}
+
+/** The camp this watcher works for is now held by another Claude Code session, `session`, or was stopped (null). */
+export interface TakenOverReport {
+  verdict: "taken-over";
+  pr: number;
+  session: string | null;
 }
 
 const REPORTED_FOR = ["waitingReportedFor", "approvedReportedFor"];
@@ -206,7 +213,7 @@ function commentsQuiet(unseen: NewComment[], previous: Snapshot | null): boolean
 }
 
 /** The verdict for one snapshot, or null to keep waiting; `previous` is the same PR's snapshot from the poll before. */
-export function classify(snapshot: Snapshot, cursor: Cursor, previous: Snapshot | null = null): Exclude<Verdict, "timeout" | "query-error"> | null {
+export function classify(snapshot: Snapshot, cursor: Cursor, previous: Snapshot | null = null): Exclude<Verdict, "timeout" | "query-error" | "taken-over"> | null {
   if (snapshot.state !== "OPEN") return "closed";
   if (snapshot.mergeable === "CONFLICTING") return "conflict";
   const unseen = unseenComments(snapshot, cursor);
@@ -304,6 +311,8 @@ export interface WatchOptions {
   intervalSeconds: number;
   /** null waits until a verdict; 0 takes one snapshot. */
   timeoutSeconds: number | null;
+  /** Asked before each poll: the other session that now holds the camp (session null: the camp is gone), or null to keep watching. */
+  takenOver?: () => { session: string | null } | null;
 }
 
 export const DEFAULT_INTERVAL_SECONDS = 60;
@@ -311,7 +320,7 @@ const MAX_WAIT_SECONDS = 300;
 const RETRY_DELAY_SECONDS = 15;
 
 /** `cursor` is what to save, or null to leave the saved one as it is. */
-export type WatchResult = { report: Report; cursor: Cursor | null } | { report: QueryErrorReport; cursor: null };
+export type WatchResult = { report: Report; cursor: Cursor | null } | { report: QueryErrorReport | TakenOverReport; cursor: null };
 
 /** Poll until a verdict. A GhError (gh missing, unauthenticated, no such PR) is not retried and propagates. */
 export function watch(reader: GitHubReader, cursor: Cursor, options: WatchOptions, clock: Clock, progress: (line: string) => void): WatchResult {
@@ -335,6 +344,11 @@ export function watchAll(targets: WatchTarget[], options: WatchOptions, clock: C
   let wait = options.intervalSeconds;
   const previous: (Snapshot | null)[] = targets.map(() => null);
   for (let poll = 1; ; poll++) {
+    const taken = options.takenOver?.() ?? null;
+    if (taken !== null) {
+      progress(JSON.stringify({ poll, verdict: "taken-over", session: taken.session }));
+      return { index: 0, result: { report: { verdict: "taken-over", pr: targets[0].cursor.pr, session: taken.session }, cursor: null } };
+    }
     let first: Snapshot | null = null;
     for (const [index, { reader, cursor, label }] of targets.entries()) {
       const snapshot = readSnapshot(reader, cursor.pr, clock, remaining, (fields) => progress(JSON.stringify({ poll, ...label, ...fields })));

@@ -29,7 +29,7 @@ import {
 } from "./git";
 import type { GhRunner } from "./github";
 import { campMarkerPath } from "./guard";
-import { type FeatureBranch, type FeatureRecord, featureUnits, isUnit, listFeatures, readFeature, type UnitRecord, updateFeature } from "./status";
+import { clearPr, type FeatureBranch, type FeatureRecord, featureUnits, isUnit, listFeatures, readFeature, type UnitRecord, updateFeature } from "./status";
 
 /** A unit or feature that landed below: the PR head its merge took (null when unknown) and the squash commit on the default branch. */
 export interface LandedBelow {
@@ -376,10 +376,10 @@ function unknownParentLanding(cwd: string, gh: GhRunner, rec: FeatureRecord, mai
 
 /**
  * Ask gh about `rec`'s PR when it hasn't landed; one merged into the default branch is recorded as landed `by:
- * "outside"`, its camp markers removed and the plain features cut from its branch restacked, as land does. Null when
- * there is no PR to ask about or it is open.
+ * "outside"`, its camp markers removed and, with `restack`, the plain features cut from its branch restacked, as land
+ * does. Null when there is no PR to ask about or it is open.
  */
-function noticeLanding(cwd: string, gh: GhRunner, rec: FeatureRecord, main: string, today: string): Outside | null {
+function noticeLanding(cwd: string, gh: GhRunner, rec: FeatureRecord, main: string, today: string, restack = true): Outside | null {
   if (rec.landed !== undefined || rec.pr === null || rec.repo === undefined) return null;
   const { slug, pr, repo } = rec;
   const note = (kind: Outside["kind"], reason: string): Outside => ({ slug, pr, kind, reason });
@@ -406,8 +406,30 @@ function noticeLanding(cwd: string, gh: GhRunner, rec: FeatureRecord, main: stri
   if (isUnit(rec) && featureUnits(cwd, rec.unitOf).every((unit) => unit.landed !== undefined)) rmSync(campMarkerPath(commonDir, rec.unitOf), { force: true });
   const warning = dropped === 0 ? "" : `; warning: ${dropped} commit${dropped === 1 ? "" : "s"} on ${rec.branch?.name} ${dropped === 1 ? "isn't" : "aren't"} in the merged head, so ${dropped === 1 ? "it" : "they"} didn't land`;
   const landed = note("landed", `PR #${pr} was merged outside fbs land; recorded ${slug} as landed at ${commit}${warning}`);
-  const stacked = plainFeaturesOn(cwd, rec).map((feature) => restackAbove(cwd, gh, feature, main, { head, squash: commit }));
+  const stacked = restack ? plainFeaturesOn(cwd, rec).map((feature) => restackAbove(cwd, gh, feature, main, { head, squash: commit })) : [];
   return stacked.length === 0 ? landed : { ...landed, stacked };
+}
+
+/**
+ * Record each of `recs` whose PR was merged outside fbs land as landed, and clear the link of one closed unmerged;
+ * what gh said of each PR not open. Nothing is restacked or pushed: stack sync restacks a feature cut from a landed
+ * branch at that feature's next sync.
+ */
+export function noticeLandings(cwd: string, gh: GhRunner, recs: FeatureRecord[], today: string): Outside[] {
+  const asked = recs.filter((rec) => rec.landed === undefined && rec.pr !== null);
+  if (asked.length === 0) return [];
+  const main = defaultBranchOf(cwd);
+  return asked.flatMap((rec) => {
+    const found = noticeLanding(cwd, gh, rec, main, today, false);
+    if (found?.kind !== "closed") return found ?? [];
+    clearPr(cwd, found.slug);
+    return { ...found, reason: `PR #${found.pr} was closed without merging; cleared ${found.slug}'s link to it, as fbs status pr ${found.slug} none would` };
+  });
+}
+
+/** `fbs status reconcile`: noticeLandings for every record with an open PR. */
+export function reconcileLandings(cwd: string, gh: GhRunner, today: string): Outside[] {
+  return noticeLandings(cwd, gh, listFeatures(cwd, () => {}), today);
 }
 
 function onOriginMain(cwd: string, commit: string, main: string): boolean {

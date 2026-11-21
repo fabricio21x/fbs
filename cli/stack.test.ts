@@ -3,8 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setGitBinary } from "./git";
+import { REAL_AFK_DEPS } from "./afk";
 import type { GhResult, GhRunner } from "./github";
-import { campMarkerPath, writeLandToken } from "./guard";
+import { campMarkerPath, openPrRecords, writeLandToken } from "./guard";
 import { land } from "./land";
 import { run } from "./main";
 import { syncStack } from "./stack";
@@ -745,43 +746,43 @@ describe("a merge outside fbs land", () => {
     expect(["f", "f-a"].map((slug) => existsSync(campMarkerPath(s.common, slug)))).toEqual([false, false]);
   });
 
+  /** Plain feature p on main with PR 50, and q cut from p's branch with PR 51, both pushed. */
+  function plainPair(): Stack & { pTip: string } {
+    const origin = join(tempDir(), "origin.git");
+    git(dirname(origin), "init", "-q", "--bare", "-b", "main", origin);
+    const work = join(tempDir(), "work");
+    git(dirname(work), "init", "-q", "-b", "main", work);
+    git(work, "remote", "add", "origin", origin);
+    const base = commitFile(work, "shared.txt", "a\n", "chore: init");
+    git(work, "push", "-q", "origin", "main");
+    git(work, "switch", "-q", "-c", "feature/p");
+    const pTip = commitFile(work, "p.txt", "p\n", "feat: p");
+    git(work, "switch", "-q", "-c", "feature/q");
+    const qTip = commitFile(work, "q.txt", "q\n", "feat: q");
+    git(work, "push", "-q", "origin", "feature/p", "feature/q");
+    git(work, "switch", "-q", "main");
+    const common = join(work, ".git");
+    mkdirSync(join(common, "fbs", "features"), { recursive: true });
+    const record = (slug: string, pr: number, branch: object) => ({ slug, dir: `docs/features/2026-10-21-${slug}`, size: "mid", approvals: {}, pr, repo: "acme/app", branch });
+    writeFileSync(join(common, "fbs", "features", "p.json"), JSON.stringify(record("p", 50, { name: "feature/p", parent: "main", base, pushed: pTip })));
+    writeFileSync(join(common, "fbs", "features", "q.json"), JSON.stringify(record("q", 51, { name: "feature/q", parent: "feature/p", base: pTip, pushed: qTip })));
+    return { work, origin, common, pTip };
+  }
+
+  /** A gh where every PR is open unless `answers` says otherwise, edits succeed, and `listed` answers gh pr list --head. */
+  function plainGh(answers: Record<number, GhResult> = {}, listed: Record<string, object[]> = {}) {
+    const calls: string[][] = [];
+    const open: GhResult = { code: 0, stdout: JSON.stringify({ state: "OPEN", headRefOid: "0".repeat(40), mergeCommit: null, baseRefName: "main" }), stderr: "" };
+    const gh: GhRunner = (args) => {
+      calls.push(args);
+      if (args[1] === "edit") return { code: 0, stdout: "", stderr: "" };
+      if (args[1] === "list") return { code: 0, stdout: JSON.stringify(listed[args[args.indexOf("--head") + 1]] ?? []), stderr: "" };
+      return answers[Number(args[2])] ?? open;
+    };
+    return { gh, calls };
+  }
+
   describe("a plain feature cut from another feature's branch", () => {
-    /** Plain feature p on main with PR 50, and q cut from p's branch with PR 51, both pushed. */
-    function plainPair(): Stack & { pTip: string } {
-      const origin = join(tempDir(), "origin.git");
-      git(dirname(origin), "init", "-q", "--bare", "-b", "main", origin);
-      const work = join(tempDir(), "work");
-      git(dirname(work), "init", "-q", "-b", "main", work);
-      git(work, "remote", "add", "origin", origin);
-      const base = commitFile(work, "shared.txt", "a\n", "chore: init");
-      git(work, "push", "-q", "origin", "main");
-      git(work, "switch", "-q", "-c", "feature/p");
-      const pTip = commitFile(work, "p.txt", "p\n", "feat: p");
-      git(work, "switch", "-q", "-c", "feature/q");
-      const qTip = commitFile(work, "q.txt", "q\n", "feat: q");
-      git(work, "push", "-q", "origin", "feature/p", "feature/q");
-      git(work, "switch", "-q", "main");
-      const common = join(work, ".git");
-      mkdirSync(join(common, "fbs", "features"), { recursive: true });
-      const record = (slug: string, pr: number, branch: object) => ({ slug, dir: `docs/features/2026-10-21-${slug}`, size: "mid", approvals: {}, pr, repo: "acme/app", branch });
-      writeFileSync(join(common, "fbs", "features", "p.json"), JSON.stringify(record("p", 50, { name: "feature/p", parent: "main", base, pushed: pTip })));
-      writeFileSync(join(common, "fbs", "features", "q.json"), JSON.stringify(record("q", 51, { name: "feature/q", parent: "feature/p", base: pTip, pushed: qTip })));
-      return { work, origin, common, pTip };
-    }
-
-    /** A gh where every PR is open unless `answers` says otherwise, edits succeed, and `listed` answers gh pr list --head. */
-    function plainGh(answers: Record<number, GhResult> = {}, listed: Record<string, object[]> = {}) {
-      const calls: string[][] = [];
-      const open: GhResult = { code: 0, stdout: JSON.stringify({ state: "OPEN", headRefOid: "0".repeat(40), mergeCommit: null, baseRefName: "main" }), stderr: "" };
-      const gh: GhRunner = (args) => {
-        calls.push(args);
-        if (args[1] === "edit") return { code: 0, stdout: "", stderr: "" };
-        if (args[1] === "list") return { code: 0, stdout: JSON.stringify(listed[args[args.indexOf("--head") + 1]] ?? []), stderr: "" };
-        return answers[Number(args[2])] ?? open;
-      };
-      return { gh, calls };
-    }
-
     test("its parent squash-merged outside fbs is recorded, and it is restacked to its own commits and retargeted", () => {
       const s = plainPair();
       const squash = squashOnOrigin(s, s.pTip, "feat: p (#50)");
@@ -912,6 +913,120 @@ describe("a merge outside fbs land", () => {
       expect(result.restack).toBeNull();
       expect(ownCommits(s, "feature/q")).toEqual(["feat: q"]);
       expect(calls).toContainEqual(["pr", "edit", "51", "--repo", "acme/app", "--base", "main"]);
+    });
+  });
+
+  describe("camp and status reconcile record it too", () => {
+    const prDeps = (gh: GhRunner) => ({ gh, now: () => NOW, sleep: () => {}, stdin: () => "" });
+    function fbs(cwd: string, gh: GhRunner, ...args: string[]) {
+      return fbsAs(null, cwd, gh, ...args);
+    }
+    /** fbs run from the Claude Code session `session`, or from none. */
+    function fbsAs(session: string | null, cwd: string, gh: GhRunner, ...args: string[]) {
+      const out: string[] = [];
+      const code = run(args, { cwd, today: "2026-11-01", out: (l) => out.push(l), err: () => {} }, prDeps(gh), { ...REAL_AFK_DEPS, sessionId: () => session });
+      return { code, out };
+    }
+    /** q's record and branches, here and on origin: what a restack would change. */
+    const qState = (s: Stack) => [readFeature(s.work, "q"), git(s.work, "rev-parse", "feature/q"), git(s.origin, "rev-parse", "feature/q")];
+    const edits = (calls: string[][]) => calls.filter((call) => call[1] === "edit");
+
+    test("camp stop records a PR merged outside fbs as landed and says so, leaving the feature cut from it for its own sync", () => {
+      const s = plainPair();
+      expect(fbs(s.work, plainGh().gh, "camp", "start", "p").code).toBe(0);
+      const squash = squashOnOrigin(s, s.pTip, "feat: p (#50)");
+      const before = qState(s);
+      const { gh, calls } = plainGh({ 50: merged(s.pTip, squash) });
+      expect(fbs(s.work, gh, "camp", "stop", "p")).toEqual({
+        code: 0,
+        out: ["stopped", `landed: PR #50 was merged outside fbs land; recorded p as landed at ${squash}`],
+      });
+      expect(readFeature(s.work, "p").landed).toEqual({ pr: 50, repo: "acme/app", commit: squash, at: "2026-11-01", head: s.pTip, by: "outside" });
+      expect(openPrRecords(s.common).map((open) => open.slug)).toEqual(["q"]);
+      expect(existsSync(campMarkerPath(s.common, "p"))).toBe(false);
+      expect(qState(s)).toEqual(before);
+      expect(edits(calls)).toEqual([]);
+    });
+
+    test("camp stop on an open PR asks gh and changes nothing else", () => {
+      const s = plainPair();
+      const { gh, calls } = plainGh();
+      fbs(s.work, gh, "camp", "start", "p");
+      expect(fbs(s.work, gh, "camp", "stop", "p")).toEqual({ code: 0, out: ["stopped"] });
+      expect(readFeature(s.work, "p").landed).toBeUndefined();
+      expect(calls.map((call) => call.slice(0, 3))).toEqual([["pr", "view", "50"], ["pr", "view", "50"]]);
+    });
+
+    test("camp stop from a session that lost the camp is refused while the PR is open, and allowed once it merged", () => {
+      const s = plainPair();
+      fbsAs("s1", s.work, plainGh().gh, "camp", "start", "p");
+      fbsAs("s2", s.work, plainGh().gh, "camp", "start", "p");
+      expect(fbsAs("s1", s.work, plainGh().gh, "camp", "stop", "p")).toEqual({ code: 1, out: ["error: camp held by s2; camp start takes it over"] });
+      expect(existsSync(campMarkerPath(s.common, "p"))).toBe(true);
+      const squash = squashOnOrigin(s, s.pTip, "feat: p (#50)");
+      expect(fbsAs("s1", s.work, plainGh({ 50: merged(s.pTip, squash) }).gh, "camp", "stop", "p")).toEqual({
+        code: 0,
+        out: ["stopped", `landed: PR #50 was merged outside fbs land; recorded p as landed at ${squash}`],
+      });
+      expect(existsSync(campMarkerPath(s.common, "p"))).toBe(false);
+    });
+
+    test("camp stop without a session stops a camp another session holds", () => {
+      const s = plainPair();
+      fbsAs("s2", s.work, plainGh().gh, "camp", "start", "p");
+      expect(fbsAs(null, s.work, plainGh().gh, "camp", "stop", "p")).toEqual({ code: 0, out: ["stopped"] });
+      expect(existsSync(campMarkerPath(s.common, "p"))).toBe(false);
+    });
+
+    test("camp start on a PR merged outside fbs records it as landed and refuses to camp, saying what it recorded", () => {
+      const s = plainPair();
+      const squash = squashOnOrigin(s, s.pTip, "feat: p (#50)");
+      const before = qState(s);
+      const { gh, calls } = plainGh({ 50: merged(s.pTip, squash) });
+      expect(fbs(s.work, gh, "camp", "start", "p")).toEqual({
+        code: 1,
+        out: [`error: p has landed; there is nothing to camp (PR #50 was merged outside fbs land; recorded p as landed at ${squash})`],
+      });
+      expect(readFeature(s.work, "p").landed).toMatchObject({ by: "outside" });
+      expect(existsSync(campMarkerPath(s.common, "p"))).toBe(false);
+      expect(qState(s)).toEqual(before);
+      expect(edits(calls)).toEqual([]);
+    });
+
+    test("camp start on a stack records a unit merged outside, starts the camp for the rest and reports it", () => {
+      const s = stack();
+      const head = originTip(s, "f-a");
+      const squash = squashOnOrigin(s, head, "feat: f-a (#31)");
+      const r = fbs(s.work, answering(fakeGh(s).gh, { 31: merged(head, squash) }), "camp", "start", "f");
+      expect(r.code).toBe(0);
+      expect(JSON.parse(r.out.join("\n"))).toMatchObject({ slug: "f", outside: [{ slug: "f-a", pr: 31, kind: "landed" }] });
+      expect(readFeature(s.work, "f-a").landed).toMatchObject({ by: "outside" });
+      expect(existsSync(campMarkerPath(s.common, "f"))).toBe(true);
+    });
+
+    test("status reconcile records every open PR merged outside fbs as landed and leaves the rest, the feature cut from it included, for their own sync", () => {
+      const s = plainPair();
+      const squash = squashOnOrigin(s, s.pTip, "feat: p (#50)");
+      const before = qState(s);
+      const { gh, calls } = plainGh({ 50: merged(s.pTip, squash) });
+      const r = fbs(s.work, gh, "status", "reconcile");
+      expect(r.code).toBe(0);
+      expect(JSON.parse(r.out.join("\n"))).toEqual({ outside: [{ slug: "p", pr: 50, kind: "landed", reason: `PR #50 was merged outside fbs land; recorded p as landed at ${squash}` }] });
+      expect(readFeature(s.work, "p").landed).toMatchObject({ by: "outside" });
+      expect(openPrRecords(s.common).map((open) => open.slug)).toEqual(["q"]);
+      expect(qState(s)).toEqual(before);
+      expect(edits(calls)).toEqual([]);
+      expect(fbs(s.work, plainGh().gh, "status", "reconcile")).toEqual({ code: 0, out: ['{"outside":[]}'] });
+    });
+
+    test("status reconcile clears the link of a PR closed without merging, once, and says so", () => {
+      const s = plainPair();
+      const closed: GhResult = { code: 0, stdout: JSON.stringify({ state: "CLOSED", headRefOid: s.pTip, mergeCommit: null, baseRefName: "main" }), stderr: "" };
+      const r = fbs(s.work, plainGh({ 51: closed }).gh, "status", "reconcile");
+      expect(JSON.parse(r.out.join("\n"))).toEqual({ outside: [{ slug: "q", pr: 51, kind: "closed", reason: "PR #51 was closed without merging; cleared q's link to it, as fbs status pr q none would" }] });
+      expect(readFeature(s.work, "q")).toMatchObject({ pr: null });
+      expect("repo" in readFeature(s.work, "q")).toBe(false);
+      expect(fbs(s.work, plainGh({ 51: closed }).gh, "status", "reconcile")).toEqual({ code: 0, out: ['{"outside":[]}'] });
     });
   });
 

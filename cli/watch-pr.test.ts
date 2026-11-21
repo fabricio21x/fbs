@@ -167,7 +167,7 @@ describe("classify", () => {
     expect(early.report.verdict).toBe("activity");
     const review = { ...placeholder, body: "a.ts:3 drops the last item. [job](https://github.com/acme/app/actions/runs/1)", updatedAt: "2026-10-25T11:00:00Z" };
     const edited = runWatch([snapshot({ checks: [passed("e2e")], comments: [review] })], early.cursor ?? undefined, ONCE);
-    if (edited.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in edited.report)) throw new Error("unexpected");
     expect(edited.report.verdict).toBe("activity");
     expect(edited.report.newComments.map((c) => [c.key, c.body, c.edited])).toEqual([["issue:4", review.body, true]]);
   });
@@ -239,7 +239,7 @@ describe("watch", () => {
     const actions: Check = { ...failed("test", "run:5"), detailsUrl: "https://github.com/o/r/actions/runs/42/job/5", runId: 42, rerunnable: true };
     const status: Check = { ...failed("ci/legacy", "status:ci/legacy:t"), conclusion: "ERROR", detailsUrl: "https://ci.example.com/1" };
     const r = runWatch([snapshot({ checks: [actions, status] })]);
-    if (r.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in r.report)) throw new Error("unexpected");
     expect(r.report.failingChecks).toEqual([
       { name: "test", status: "COMPLETED", conclusion: "FAILURE", failedOnPreviousHead: false, detailsUrl: "https://github.com/o/r/actions/runs/42/job/5", runId: 42, rerunnable: true, runInProgress: false },
       { name: "ci/legacy", status: "COMPLETED", conclusion: "ERROR", failedOnPreviousHead: false, detailsUrl: "https://ci.example.com/1", runId: null, rerunnable: false, runInProgress: false },
@@ -288,7 +288,7 @@ describe("watch", () => {
     const r = runWatch([snapshot({ checks: [pending("ci")], comments: [botComment(1)] }), snapshot({ checks: [failed("ci")], comments: [botComment(1)] })]);
     expect(r.report.verdict).toBe("activity");
     expect(r.calls).toBe(2);
-    if (r.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in r.report)) throw new Error("unexpected");
     expect(r.report.newComments.map((c) => [c.key, c.bot, c.edited])).toEqual([["thread:1", true, false]]);
     expect(r.report.failingChecks).toEqual([failure("ci")]);
   });
@@ -297,7 +297,7 @@ describe("watch", () => {
     const one = snapshot({ checks: [failed("lint"), pending("e2e")], comments: [botComment(1)] });
     const two = snapshot({ checks: [failed("lint"), pending("e2e")], comments: [botComment(1), botComment(2)] });
     const r = runWatch([one, two, two], emptyCursor(PR), { intervalSeconds: 60, timeoutSeconds: 3600 });
-    if (r.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in r.report)) throw new Error("unexpected");
     expect(r.report.verdict).toBe("activity");
     expect(r.calls).toBe(3);
     expect(r.report.newComments.map((c) => c.id)).toEqual([1, 2]);
@@ -310,12 +310,12 @@ describe("watch", () => {
     const job = (check: Check, runId: number): Check => ({ ...check, runId, rerunnable: true });
     const early = snapshot({ checks: [job(failed("lint"), 41), job(failed("unit"), 42), job(pending("e2e"), 42)], comments: [botComment(1)] });
     const r = runWatch([early], emptyCursor(PR), { intervalSeconds: 60, timeoutSeconds: 3600 });
-    if (r.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in r.report)) throw new Error("unexpected");
     expect(r.report.verdict).toBe("activity");
     expect(r.report.pendingChecks).toBe(1);
     expect(r.report.failingChecks.map((c) => [c.name, c.runInProgress])).toEqual([["lint", false], ["unit", true]]);
     const settled = runWatch([snapshot({ checks: [job(failed("lint"), 41), job(failed("unit"), 42), job(passed("e2e"), 42)], comments: [botComment(1)] })], r.cursor ?? undefined, ONCE);
-    if (settled.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in settled.report)) throw new Error("unexpected");
     expect(settled.report.verdict).toBe("activity");
     expect(settled.report.pendingChecks).toBe(0);
     expect(settled.report.failingChecks.map((c) => [c.name, c.runInProgress])).toEqual([["lint", false], ["unit", false]]);
@@ -330,7 +330,7 @@ describe("watch", () => {
     expect(once.report.verdict).toBe("timeout");
     expect(once.calls).toBe(1);
     expect(once.sleeps).toEqual([]);
-    if (once.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in once.report)) throw new Error("unexpected");
     expect(once.report.newComments.map((c) => c.id)).toEqual([1]);
   });
 
@@ -391,11 +391,11 @@ describe("watch", () => {
     expect(first.report.verdict).toBe("activity");
     const quiet = runWatch([snapshot({ ...openThread, comments: [comment(1)] })], first.cursor ?? undefined, ONCE);
     expect(quiet.report.verdict).toBe("timeout");
-    if (quiet.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in quiet.report)) throw new Error("unexpected");
     expect(quiet.report.newComments).toEqual([]);
     const edited = runWatch([snapshot({ comments: [comment(1, { updatedAt: "2026-10-25T12:00:00Z", body: "edited" })] })], first.cursor ?? undefined);
     expect(edited.report.verdict).toBe("activity");
-    if (edited.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in edited.report)) throw new Error("unexpected");
     expect(edited.report.newComments.map((c) => [c.body, c.edited])).toEqual([["edited", true]]);
   });
 
@@ -403,11 +403,11 @@ describe("watch", () => {
     const first = runWatch([snapshot({ checks: [failed("ci"), passed("lint")] })]);
     expect(first.cursor).toMatchObject({ head: HEAD, reported: ["run:ci"], failing: ["ci"], previousFailing: [] });
     const pushed = runWatch([snapshot({ head: NEW_HEAD, checks: [failed("ci", "run:3"), failed("lint", "run:4")] })], first.cursor ?? undefined);
-    if (pushed.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in pushed.report)) throw new Error("unexpected");
     expect(pushed.report.failingChecks).toEqual([failure("ci", true), failure("lint")]);
     expect(pushed.cursor).toMatchObject({ head: NEW_HEAD, reported: ["run:3", "run:4"], failing: ["ci", "lint"], previousFailing: ["ci"] });
     const again = runWatch([snapshot({ head: NEW_HEAD, state: "CLOSED", checks: [failed("ci", "run:3")] })], pushed.cursor ?? undefined);
-    if (again.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in again.report)) throw new Error("unexpected");
     expect(again.report.failingChecks).toEqual([failure("ci", true)]);
   });
 });

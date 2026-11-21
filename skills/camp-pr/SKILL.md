@@ -24,13 +24,15 @@ Run every `fbs` command as its own Bash call, with nothing chained, piped or red
 
 **Rewriting the PR's branch.** A fix to commit messages only (rewording commits so each keeps its tree and the branch its base) is pushed with `git push --force-with-lease origin <branch>` as its own Bash call, from the repo's directory: the guard lets it through, since reviews and the stamp still hold. Any other rewrite (a rebase, a squash, a dropped or changed commit) needs the user's go. When they asked for it in their own words ("go ahead and force push it"), that is the go. Otherwise run `fbs rewrite request <slug>` and ask in plain words what it rewrites and why; their yes as their next message is the go. The go lets one `--force-with-lease` push through from this session. Never `--force`, `-f` or a `+` refspec, whatever the user says. When the guard denies a push, follow its message; never stop the camp to get around it.
 
+**Merged outside fbs** (the user says "it was squashed and merged"): run `fbs status reconcile`. It records every PR merged outside fbs as landed, which switches the guard off for it, and clears the link of one closed unmerged; report each `outside` entry in one line. Then run `fbs camp stop <slug>` and stop (in a stack, the stack section's "A unit merged" rule instead).
+
 **Handling comments outside a camp** (the user says "there are comments from codex, look at them"): the same triage and the same round count. Run `fbs camp start <slug>` (it keeps the rounds on a resume), handle the round as steps 4 and 5 say, and record it with `fbs camp round`, so the fix budget holds.
 
 ## 1. Start or resume
 
 1. Run `fbs status show <slug>` and take `dir`, `pr` and `repo`. No `pr`: continue into open-pr.
 2. Run `fbs branch <slug> --existing` and take `branch` from its JSON (written `<branch>` below). On `refused:`, report it and stop: a PR without its branch can't be worked.
-3. Run `fbs camp start <slug>` (add `--auto-fix-rounds <n>` when the user set a budget for this camp). It creates the camp's state, or keeps it on a resume; only the CLI writes it.
+3. Run `fbs camp start <slug>` (add `--auto-fix-rounds <n>` when the user set a budget for this camp). It creates the camp's state, or keeps it on a resume; only the CLI writes it. The camp belongs to this session: with `takenOverFrom`, tell the user the camp moved here from that session, whose watcher stops at its next poll. Each `outside` entry, by `kind`: `landed` is exit 4's merged (in a stack, the stack section's "A unit merged" rule); `closed` is exit 4's closed (the link is already cleared); any other kind, tell the user in one line and carry on. `error: <slug> has landed` (it may have just recorded that): report it and stop.
 4. **On a resume,** start the watcher (step 2) and work from its first report: it carries everything not reported before. Then check for what was reported but never handled before an interruption: unresolved threads with no reply from you. Treat those as part of the same round.
 
 ## 2. Watch
@@ -49,6 +51,7 @@ Its report is the last line of its stdout, one JSON object (progress lines go to
 - **6, conflict:** the base moved under the PR (step 5, "Base").
 - **8, ready:** the draft is green with nothing unseen: mark it ready (`gh pr ready <pr>`), report it, start the watcher again.
 - **9, waiting:** green, every thread handled, not approved. When the repo requires no review and the PR is the user's own (they can't approve it), say it's ready to land, as for 0; otherwise say it's waiting for reviewers. Either way, start the watcher again: more comments can still come.
+- **10, taken over:** another Claude Code session (`session` in the report) now holds the camp, or the camp was stopped (`session: null`). `error: camp held by <id>` from `fbs camp round`, `checkpoint` or `stop` means the same. Stop camping here: don't start the watcher again, don't run `fbs camp stop`, and touch nothing on the PR. Tell the user which session holds it (after `--continue` or `--resume` it can be this conversation's own earlier session id), and that `/fbs:assemble <slug>` here takes it back either way.
 
 On 0, 8 and 9, step 6 comes before the watcher starts again when follow-ups are open. Camp keeps watching until the PR is landed or closed, or the user says to stop; the watcher reports each state once per head, so it never loops on them.
 

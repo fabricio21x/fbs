@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { REAL_AFK_DEPS } from "./afk";
 import { gitCommonDir, repoRoot } from "./git";
 import type { GhResult } from "./github";
 import { type PrDeps, run, takeToolFlags } from "./main";
@@ -875,6 +876,16 @@ test("config show prints the validated config as one JSON line, defaults filled 
   expectEnvironmentError(config(gitRepo({ ".fbs/config.json": '{"verify": {"ciEvidence": "yes"}}' }), "show"), "verify.ciEvidence must be true or false");
 });
 
+test("the help lists status reconcile and watch-pr's taken-over exit, and status reconcile takes no argument", () => {
+  const out: string[] = [];
+  expect(run(["help"], io(out, []))).toBe(0);
+  expect(out.join("\n")).toContain("status reconcile ");
+  expect(out.join("\n")).toContain("10 taken-over");
+  const err: string[] = [];
+  expect(run(["status", "reconcile", "x"], io([], err, featureRepo()))).toBe(2);
+  expect(err).toEqual(["unknown command: status reconcile x"]);
+});
+
 test("the help lists the branch types", () => {
   const out: string[] = [];
   expect(run(["help"], io(out, []))).toBe(0);
@@ -1209,6 +1220,74 @@ test.each([[["watch-pr"]], [["watch-pr", "x", "--interval", "0"]], [["watch-pr",
     expect(r.err[0]).toStartWith("unknown command: watch-pr");
   },
 );
+
+/** Run fbs from the Claude Code session `session`, or from none. */
+function inSession(session: string | null, cwd: string, deps: PrDeps, ...args: string[]) {
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = run(args, io(out, err, cwd), deps, { ...REAL_AFK_DEPS, sessionId: () => session });
+  return { code, out, err };
+}
+
+describe("a camp taken over by another session", () => {
+  test("watch-pr exits 10 with taken-over, naming the session, before asking gh, and saves no cursor", () => {
+    const repo = prRepo();
+    expect(inSession("s2", repo, prDeps({}).deps, "camp", "start", "x").code).toBe(0);
+    const { deps, calls } = prDeps({ graphql: { stdout: graphqlAnswer({}) } });
+    const r = inSession("s1", repo, deps, "watch-pr", "x", "--once");
+    expect(r.code).toBe(10);
+    expect(r.out.map((line) => JSON.parse(line))).toEqual([{ verdict: "taken-over", pr: 7, session: "s2" }]);
+    expect(calls).toEqual([]);
+    expect(existsSync(cursorFile(repo))).toBe(false);
+  });
+
+  test("the holding session's watcher, a watcher with no session, and a camp with no session recorded watch as before", () => {
+    const repo = prRepo();
+    const { deps } = prDeps({ graphql: { stdout: graphqlAnswer({ reviewDecision: "REVIEW_REQUIRED" }) } });
+    expect(inSession(null, repo, deps, "camp", "start", "x").code).toBe(0);
+    expect(inSession("s1", repo, deps, "watch-pr", "x", "--once").code).toBe(9);
+    rmSync(cursorFile(repo));
+    expect(inSession("s2", repo, deps, "camp", "start", "x").code).toBe(0);
+    expect(inSession("s2", repo, deps, "watch-pr", "x", "--once").code).toBe(9);
+    rmSync(cursorFile(repo));
+    expect(inSession(null, repo, deps, "watch-pr", "x", "--once").code).toBe(9);
+  });
+
+  test("a camp stopped while its watcher sleeps ends the watch with taken-over and no session; no camp at the start watches as before", () => {
+    const repo = prRepo();
+    const pendingCheck = { __typename: "CheckRun", databaseId: 2, name: "ci", status: "IN_PROGRESS", conclusion: null };
+    const commits = { nodes: [{ commit: { oid: PR_HEAD, statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, nodes: [pendingCheck] } } } }] };
+    const { deps } = prDeps({ graphql: { stdout: graphqlAnswer({ commits }) } });
+    expect(inSession("s1", repo, deps, "watch-pr", "x", "--once").code).toBe(5);
+    inSession("s1", repo, deps, "camp", "start", "x");
+    let naps = 0;
+    const stopCamp = () => {
+      if (++naps > 1) throw new Error("the watcher slept again after its camp was stopped");
+      rmSync(join(repo, ".git", "fbs", "pr", "x.camp"));
+    };
+    const r = inSession("s1", repo, { ...deps, sleep: stopCamp }, "watch-pr", "x", "--interval", "30");
+    expect(r.code).toBe(10);
+    expect(JSON.parse(r.out[0])).toEqual({ verdict: "taken-over", pr: 7, session: null });
+  });
+
+  test("a watcher whose camp is taken over while it sleeps exits at its next poll", () => {
+    const repo = prRepo();
+    const pendingCheck = { __typename: "CheckRun", databaseId: 2, name: "ci", status: "IN_PROGRESS", conclusion: null };
+    const commits = { nodes: [{ commit: { oid: PR_HEAD, statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, nodes: [pendingCheck] } } } }] };
+    const { deps, calls } = prDeps({ graphql: { stdout: graphqlAnswer({ commits }) } });
+    inSession("s1", repo, deps, "camp", "start", "x");
+    let naps = 0;
+    const takeOver = () => {
+      if (++naps > 1) throw new Error("the watcher slept again after the takeover");
+      inSession("s2", repo, deps, "camp", "start", "x");
+    };
+    const r = inSession("s1", repo, { ...deps, sleep: takeOver }, "watch-pr", "x", "--interval", "30");
+    expect(r.code).toBe(10);
+    expect(JSON.parse(r.out[0])).toEqual({ verdict: "taken-over", pr: 7, session: "s2" });
+    expect(calls.filter((call) => call.args.includes("graphql"))).toHaveLength(1);
+    expect(JSON.parse(r.err.at(-1) as string)).toMatchObject({ poll: 2, verdict: "taken-over", session: "s2" });
+  });
+});
 
 test("watch-pr with a malformed cursor is an environment error", () => {
   const repo = prRepo();

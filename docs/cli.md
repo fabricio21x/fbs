@@ -21,6 +21,7 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 | `status init <unit> --unit-of <feature> [--unit <n>]` | Records a work unit of a big feature whose design approval is current; its folder is `<feature dir>/units/<unit>` |
 | `status show <slug>` | The record as JSON: size, folder, documents mode, branch, approvals and stamp (each with `current`), PR, ticket, rollout criteria with their outcomes, and `pendingRollout` for the ones still waiting (a feature's own and its units'); a feature lists its units, a unit its `covers` and `dependsOn` |
 | `status list` | One line per feature: slug, size, stage |
+| `status reconcile` | Asks `gh` about every record with an open PR: one merged outside fbs is recorded as landed (`by: outside`), so the guard stops counting it open, and one closed without merging has its link cleared, as `status pr <slug> none` would. Restacks and pushes nothing: `stack sync` moves a feature cut from a landed branch at its next sync. Prints `{outside}`, each PR it found not open |
 | `status gate <slug> spec\|design` | The gate: facts sourced, assumptions accepted, no open questions, every section present; a design's work units checked against the spec. A fact ends with its source in parentheses: `(user, YYYY-MM-DD)`, `(spec)`, a URL or a file path (optionally `:line`), then optionally `, <detail>` or `; <detail>`, as in `(user, 2026-11-18; replaces the old limit)`; an `unsourced:` line lists these forms |
 | `status approve <slug> spec\|design --quote '<words>'` | Records your approval verbatim, bound to the document's sha256; runs the gate first |
 | `status approve <slug> design --auto '<reason>'` | Records the agent's approval of a simple design amendment; refused for a spec |
@@ -67,11 +68,11 @@ For `branch --types`, `test/`, `docs/`, `build/` and `style/` branches count as 
 | `pr reply <slug> --comment <thread\|issue\|review>:<id> --body-file <path>` | Replies to a comment without putting text on the command line |
 | `pr comment <slug> --body-file <path>` | Posts a new top-level PR comment, marked seen so the watcher doesn't wake on it |
 | `pr resolve <slug> --thread <id>` | Resolves a review thread |
-| `camp start <slug> [--auto-fix-rounds <n>]` | Creates the PR camp's state, which switches on the guard, or keeps it on a resume |
-| `camp round <slug> --in <n> --fixed <n> --declined <n> --followups <n> --asked <n> [--note <text>] [--unit <unit>]` | Records a round and prints what comes next: continue, checkpoint or blockers-only |
-| `camp checkpoint <slug> [--unit <unit>]` | Records that the checkpoint with you was held |
+| `camp start <slug> [--auto-fix-rounds <n>]` | Creates the PR camp's state, which switches on the guard, or keeps it on a resume. The camp is held by the Claude Code session that ran it; from another session it takes the camp over and prints `takenOverFrom`. Asks `gh` about each PR it camps first, as `status reconcile` does (`outside`) |
+| `camp round <slug> --in <n> --fixed <n> --declined <n> --followups <n> --asked <n> [--note <text>] [--unit <unit>]` | Records a round and prints what comes next: continue, checkpoint or blockers-only. Refused with `error: camp held by <id>` when another session holds the camp |
+| `camp checkpoint <slug> [--unit <unit>]` | Records that the checkpoint with you was held. Refused like `camp round` when another session holds the camp |
 | `camp show <slug> [--unit <unit>]` | The camp's budget, rounds, follow-ups, and how the next round is handled |
-| `camp stop <slug>` | Ends the camp; follow-ups stay |
+| `camp stop <slug>` | Ends the camp; follow-ups stay. Asks `gh` about each PR it camps, as `status reconcile` does, and prints a `<kind>: <reason>` line after `stopped` for each PR found not open. When another session holds the camp, refused like `camp round` while a PR it camps is still open |
 | `camp followup <slug> --thread <key> --summary <text> [--why <text>] [--unit <unit>]` | Records a valid out-of-scope finding for a ticket later. The key is a comment's, as `pr reply` takes it, or `check:<check name>` for a failing CI check |
 | `camp followup <slug> --filed <n> --link <url>` / `--declined <n>` | Closes a follow-up |
 
@@ -87,6 +88,7 @@ For `branch --types`, `test/`, `docs/`, `build/` and `style/` branches count as 
 | `7` | Query error |
 | `8` | A green draft, ready to mark ready |
 | `9` | Green, waiting on review |
+| `10` | Taken over: another Claude Code session now holds the camp (`session` in the report), or the camp it started with is gone (`session: null`). Checked before each poll; nothing is marked seen. A watcher with no session id, or a camp that names none, never stops for this |
 
 ### Landing and stacks
 
@@ -146,7 +148,7 @@ Runtime state lives in `$(git rev-parse --git-common-dir)/fbs/`: shared by every
 | `features/<slug>.json` | The feature record: size, folder, branch, approvals, stamp, PR, ticket, units |
 | `evidence/<slug>/` | Validate's and the UI implementer's screenshots and notes, polish reports, autopilot evidence indexes |
 | `pr/<slug>.json` | The PR watcher's cursor: what it has already reported |
-| `pr/<slug>.camp` | A running camp and its rounds. Its existence switches on the guard |
+| `pr/<slug>.camp` | A running camp, the session holding it, and its rounds. Its existence switches on the guard |
 | `pr/<slug>.followups.json` | Follow-ups recorded during the camp |
 | `pr/<slug>.md` | The PR description |
 | `land/` | The pending land or rewrite request, the one-time land tokens and the rewrite token |
