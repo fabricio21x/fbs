@@ -18,7 +18,7 @@ flowchart LR
   W -->|yes| WT[walkthrough] --> VE
   W -->|no| VE
   VE -->|stamp| OP[open-pr] --> CP[camp-pr]
-  CP -->|ready| L{{"/fbs:land<br/>(typed by you)"}} --> M([merged])
+  CP -->|ready| L{{"land<br/>(on your go)"}} --> M([merged])
   C[[changes]] -.->|feedback or a finding, at any stage| I
   B[bug] --> T[tdd] --> VE
   TI[tiny] -->|built directly, test-first| VE

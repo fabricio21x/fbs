@@ -78,14 +78,14 @@ You start everything with `/fbs:assemble`. It finds where the work stands and ru
 6. **verify** runs before any PR: every criterion needs evidence from this tree, and a pass is stamped.
 7. **open-pr** runs on a stamped tree: it tidies the commits and opens a draft PR described from the spec.
 8. **camp-pr** runs while the PR is open: it triages review comments and CI each round, fixes, replies.
-9. **land** runs only when you type `/fbs:land`: it merges if the PR is approved, green and carries the verified tree.
+9. **land** runs only on your go: tell the agent to merge it ("go ahead and land it"), or type `/fbs:land`. It merges if the PR is approved, green (or the repo has no CI) and carries the verified tree. A PR in a GitHub stack is merged by you with GitHub's one command, which the agent hands you.
 
 ```mermaid
 flowchart LR
   A["/fbs:assemble"] --> P[plan] --> AR[architect] --> I[implement]
   I -->|UI criteria| V[validate] --> VE[verify]
   I -->|no UI| VE
-  VE --> OP[open-pr] --> CP[camp-pr] --> L{{"/fbs:land<br/>typed by you"}}
+  VE --> OP[open-pr] --> CP[camp-pr] --> L{{"land<br/>on your go"}}
   B[bug] --> T[tdd] --> VE
   C[[changes]] -.->|at any stage| I
 ```
@@ -140,7 +140,7 @@ You can type these. Most of the time `/fbs:assemble` runs them for you.
 | [`/fbs:organize-commits`](docs/skills.md#organize-commits) | Folds fix rounds into one commit per task, conventional subjects |
 | [`/fbs:open-pr`](docs/skills.md#open-pr) | Opens a draft PR for a verified feature |
 | [`/fbs:camp-pr`](docs/skills.md#camp-pr) | Works the PR round by round until it is ready to land |
-| [`/fbs:land`](docs/skills.md#land) | The only merge, typed by you |
+| [`/fbs:land`](docs/skills.md#land) | The only merge, on your go: ask in plain words or type it |
 | [`/fbs:afk`](docs/skills.md#afk) | Autopilot for a task whose finish line is a set of checks |
 
 ### Building blocks
@@ -172,7 +172,7 @@ Short rules a stage or agent loads at the step where they apply.
 ## Safety
 
 - **The agent never merges.** While a PR flow or an autopilot run is active in a repo, a `PreToolUse` hook denies `gh pr merge`, merge APIs and MCP merge tools, pushes to the default branch and force pushes.
-- **Only you land.** `fbs land` needs a one-time token that a hook writes when you type `/fbs:land`, or when you answer the agent's land request with a bare `land`. It also refuses unless the PR is approved (or it is your own solo repo), green, clean, and its head carries exactly the verified tree.
+- **Only you land.** `fbs land` needs a one-time token that a hook writes from your own message: when you ask the agent to merge or land the PR in plain words, answer its land question with a yes, or type `/fbs:land`. It also refuses unless the PR is approved (or it is your own solo repo), green (no checks at all is fine when the base branch requires none), clean, and its head carries exactly the verified tree.
 - **The verify stamp.** A passing verdict is bound to the git tree hash. Any code change makes it stale; `open-pr` and `land` refuse without a current one.
 - **Approvals are bound to the document.** Editing an approved spec or design makes its approval stale until you approve it again.
 - **Autopilot has hard limits.** `/fbs:afk` refuses migrations, new dependencies, infra and product decisions, never edits its own checks, and stops on any flag. It never merges, deploys or touches production. See [docs/afk.md](docs/afk.md).

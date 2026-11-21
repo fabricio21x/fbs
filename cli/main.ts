@@ -158,7 +158,13 @@ const USAGE = [
   "  camp followup <slug> --declined <n>",
   "                            close follow-up n: filed with its ticket's link, or declined; prints it; works after the camp",
   "                            stopped; a filed one can't be declined, nor a declined one filed",
-  "  land <slug>                merge the feature's PR; needs the token the user's /fbs:land writes",
+  "  land <slug>                merge the feature's PR; needs the land token the user's own message writes, kept until",
+  "                            a merge is tried or their next message that doesn't ask to land (asking to merge or land",
+  "                            it, a yes to a land request, or /fbs:land; bound to their session); a PR with",
+  "                            no checks lands when the base requires none (checks: \"none\" in the JSON); a PR in a GitHub",
+  "                            stack with other open PRs merges nothing: prints {merged:false,stack:{number,prs,upTo,",
+  "                            command}}, each open PR checked as land would ({pr,slug,ready,reasons?}), upTo the highest",
+  "                            ready one with only ready ones below, command gh stack merge <upTo> --squash for the user;",
   "                            a feature with units lands its lowest unit with an open PR, and a unit lands only when it",
   "                            is that one (bottom-up); /fbs:land on the feature or that unit writes the unit's token;",
   "                            then the unit above, when its PR is open, is restacked in a temporary worktree: git rebase",
@@ -170,10 +176,12 @@ const USAGE = [
   "                            or {slug,pr,done,kind,reason}, kind as for stack sync), and a restack that fails (a",
   "                            conflict or a refused push leaves the branch as it was) never fails the land",
   "  land request <slug>       ask for a land: write a pending request for the PR and stamp that land <slug> would land;",
-  "                            the user's bare reply (land, land it, land #<pr>) within 10 minutes, in the session that",
-  "                            asked ($CLAUDE_CODE_SESSION_ID, required), turns it into the land token; prints",
-  "                            {requested,slug,pr}; refused like land with no PR or no stamp, and while another",
-  "                            feature's request waits for an answer (the same feature's is refreshed)",
+  "                            the user's yes (yes, go ahead, land it anyway, land #<pr>) as their next message in the",
+  "                            session that asked ($CLAUDE_CODE_SESSION_ID, required), turns it into the land token, and",
+  "                            anything else they say drops it; prints {requested,slug,pr}; refused like",
+  "                            land with no PR or no stamp, and while another feature's request waits for an answer (the",
+  "                            same feature's is refreshed); in a GitHub stack it writes nothing and prints",
+  "                            {requested:false,stack} as land does",
   "  land request <slug> --over-failing",
   "                            the same, listing in over ({name,workflow?,state}) the PR's checks that completed without",
   "                            passing (failed or cancelled) and the base branch's required checks that never ran",
@@ -205,7 +213,8 @@ const USAGE = [
   "                            unexpected git failure in land's restack)",
   "  guard [--prompt|--reply]  hook entry: deny merges and default-branch pushes while a PR flow runs (a camp, or any",
   "                            feature with an open PR); --prompt writes the land token when the user types /fbs:land;",
-  "                            --reply writes it when the user answers a pending land request with a bare land",
+  "                            --reply writes it when the user's message may ask to land (for the PR it names, else the",
+  "                            one open PR flow's, bound to the session) or says yes to a pending land request",
   "  ask-check                 hook entry on AskUserQuestion: deny an Assuming, Confirm or Approve question, or one that",
   "                            says \"above\", when its message wrote no text in the chat before the call",
   "  afk start <slug> --spec <file> [--session <id>] [--restart]",
@@ -754,7 +763,12 @@ function runLand(args: string[], io: Io, deps: PrDeps, afkDeps: AfkDeps): number
   if ((args.length === 2 || overFailing) && args[0] === "request") {
     return refusingOnStdout(io, () => {
       try {
-        const { slug, pr, over } = requestLand(io.cwd, args[1], deps.now(), afkDeps.sessionId(), overFailing ? deps.gh : undefined);
+        const requested = requestLand(io.cwd, args[1], deps.now(), afkDeps.sessionId(), deps.gh, overFailing);
+        if ("stack" in requested) {
+          io.out(JSON.stringify({ requested: false, ...requested }));
+          return 0;
+        }
+        const { slug, pr, over } = requested;
         const note = overFailing && over === undefined ? { note: "no check is failing, so this is a plain land request" } : {};
         io.out(JSON.stringify({ requested: true, slug, pr, ...(over !== undefined && { over }), ...note }));
         return 0;
@@ -771,7 +785,8 @@ function runLand(args: string[], io: Io, deps: PrDeps, afkDeps: AfkDeps): number
   }
   return refusingOnStdout(io, () => {
     try {
-      io.out(JSON.stringify({ merged: true, ...land(io.cwd, args[0], deps.gh, deps.now(), io.today) }));
+      const landed = land(io.cwd, args[0], deps.gh, deps.now(), io.today, afkDeps.sessionId(), deps.sleep);
+      io.out(JSON.stringify({ merged: !("stack" in landed), ...landed }));
       return 0;
     } catch (e) {
       if (!(e instanceof LandRefusedError)) throw e;
@@ -957,15 +972,15 @@ function blockerLines(result: GateResult): string[] {
   ];
 }
 
-const TOOL_FLAGS = { git: "--fbs-git=", gh: "--fbs-gh=", claude: "--fbs-claude=" };
+const TOOL_FLAGS = { git: "--fbs-git=", gh: "--fbs-gh=", claude: "--fbs-claude=", session: "--fbs-session=" };
 type ToolPaths = Record<keyof typeof TOOL_FLAGS, string | null>;
 
-/** Split off the leading `--fbs-git=`, `--fbs-gh=` and `--fbs-claude=<path>` that `bin/fbs` adds, in any order. */
+/** Split off the leading `--fbs-git=`, `--fbs-gh=`, `--fbs-claude=<path>` and `--fbs-session=<id>` that `bin/fbs` adds, in any order. */
 export function takeToolFlags(argv: string[]): ToolPaths & { argv: string[] } {
-  const tools: ToolPaths = { git: null, gh: null, claude: null };
+  const tools: ToolPaths = { git: null, gh: null, claude: null, session: null };
   let i = 0;
   for (; i < argv.length; i++) {
-    const tool = (["git", "gh", "claude"] as const).find((name) => tools[name] === null && argv[i].startsWith(TOOL_FLAGS[name]) && argv[i].length > TOOL_FLAGS[name].length);
+    const tool = (["git", "gh", "claude", "session"] as const).find((name) => tools[name] === null && argv[i].startsWith(TOOL_FLAGS[name]) && argv[i].length > TOOL_FLAGS[name].length);
     if (tool === undefined) break;
     tools[tool] = argv[i].slice(TOOL_FLAGS[tool].length);
   }
@@ -973,7 +988,8 @@ export function takeToolFlags(argv: string[]): ToolPaths & { argv: string[] } {
 }
 
 if (import.meta.main) {
-  const { git, gh, claude, argv } = takeToolFlags(process.argv.slice(2));
+  const { git, gh, claude, session, argv } = takeToolFlags(process.argv.slice(2));
+  if (session && !process.env.CLAUDE_CODE_SESSION_ID) process.env.CLAUDE_CODE_SESSION_ID = session;
   if (git) setGitBinary(git);
   if (gh) setGhBinary(gh);
   if (claude) setClaudeBinary(claude);

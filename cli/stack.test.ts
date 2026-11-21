@@ -103,6 +103,7 @@ function fakeGh(s: Stack) {
   const ok = (stdout: string): GhResult => ({ code: 0, stdout, stderr: "" });
   const gh: GhRunner = (args) => {
     calls.push(args);
+    if (args[0] === "api" && args[1] === "graphql") return ok(JSON.stringify({ data: { repository: { pullRequest: { stack: null } } } }));
     const [, verb, number] = args;
     const u = UNITS.find((unit) => String(unit.pr) === number);
     const line = args.join(" ");
@@ -522,6 +523,49 @@ describe("a merge outside fbs land", () => {
     expect(ownCommits(s, "feature/g")).toEqual(["feat: g"]);
     expect(readFeature(s.work, "g").branch).toMatchObject({ parent: "main" });
     expect(calls).toContainEqual(["pr", "edit", "40", "--repo", "acme/app", "--base", "main"]);
+  });
+
+  test("a GitHub stack merged whole is recorded unit by unit, each PR's base its branch below, since each squash is on main", () => {
+    const s = stack();
+    const answers: Record<number, GhResult> = {};
+    let base = "main";
+    for (const u of UNITS) {
+      const head = originTip(s, u.slug);
+      // Each unit's tree holds every unit below it, so its squash onto main is its own tree.
+      const squash = git(s.origin, "commit-tree", `${head}^{tree}`, "-p", "main", "-m", `feat: ${u.slug} (#${u.pr})`);
+      git(s.origin, "update-ref", "refs/heads/main", squash);
+      answers[u.pr] = { code: 0, stdout: JSON.stringify({ state: "MERGED", headRefOid: head, mergeCommit: { oid: squash }, baseRefName: base }), stderr: "" };
+      base = u.branch;
+    }
+    const result = syncStack(s.work, "f", answering(fakeGh(s).gh, answers), "2026-11-01");
+    expect(result.outside.map((o) => [o.slug, o.kind])).toEqual([["f-a", "landed"], ["f-b", "landed"], ["f-c", "landed"]]);
+    expect(result.units).toEqual([]);
+    for (const u of UNITS) expect(readFeature(s.work, u.slug).landed).toMatchObject({ pr: u.pr, by: "outside" });
+  });
+
+  test("a GitHub stack merged up to f-a: GitHub restacked f-b and f-c on origin, and sync takes its branches rather than calling them diverged", () => {
+    const s = stack();
+    const head = originTip(s, "f-a");
+    const squash = squashOnOrigin(s, head, "feat: f-a (#31)");
+    const rebasedB = git(s.origin, "commit-tree", `${originTip(s, "f-b")}^{tree}`, "-p", squash, "-m", "feat: f-b");
+    const rebasedC = git(s.origin, "commit-tree", `${originTip(s, "f-c")}^{tree}`, "-p", rebasedB, "-m", "feat: f-c");
+    git(s.origin, "update-ref", "refs/heads/feature/f-b", rebasedB);
+    git(s.origin, "update-ref", "refs/heads/feature/f-c", rebasedC);
+    const { gh, calls } = fakeGh(s);
+    // GitHub manages a stacked PR's base itself and refuses gh pr edit on it; it already retargeted #32 to main.
+    const stacked: GhRunner = (args, cwd) => {
+      if (args[1] === "edit") return (calls.push(args), { code: 1, stdout: "", stderr: "GraphQL: Pull request is part of a stack and its base can't be changed" });
+      if (args[1] === "view" && args.includes(".baseRefName")) return (calls.push(args), { code: 0, stdout: "main\n", stderr: "" });
+      return gh(args, cwd);
+    };
+    const result = syncStack(s.work, "f", answering(stacked, { 31: merged(head, squash) }), "2026-11-01");
+    expect(result.outside.map((o) => [o.slug, o.kind])).toEqual([["f-a", "landed"]]);
+    expect(result.units.map((unit) => [unit.slug, unit.done, unit.treeChanged, unit.retargeted])).toEqual([["f-b", true, false, true], ["f-c", true, false, false]]);
+    expect(git(s.work, "rev-parse", "refs/heads/feature/f-b")).toBe(rebasedB);
+    expect(git(s.work, "rev-parse", "refs/heads/feature/f-c")).toBe(rebasedC);
+    expect([originTip(s, "f-b"), originTip(s, "f-c")]).toEqual([rebasedB, rebasedC]);
+    expect(readFeature(s.work, "f-b").branch).toMatchObject({ parent: "main" });
+    expect(calls).toContainEqual(["pr", "edit", "32", "--repo", "acme/app", "--base", "main"]);
   });
 
   test("a PR merged into another branch is reported and not recorded", () => {

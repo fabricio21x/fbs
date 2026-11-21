@@ -1201,6 +1201,15 @@ test("bin/fbs passes the gh, git and claude it resolves as leading flags", () =>
   expect(result.stdout.toString().trimEnd().split("\n")).toEqual([`--fbs-git=${join(tools, "git")}`, `--fbs-gh=${join(tools, "gh")}`, `--fbs-claude=${join(tools, "claude")}`, "watch-pr", "x"]);
 });
 
+test("bin/fbs passes the Claude Code session id as a leading flag when it has one", () => {
+  const dir = tempDir();
+  copyFileSync(join(import.meta.dir, "..", "bin", "fbs"), join(dir, "fbs"));
+  writeFileSync(join(dir, "fbs-bin"), '#!/bin/sh\nprintf "%s\\n" "$@"\n');
+  for (const file of [join(dir, "fbs"), join(dir, "fbs-bin")]) chmodSync(file, 0o755);
+  const result = Bun.spawnSync([join(dir, "fbs"), "land", "x"], { env: { PATH: "/usr/bin:/bin", CLAUDE_CODE_SESSION_ID: "s1" }, stdout: "pipe", stderr: "pipe" });
+  expect(result.stdout.toString().trimEnd().split("\n").slice(-3)).toEqual(["--fbs-session=s1", "land", "x"]);
+});
+
 test("--fbs-claude=<path> is the claude polish check runs", () => {
   const dir = tempDir();
   const claude = join(dir, "claude");
@@ -1213,21 +1222,24 @@ test("--fbs-claude=<path> is the claude polish check runs", () => {
 
 describe("takeToolFlags", () => {
   test("splits off a leading --fbs-git=<path>", () => {
-    expect(takeToolFlags(["--fbs-git=/x/git", "context", "check"])).toEqual({ git: "/x/git", gh: null, claude: null, argv: ["context", "check"] });
+    expect(takeToolFlags(["--fbs-git=/x/git", "context", "check"])).toEqual({ git: "/x/git", gh: null, claude: null, session: null, argv: ["context", "check"] });
   });
   test("splits off leading --fbs-git and --fbs-gh in either order", () => {
-    expect(takeToolFlags(["--fbs-git=/x/git", "--fbs-gh=/x/gh", "watch-pr", "x"])).toEqual({ git: "/x/git", gh: "/x/gh", claude: null, argv: ["watch-pr", "x"] });
-    expect(takeToolFlags(["--fbs-gh=/x/gh", "--fbs-git=/x/git", "help"])).toEqual({ git: "/x/git", gh: "/x/gh", claude: null, argv: ["help"] });
-    expect(takeToolFlags(["--fbs-gh=/x/gh", "help"])).toEqual({ git: null, gh: "/x/gh", claude: null, argv: ["help"] });
+    expect(takeToolFlags(["--fbs-git=/x/git", "--fbs-gh=/x/gh", "watch-pr", "x"])).toEqual({ git: "/x/git", gh: "/x/gh", claude: null, session: null, argv: ["watch-pr", "x"] });
+    expect(takeToolFlags(["--fbs-gh=/x/gh", "--fbs-git=/x/git", "help"])).toEqual({ git: "/x/git", gh: "/x/gh", claude: null, session: null, argv: ["help"] });
+    expect(takeToolFlags(["--fbs-gh=/x/gh", "help"])).toEqual({ git: null, gh: "/x/gh", claude: null, session: null, argv: ["help"] });
   });
   test("splits off a leading --fbs-claude=<path> with the others", () => {
-    expect(takeToolFlags(["--fbs-git=/x/git", "--fbs-gh=/x/gh", "--fbs-claude=/x/claude", "polish", "check"])).toEqual({ git: "/x/git", gh: "/x/gh", claude: "/x/claude", argv: ["polish", "check"] });
+    expect(takeToolFlags(["--fbs-git=/x/git", "--fbs-gh=/x/gh", "--fbs-claude=/x/claude", "polish", "check"])).toEqual({ git: "/x/git", gh: "/x/gh", claude: "/x/claude", session: null, argv: ["polish", "check"] });
+  });
+  test("splits off a leading --fbs-session=<id>, which the compiled CLI can't read from its emptied environment", () => {
+    expect(takeToolFlags(["--fbs-gh=/x/gh", "--fbs-session=s1", "land", "x"])).toEqual({ git: null, gh: "/x/gh", claude: null, session: "s1", argv: ["land", "x"] });
   });
   test("leaves argv alone without the flags, or when they aren't first, are empty or repeat", () => {
-    expect(takeToolFlags(["context", "check"])).toEqual({ git: null, gh: null, claude: null, argv: ["context", "check"] });
-    expect(takeToolFlags(["context", "--fbs-git=/x/git"])).toEqual({ git: null, gh: null, claude: null, argv: ["context", "--fbs-git=/x/git"] });
-    expect(takeToolFlags(["--fbs-git="])).toEqual({ git: null, gh: null, claude: null, argv: ["--fbs-git="] });
-    expect(takeToolFlags(["--fbs-gh=/a", "--fbs-gh=/b"])).toEqual({ git: null, gh: "/a", claude: null, argv: ["--fbs-gh=/b"] });
+    expect(takeToolFlags(["context", "check"])).toEqual({ git: null, gh: null, claude: null, session: null, argv: ["context", "check"] });
+    expect(takeToolFlags(["context", "--fbs-git=/x/git"])).toEqual({ git: null, gh: null, claude: null, session: null, argv: ["context", "--fbs-git=/x/git"] });
+    expect(takeToolFlags(["--fbs-git="])).toEqual({ git: null, gh: null, claude: null, session: null, argv: ["--fbs-git="] });
+    expect(takeToolFlags(["--fbs-gh=/a", "--fbs-gh=/b"])).toEqual({ git: null, gh: "/a", claude: null, session: null, argv: ["--fbs-gh=/b"] });
   });
 });
 

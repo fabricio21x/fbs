@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { REAL_AFK_DEPS } from "./afk";
 import type { GhResult, GhRunner } from "./github";
-import { afkRunsIn, campMarkerPath, freshToken, guardPrompt, guardToolUse, landRequestPath, landTokenPath, TOKEN_TTL_MS, writeLandToken } from "./guard";
+import { afkRunsIn, campMarkerPath, freshToken, guardPrompt, guardToolUse, landRequestPath, landTokenPath, REQUEST_TTL_MS, TOKEN_TTL_MS, writeLandToken } from "./guard";
 import { land, LandRefusedError, requestLand } from "./land";
 import { type PrDeps, run } from "./main";
 import { type OverCheck, readFeature } from "./status";
@@ -91,6 +91,7 @@ function fakeGh(s: Setup, view: PrView = {}, extra: { protection?: Partial<GhRes
   const gh: GhRunner = (args) => {
     calls.push(args);
     const line = args.join(" ");
+    if (args[0] === "api" && args[1] === "graphql") return ok(JSON.stringify({ data: { repository: { pullRequest: { stack: null } } } }));
     if (line.startsWith("pr view 7 --repo acme/app --json state,isDraft")) {
       return ok(
         JSON.stringify({
@@ -168,7 +169,7 @@ describe("land", () => {
     const run = (conclusion: string, startedAt: string, status = "COMPLETED") => ({ __typename: "CheckRun", name: "e2e", workflowName: "CI", status, conclusion, startedAt });
     const superseded = setup();
     const cancelledThenPassed = [run("CANCELLED", "2026-11-04T14:07:36Z"), run("SUCCESS", "2026-11-04T14:09:11Z")];
-    expect(land(superseded.work, "x", fakeGh(superseded, { statusCheckRollup: cancelledThenPassed }).gh, NOW, "2026-10-25").pr).toBe(7);
+    expect(land(superseded.work, "x", fakeGh(superseded, { statusCheckRollup: cancelledThenPassed }).gh, NOW, "2026-10-25")).toMatchObject({ pr: 7 });
     const regressed = setup();
     expect(refusals(regressed, "x", fakeGh(regressed, { statusCheckRollup: [run("FAILURE", "2026-11-04T14:09:11Z"), run("SUCCESS", "2026-11-04T14:07:36Z")] }).gh)).toEqual(["checks not passed: CI / e2e"]);
     const queued = setup();
@@ -177,7 +178,7 @@ describe("land", () => {
 
   test("a solo repo with no review requirement lands the user's own PR on their /fbs:land", () => {
     const s = setup();
-    expect(land(s.work, "x", fakeGh(s, { reviewDecision: "" }).gh, NOW, "2026-10-25").pr).toBe(7);
+    expect(land(s.work, "x", fakeGh(s, { reviewDecision: "" }).gh, NOW, "2026-10-25")).toMatchObject({ pr: 7 });
   });
 
   test.each([
@@ -195,8 +196,7 @@ describe("land", () => {
     ["required reviews", {}, { reviewDecision: "" }, { protection: { code: 0, stdout: "1\n" } }, "requires 1 approving review"],
     ["someone else's PR", {}, { reviewDecision: "", author: "ana" }, {}, "is by ana, not alex"],
     ["a stale stamp", { stampTree: "0".repeat(40) }, {}, {}, "is not the stamped tree"],
-    ["a re-stamp after /fbs:land", { tokenTree: "0".repeat(40) }, {}, {}, "stamped again after the user typed /fbs:land"],
-    ["no registered checks", {}, { statusCheckRollup: [] }, {}, "no checks registered on the head of PR #7"],
+    ["a re-stamp after /fbs:land", { tokenTree: "0".repeat(40) }, {}, {}, "stamped again after the user asked to land it"],
   ])("refuses %p", (_, options, view, extra, reason) => {
     const s = setup(options as { token?: boolean; stampTree?: string });
     const now = _ === "a stale token" ? NOW + TOKEN_TTL_MS : NOW;
@@ -211,7 +211,57 @@ describe("land", () => {
     expect(reasons.join("\n")).toContain(reason);
     expect(calls.some((c) => c[1] === "merge")).toBe(false);
     expect(existsSync(campMarkerPath(join(s.work, ".git"), "x"))).toBe(true);
-    expect(existsSync(landTokenPath(join(s.work, ".git"), "x"))).toBe(false);
+  });
+
+  test("a repo with no CI lands on the verify stamp alone when the base requires no check, and says so", () => {
+    const s = setup();
+    const { gh, calls } = fakeGh(s, { statusCheckRollup: [] });
+    expect(land(s.work, "x", gh, NOW, "2026-10-25")).toEqual({ pr: 7, mergeCommit: "f".repeat(40), checks: "none" });
+    expect(calls).toContainEqual(["pr", "merge", "7", "--repo", "acme/app", "--squash", "--subject", "feat(booking): sync the booking window (#7)", "--match-head-commit", s.head]);
+  });
+
+  test("no checks ran but the base requires some, or fbs can't read whether it does: refused", () => {
+    const required = setup();
+    const protection = { required_status_checks: { contexts: ["test"], checks: [] } };
+    expect(refusals(required, "x", fakeGh(required, { statusCheckRollup: [] }, { branchProtection: protection, rules: [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "e2e" }] } }] }).gh)).toEqual(["no checks ran on PR #7, and main requires test, e2e"]);
+    const unreadable = setup();
+    const { gh } = fakeGh(unreadable, { statusCheckRollup: [] });
+    const forbidden: GhRunner = (args, cwd) => (args.join(" ") === "api repos/acme/app/branches/main/protection" ? { code: 1, stdout: "", stderr: "gh: Resource not accessible (HTTP 403)" } : gh(args, cwd));
+    expect(refusals(unreadable, "x", forbidden)).toEqual(["no checks ran on PR #7, and fbs cannot read the branch protection of main, so it can't tell whether main requires any"]);
+  });
+
+  test("a free private repo, which can't have branch protection, counts as requiring no check", () => {
+    const s = setup();
+    const { gh } = fakeGh(s, { statusCheckRollup: [] });
+    const free: GhRunner = (args, cwd) => (args.join(" ") === "api repos/acme/app/branches/main/protection" ? { code: 1, stdout: "", stderr: "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)" } : gh(args, cwd));
+    expect(land(s.work, "x", free, NOW, "2026-10-25")).toMatchObject({ pr: 7, checks: "none" });
+  });
+
+  test("when GitHub can't say whether the PR is in a stack, land refuses rather than merge one PR out of it; a server without stacks lands as usual", () => {
+    const s = setup();
+    const { gh, calls } = fakeGh(s);
+    const flaky: GhRunner = (args, cwd) => (args[1] === "graphql" ? { code: 1, stdout: "", stderr: "gh: API rate limit exceeded (HTTP 403)" } : gh(args, cwd));
+    expect(() => land(s.work, "x", flaky, NOW, "2026-10-25")).toThrow("cannot read whether PR #7 is in a GitHub stack: gh: API rate limit exceeded (HTTP 403)");
+    expect(calls.some((c) => c[1] === "merge")).toBe(false);
+    const old = setup();
+    const ghes: GhRunner = (args, cwd) => (args[1] === "graphql" ? { code: 1, stdout: "", stderr: "gh: Field 'stack' doesn't exist on type 'PullRequest'" } : fakeGh(old).gh(args, cwd));
+    expect(land(old.work, "x", ghes, NOW, "2026-10-25")).toMatchObject({ pr: 7 });
+  });
+
+  test("a token the user's plain-words ask wrote lands only from the session they asked in", () => {
+    const s = setup({ token: false });
+    const common = join(s.work, ".git");
+    writeLandToken(common, { slug: "x", at: NOW - 60_000, tree: s.tree, session: "s1" });
+    let reasons: string[] = [];
+    try {
+      land(s.work, "x", fakeGh(s).gh, NOW, "2026-10-25", "s2");
+    } catch (e) {
+      if (!(e instanceof LandRefusedError)) throw e;
+      reasons = e.reasons;
+    }
+    expect(reasons).toEqual(["the user asked to land x in another Claude Code session; ask them again here"]);
+    writeLandToken(common, { slug: "x", at: NOW - 60_000, tree: s.tree, session: "s1" });
+    expect(land(s.work, "x", fakeGh(s).gh, NOW, "2026-10-25", "s1")).toMatchObject({ pr: 7 });
   });
 
   test("a refused merge, or a PR not merged afterwards, is refused", () => {
@@ -221,16 +271,49 @@ describe("land", () => {
     expect(refusals(t, "x", fakeGh(t, {}, { after: { state: "OPEN", mergeCommit: null } }).gh)).toEqual(["PR #7 is open after gh pr merge, not merged"]);
   });
 
-  test("the token is single-use: a second attempt after a refusal has none", () => {
+  test("a refusal keeps the user's go for the same verified tree, so their \"land it once CI passes\" carries; a merge uses it up", () => {
     const s = setup();
-    expect(refusals(s, "x", fakeGh(s, { isDraft: true }).gh)).toContain("PR #7 is a draft");
-    expect(refusals(s, "x", fakeGh(s).gh)).toEqual(["no fresh land token for x: the user types /fbs:land x"]);
+    expect(refusals(s, "x", fakeGh(s, { statusCheckRollup: [{ __typename: "CheckRun", name: "e2e", status: "IN_PROGRESS", conclusion: "" }] }).gh)).toEqual(["checks not passed: e2e"]);
+    expect(existsSync(landTokenPath(join(s.work, ".git"), "x"))).toBe(true);
+    expect(land(s.work, "x", fakeGh(s).gh, NOW, "2026-10-25")).toMatchObject({ pr: 7 });
+    expect(existsSync(landTokenPath(join(s.work, ".git"), "x"))).toBe(false);
+    const failed = setup();
+    expect(refusals(failed, "x", fakeGh(failed, {}, { merge: { code: 1, stderr: "Head branch was modified" } }).gh)).toEqual(["gh pr merge failed: Head branch was modified"]);
+    expect(refusals(failed, "x", fakeGh(failed).gh)).toEqual(["no fresh land token for x: the user asks you to land it (or types /fbs:land x)"]);
+  });
+
+  test("a merge state GitHub is still computing (UNKNOWN) is read again before it refuses", () => {
+    const s = setup();
+    const { gh } = fakeGh(s);
+    let views = 0;
+    const settling: GhRunner = (args, cwd) => {
+      const result = gh(args, cwd);
+      if (!args.join(" ").includes("--json state,isDraft")) return result;
+      views++;
+      return views < 3 ? { ...result, stdout: JSON.stringify({ ...JSON.parse(result.stdout), mergeStateStatus: "UNKNOWN" }) } : result;
+    };
+    const sleeps: number[] = [];
+    expect(land(s.work, "x", settling, NOW, "2026-10-25", null, (ms) => sleeps.push(ms))).toMatchObject({ pr: 7 });
+    expect(sleeps).toEqual([3000, 3000]);
+    const stuck = setup();
+    const always: GhRunner = (args, cwd) => {
+      const result = fakeGh(stuck).gh(args, cwd);
+      return args.join(" ").includes("--json state,isDraft") ? { ...result, stdout: JSON.stringify({ ...JSON.parse(result.stdout), mergeStateStatus: "UNKNOWN" }) } : result;
+    };
+    let reasons: string[] = [];
+    try {
+      land(stuck.work, "x", always, NOW, "2026-10-25", null, () => {});
+    } catch (e) {
+      if (!(e instanceof LandRefusedError)) throw e;
+      reasons = e.reasons;
+    }
+    expect(reasons).toEqual(["merge state is UNKNOWN, not CLEAN or HAS_HOOKS"]);
   });
 
   test("no token refuses without asking GitHub", () => {
     const s = setup({ token: false });
     const { gh, calls } = fakeGh(s);
-    expect(refusals(s, "x", gh)).toEqual(["no fresh land token for x: the user types /fbs:land x"]);
+    expect(refusals(s, "x", gh)).toEqual(["no fresh land token for x: the user asks you to land it (or types /fbs:land x)"]);
     expect(calls).toEqual([]);
   });
 });
@@ -247,7 +330,7 @@ describe("landing over failing checks the user confirmed", () => {
   ];
   const DEPLOY: OverCheck = { name: "deploy", state: "missing" };
   const requires = (...contexts: string[]) => ({ required_status_checks: { contexts, checks: contexts.map((context) => ({ context, app_id: null })) } });
-  const posts = (calls: string[][]) => calls.filter((c) => ["comment", "review"].includes(c[1]) || (c[0] === "api" && c.some((a) => a === "POST" || a.startsWith("-f") || a.startsWith("--field"))));
+  const posts = (calls: string[][]) => calls.filter((c) => ["comment", "review"].includes(c[1]) || (c[0] === "api" && c[1] !== "graphql" && c.some((a) => a === "POST" || a.startsWith("-f") || a.startsWith("--field"))));
   const mergeCall = (s: Setup, ...flags: string[]) => ["pr", "merge", "7", "--repo", "acme/app", "--squash", ...flags, "--subject", "feat(booking): sync the booking window (#7)", "--match-head-commit", s.head];
 
   test("ignores the confirmed failing checks, accepts UNSTABLE, records over and posts nothing", () => {
@@ -277,7 +360,7 @@ describe("landing over failing checks the user confirmed", () => {
   test("on BLOCKED merges with --admin for a repo admin when every required check passed or was confirmed, a missing one included", () => {
     const s = setup({ over: [...OVER, DEPLOY] });
     const { gh, calls } = fakeGh(s, { statusCheckRollup: RED, mergeStateStatus: "BLOCKED" }, { admin: "true", branchProtection: requires("test", "e2e", "deploy") });
-    expect(land(s.work, "x", gh, NOW, "2026-10-25").pr).toBe(7);
+    expect(land(s.work, "x", gh, NOW, "2026-10-25")).toMatchObject({ pr: 7 });
     expect(calls).toContainEqual(mergeCall(s, "--admin"));
     expect(posts(calls)).toEqual([]);
     expect(readFeature(s.work, "x").landed?.over).toEqual([...OVER, DEPLOY]);
@@ -333,7 +416,7 @@ describe("landing over failing checks the user confirmed", () => {
     ];
     const s = setup({ over: OVER });
     const { gh, calls } = fakeGh(s, { statusCheckRollup: RED, mergeStateStatus: "BLOCKED" }, { admin: "true", rules, branchProtection: { ...requires("test"), enforce_admins: { enabled: false }, required_linear_history: { enabled: true }, allow_force_pushes: { enabled: false }, allow_deletions: { enabled: false }, required_signatures: { enabled: false } } });
-    expect(land(s.work, "x", gh, NOW, "2026-10-25").pr).toBe(7);
+    expect(land(s.work, "x", gh, NOW, "2026-10-25")).toMatchObject({ pr: 7 });
     expect(calls).toContainEqual(mergeCall(s, "--admin"));
   });
 
@@ -364,7 +447,7 @@ describe("landing over failing checks the user confirmed", () => {
     expect(refusals(s, "x", gh)).toEqual(["merge state is BLOCKED, not CLEAN or HAS_HOOKS"]);
     expect(calls.some((c) => c[1] === "merge")).toBe(false);
     const t = setup({ over: [OVER[0]] });
-    expect(land(t.work, "x", fakeGh(t).gh, NOW, "2026-10-25").pr).toBe(7);
+    expect(land(t.work, "x", fakeGh(t).gh, NOW, "2026-10-25")).toMatchObject({ pr: 7 });
     expect(readFeature(t.work, "x").landed?.over).toBeUndefined();
   });
 });
@@ -403,7 +486,7 @@ describe("fbs land", () => {
     const s = setup();
     const r = cli(s.work, () => ({ code: 4, stdout: "", stderr: "gh auth login" }), "x");
     expect(r.code).toBe(2);
-    expect(r.err[0]).toContain("gh pr view failed");
+    expect(r.err[0]).toContain("cannot read whether PR #7 is in a GitHub stack");
     expect(cli(s.work, fakeGh(s).gh).code).toBe(2);
     expect(cli(s.work, fakeGh(s).gh, "x", "y").code).toBe(2);
     expect(cli(s.work, fakeGh(s).gh, "nope")).toEqual({ code: 1, out: ["error: missing: no feature nope"], err: [] });
@@ -412,7 +495,7 @@ describe("fbs land", () => {
 
 describe("fbs land request", () => {
   const io = (cwd: string, out: string[]) => ({ cwd, today: "2026-10-25", out: (l: string) => out.push(l), err: (l: string) => out.push(`err: ${l}`) });
-  const cli = (cwd: string, args: string[], stdin = "", session: string | null = null, gh: GhRunner = () => ({ code: 1, stdout: "", stderr: "no gh in this test" })) => {
+  const cli = (cwd: string, args: string[], stdin = "", session: string | null = null, gh: GhRunner = (args) => (args[1] === "graphql" ? { code: 0, stdout: JSON.stringify({ data: { repository: { pullRequest: { stack: null } } } }), stderr: "" } : { code: 1, stdout: "", stderr: "no gh in this test" })) => {
     const out: string[] = [];
     const deps = { gh, now: () => NOW, sleep: () => {}, stdin: () => stdin };
     const code = run(args, io(cwd, out), deps, { ...REAL_AFK_DEPS, sessionId: () => session });
@@ -430,16 +513,14 @@ describe("fbs land request", () => {
     expect(existsSync(landTokenPath(join(s.work, ".git"), "x"))).toBe(false);
   });
 
-  test("the user's bare land answer in the asking session turns it into the token fbs land takes", () => {
+  test("the user's yes in the asking session turns it into the token fbs land takes", () => {
     const s = setup({ token: false });
     expect(cli(s.work, ["land", "request", "x"], "", "s1").code).toBe(0);
     const reply = (prompt: string, session = "s1") => cli(s.work, ["guard", "--reply"], JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: session, cwd: s.work, prompt }));
-    expect(reply("yes")).toEqual({ code: 0, out: [] });
-    expect(reply("land it, after the copy fix")).toEqual({ code: 0, out: [] });
-    expect(reply("land", "s2")).toEqual({ code: 0, out: [] });
-    expect(reply("land #7")).toEqual({ code: 0, out: ["fbs: the user answered land for x (PR #7); its land token is written: run fbs land x"] });
-    expect(freshToken(join(s.work, ".git"), "x", NOW)).toEqual({ slug: "x", at: NOW, tree: s.tree });
-    expect(land(s.work, "x", fakeGh(s).gh, NOW, "2026-10-25")).toEqual({ pr: 7, mergeCommit: "f".repeat(40) });
+    expect(reply("yes", "s2")).toEqual({ code: 0, out: [] });
+    expect(reply("land #7")).toEqual({ code: 0, out: ["fbs: the user answered yes to landing x (PR #7); its land token is written: run fbs land x"] });
+    expect(freshToken(join(s.work, ".git"), "x", NOW)).toEqual({ slug: "x", at: NOW, tree: s.tree, session: "s1" });
+    expect(land(s.work, "x", fakeGh(s).gh, NOW, "2026-10-25", "s1")).toEqual({ pr: 7, mergeCommit: "f".repeat(40) });
     expect(reply("garbage")).toEqual({ code: 0, out: [] });
   });
 
@@ -467,9 +548,9 @@ describe("fbs land request", () => {
     expect(cli(s.work, ["land", "request", "x", "--over-failing"], "", "s1", gh)).toEqual({ code: 0, out: [JSON.stringify({ requested: true, slug: "x", pr: 7, over })] });
     expect(JSON.parse(readFileSync(landRequestPath(join(s.work, ".git")), "utf8"))).toEqual({ slug: "x", pr: 7, tree: s.tree, at: NOW, session: "s1", over });
     const r = cli(s.work, ["guard", "--reply"], JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "s1", cwd: s.work, prompt: "land" }));
-    expect(r.out).toEqual(["fbs: the user answered land for x (PR #7) over the failing checks CI / e2e (cancelled), unit (failed), CI / smoke (failed), ci/legacy (failed), visual (didn't run), a11y (didn't run); its land token is written: run fbs land x"]);
-    expect(freshToken(join(s.work, ".git"), "x", NOW)).toEqual({ slug: "x", at: NOW, tree: s.tree, over });
-    expect(calls.every((c) => (c[0] === "pr" && c[1] === "view") || (c[0] === "api" && c.length === 2))).toBe(true);
+    expect(r.out).toEqual(["fbs: the user answered yes to landing x (PR #7) over the failing checks CI / e2e (cancelled), unit (failed), CI / smoke (failed), ci/legacy (failed), visual (didn't run), a11y (didn't run); its land token is written: run fbs land x"]);
+    expect(freshToken(join(s.work, ".git"), "x", NOW)).toEqual({ slug: "x", at: NOW, tree: s.tree, session: "s1", over });
+    expect(calls.every((c) => (c[0] === "pr" && c[1] === "view") || (c[0] === "api" && (c.length === 2 || c[1] === "graphql")))).toBe(true);
   });
 
   test("a refresh of the waiting request may drop checks from its list but never add one", () => {
@@ -480,7 +561,7 @@ describe("fbs land request", () => {
     expect(request("e2e").code).toBe(0);
     const refused = request("e2e", "unit");
     expect(refused.code).toBe(1);
-    expect(refused.out).toEqual(["refused: a land request for x with fewer failing checks is waiting for the user's answer; let it be answered or expire in 10 min, then ask again"]);
+    expect(refused.out).toEqual(["refused: a land request for x with fewer failing checks is waiting for the user's answer; ask again after they reply"]);
     expect(JSON.parse(readFileSync(landRequestPath(join(s.work, ".git")), "utf8")).over).toEqual([{ name: "e2e", workflow: "CI", state: "failed" }]);
   });
 
@@ -629,6 +710,7 @@ describe("landing a stack", () => {
     const gh: GhRunner = (args) => {
       calls.push(args);
       const line = args.join(" ");
+      if (args[0] === "api" && args[1] === "graphql") return ok(JSON.stringify({ data: { repository: { pullRequest: { stack: null } } } }));
       const head = git(s.origin, "rev-parse", `refs/heads/${branch}`);
       if (line.startsWith(`pr view ${pr} --repo acme/app --json state,isDraft`)) {
         const facts = { state: "OPEN", isDraft: false, mergeStateStatus: "CLEAN", headRefOid: head, headRefName: branch, baseRefName: "main", title: `feat: ${slug}`, reviewDecision: "APPROVED" };
@@ -748,9 +830,9 @@ describe("landing a stack", () => {
     expect(bash("fbs stack sync f")).toEqual([]);
     expect(bash("git push --force origin feature/f-ui")).toEqual([expect.stringContaining("--force, -f or a + refspec")]);
 
+    // A refusal keeps the go for the same verified tree; only a merge uses it up.
     expect(refusals(s, "f", stackGh(s, "f-api", { isDraft: true }).gh)).toEqual(["PR #21 is a draft"]);
-    expect(bash("fbs land f-api")).toEqual([expect.stringContaining("needs a fresh land token")]);
-    expect(refusals(s, "f-api", stackGh(s, "f-api").gh)).toEqual(["no fresh land token for f-api: the user types /fbs:land f-api"]);
+    expect(bash("fbs land f-api")).toEqual([]);
   });
 
   const requestRefusals = (cwd: string, slug: string, now = NOW): string[] => {
@@ -773,10 +855,10 @@ describe("landing a stack", () => {
     const s = stack();
     requestLand(s.work, "f-api", NOW, "s1");
     const path = landRequestPath(s.common);
-    expect(requestRefusals(s.work, "f-ui", NOW + 60_000)).toContain("a land request for f-api (PR #21) is waiting for the user's answer; ask again after it is answered or expires in 9 min");
+    expect(requestRefusals(s.work, "f-ui", NOW + 60_000)).toContain("a land request for f-api (PR #21) is waiting for the user's answer; ask again after they reply");
     expect(JSON.parse(readFileSync(path, "utf8")).slug).toBe("f-api");
     expect(requestLand(s.work, "f", NOW + 60_000, "s1")).toMatchObject({ slug: "f-api", at: NOW + 60_000 });
-    expect(requestRefusals(s.work, "f-ui", NOW + 60_000 + 10 * 60_000)).not.toContain(expect.stringContaining("waiting for the user's answer"));
+    expect(requestRefusals(s.work, "f-ui", NOW + 60_000 + REQUEST_TTL_MS)).not.toContain(expect.stringContaining("waiting for the user's answer"));
   });
 
   test("a unit lands only bottom-up, and a feature with no open unit PR has nothing to land", () => {
@@ -785,7 +867,6 @@ describe("landing a stack", () => {
     const { gh, calls } = stackGh(s, "f-ui");
     expect(refusals(s, "f-ui", gh)).toEqual(["land bottom-up: unit 1 of f, f-api, lands before f-ui"]);
     expect(calls).toEqual([]);
-    expect(existsSync(landTokenPath(s.common, "f-ui"))).toBe(false);
     for (const slug of ["f-api", "f-ui"]) {
       const path = join(s.common, "fbs", "features", `${slug}.json`);
       writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), pr: null, repo: undefined }));
@@ -803,5 +884,84 @@ describe("landing a stack", () => {
     expect(land(s.work, "f", gh, NOW, "2026-10-25")).toEqual({ pr: 22, mergeCommit: squash(), slug: "f-ui", unit: 2, restack: null });
     for (const slug of ["f", "f-api", "f-ui"]) expect(existsSync(campMarkerPath(s.common, slug))).toBe(false);
     expect(git(s.origin, "rev-parse", "main^{tree}")).toBe(s.trees["f-ui"]);
+  });
+
+  describe("in a GitHub stack", () => {
+    type Entry = { pr: number; state: string };
+    /** A gh where both units' PRs are in GitHub stack #5 (or `entries`), answering the facts fbs checks for each. */
+    function nativeGh(s: Stack, options: { entries?: Entry[]; view?: Record<number, PrView>; base?: string } = {}) {
+      const calls: string[][] = [];
+      const ok = (stdout: string): GhResult => ({ code: 0, stdout, stderr: "" });
+      const entries = options.entries ?? [{ pr: 21, state: "OPEN" }, { pr: 22, state: "OPEN" }];
+      const gh: GhRunner = (args) => {
+        calls.push(args);
+        const line = args.join(" ");
+        if (args[0] === "api" && args[1] === "graphql") {
+          const nodes = entries.map((entry, i) => ({ position: i + 1, pullRequest: { number: entry.pr, state: entry.state } }));
+          return ok(JSON.stringify({ data: { repository: { pullRequest: { stack: { number: 5, baseRefName: options.base ?? "main", entries: { nodes } } } } } }));
+        }
+        for (const [slug, { pr, branch }] of Object.entries(UNITS)) {
+          if (!line.startsWith(`pr view ${pr} --repo acme/app --json state,isDraft`)) continue;
+          const head = git(s.origin, "rev-parse", `refs/heads/${branch}`);
+          const facts = { state: "OPEN", isDraft: false, mergeStateStatus: "CLEAN", headRefOid: head, headRefName: branch, baseRefName: pr === 21 ? "main" : "feature/f-api", title: `feat: ${slug}`, reviewDecision: "APPROVED" };
+          return ok(JSON.stringify({ ...facts, author: { login: "alex" }, statusCheckRollup: GREEN, ...options.view?.[pr] }));
+        }
+        if (line.startsWith("repo view acme/app")) return ok("main\n");
+        if (line === "api repos/acme/app/branches/main/protection") return { code: 1, stdout: "", stderr: "gh: Branch not protected (HTTP 404)" };
+        if (line === "api repos/acme/app/rules/branches/main") return ok("[]");
+        return { code: 1, stdout: "", stderr: `unexpected gh ${line}` };
+      };
+      return { gh, calls };
+    }
+    const BOTH_READY = { number: 5, prs: [{ pr: 21, slug: "f-api", ready: true }, { pr: 22, slug: "f-ui", ready: true }], upTo: 22, command: "gh stack merge 22 --squash" };
+    const PENDING = [{ __typename: "CheckRun", name: "e2e", status: "IN_PROGRESS", conclusion: "" }];
+
+    test("fbs merges nothing: it hands back GitHub's command for the whole stack, every PR checked as land would", () => {
+      const s = stack();
+      const { gh, calls } = nativeGh(s);
+      expect(land(s.work, "f", gh, NOW, "2026-10-25")).toEqual({ stack: BOTH_READY });
+      expect(calls.some((c) => (c[0] === "pr" && (c[1] === "merge" || c[1] === "edit")) || (c[0] === "stack" && c[1] === "merge"))).toBe(false);
+      expect(readFeature(s.work, "f-api").landed).toBeUndefined();
+      expect(git(s.origin, "rev-parse", "refs/heads/feature/f-ui")).toBe(git(s.work, "rev-parse", "refs/heads/feature/f-ui"));
+    });
+
+    test("a PR that isn't ready stops the command below it: still running, unverified, or not fbs's", () => {
+      const pending = stack();
+      expect(land(pending.work, "f", nativeGh(pending, { view: { 22: { statusCheckRollup: PENDING } } }).gh, NOW, "2026-10-25")).toEqual({
+        stack: { number: 5, prs: [{ pr: 21, slug: "f-api", ready: true }, { pr: 22, slug: "f-ui", ready: false, reasons: ["checks not passed: e2e"] }], upTo: 21, command: "gh stack merge 21 --squash" },
+      });
+      const stale = stack();
+      const path = join(stale.common, "fbs", "features", "f-ui.json");
+      writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), stamp: { tree: "0".repeat(40), at: "2026-10-25", verdict: "pass", criteria: 1, evidence: "v.md" } }));
+      const result = land(stale.work, "f", nativeGh(stale).gh, NOW, "2026-10-25") as { stack: { prs: { reasons?: string[] }[]; upTo: number } };
+      expect(result.stack.upTo).toBe(21);
+      expect(result.stack.prs[1].reasons).toEqual([`its head's tree ${stale.trees["f-ui"]} is not the stamped tree ${"0".repeat(40)}; verify f-ui again`]);
+      const foreign = stack();
+      const entries = [{ pr: 21, state: "OPEN" }, { pr: 22, state: "OPEN" }, { pr: 23, state: "OPEN" }];
+      expect(land(foreign.work, "f", nativeGh(foreign, { entries }).gh, NOW, "2026-10-25")).toEqual({ stack: { ...BOTH_READY, prs: [...BOTH_READY.prs, { pr: 23, slug: null, ready: false, reasons: ["it has no fbs record, so fbs hasn't verified it"] }] } });
+    });
+
+    test("a bottom PR that isn't ready, or a stack based off the default branch, is refused", () => {
+      const draft = stack();
+      expect(refusals(draft, "f", nativeGh(draft, { view: { 21: { isDraft: true } } }).gh)).toEqual(["PR #21: it's a draft"]);
+      const elsewhere = stack();
+      expect(refusals(elsewhere, "f", nativeGh(elsewhere, { base: "develop" }).gh)).toEqual(["GitHub stack #5 is based on develop, not the default branch main"]);
+    });
+
+    test("a stack with only this PR open lands it as any PR", () => {
+      const s = stack();
+      const { gh, calls } = nativeGh(s, { entries: [{ pr: 21, state: "OPEN" }, { pr: 22, state: "CLOSED" }] });
+      expect(refusals(s, "f", gh)).toEqual([`gh pr merge failed: unexpected gh pr merge 21 --repo acme/app --squash --subject feat: f-api (#21) --match-head-commit ${git(s.origin, "rev-parse", "refs/heads/feature/f-api")}`]);
+      expect(calls.some((c) => c[0] === "pr" && c[1] === "merge")).toBe(true);
+    });
+
+    test("a land request in a GitHub stack writes no request: there is nothing to answer, the user runs GitHub's command", () => {
+      const s = stack();
+      expect(requestLand(s.work, "f", NOW, "s1", nativeGh(s).gh)).toEqual({ stack: BOTH_READY });
+      expect(existsSync(landRequestPath(s.common))).toBe(false);
+      const out: string[] = [];
+      const code = run(["land", "request", "f"], { cwd: s.work, today: "2026-10-25", out: (l) => out.push(l), err: (l) => out.push(l) }, { gh: nativeGh(s).gh, now: () => NOW, sleep: () => {}, stdin: () => "" }, { ...REAL_AFK_DEPS, sessionId: () => "s1" });
+      expect([code, out]).toEqual([0, [JSON.stringify({ requested: false, stack: BOTH_READY })]]);
+    });
   });
 });

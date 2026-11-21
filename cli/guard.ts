@@ -2,11 +2,13 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameS
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { type Run, runConfig } from "./afk";
 import { commitOf, currentBranch, gitCommonDir, mergeBase, originDefaultBranch } from "./git";
-import { featureUnits, isUnit, nextToLand, type OverCheck, readFeature, readOverChecks, recordPath } from "./status";
+import { type FeatureRecord, featureUnits, isUnit, listFeatures, nextToLand, type OverCheck, readFeature, readOverChecks, recordPath } from "./status";
 
 const SLUG = /^[a-z0-9]+(-[a-z0-9]+)*$/;
-export const TOKEN_TTL_MS = 15 * 60 * 1000;
-export const REQUEST_TTL_MS = 10 * 60 * 1000;
+// A token binds the verified tree, so it outlives a wait for CI ("land it once it's green") but not a new stamp.
+export const TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
+// The user's next message answers or drops a request, so it can wait as long as they're away.
+export const REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function isSlug(slug: string): boolean {
   return SLUG.test(slug);
@@ -74,13 +76,15 @@ export function afkRunsIn(commonDir: string, statuses: Run["status"][]): Run[] {
   return runs;
 }
 
-/** Written when the user types /fbs:land or answers a land request, bound to the stamp the feature had then. */
+/** Written from the user's own message (asking to land, a yes to a land request, or /fbs:land), bound to the stamp the feature had then. */
 export interface LandToken {
   slug: string;
   at: number;
   tree: string;
-  /** The failing checks the user confirmed landing over, copied from the request they answered; never from /fbs:land. */
+  /** The failing checks the user confirmed landing over, copied from the request they answered; never from any other go. */
   over?: OverCheck[];
+  /** The session whose user gave the go; only `fbs land` run from that session takes it. */
+  session?: string;
 }
 
 export function writeLandToken(commonDir: string, token: LandToken): void {
@@ -91,13 +95,14 @@ export function writeLandToken(commonDir: string, token: LandToken): void {
   renameSync(temp, path);
 }
 
-/** The token for `slug` if it is well formed and was written in the last 15 minutes. */
+/** The token for `slug` if it is well formed and was written within TOKEN_TTL_MS. */
 export function freshToken(commonDir: string, slug: string, now: number): LandToken | null {
   try {
     const token = JSON.parse(readFileSync(landTokenPath(commonDir, slug), "utf8"));
     const fresh = token.slug === slug && Number.isInteger(token.at) && token.at <= now && now - token.at < TOKEN_TTL_MS && typeof token.tree === "string";
     const over = token.over === undefined ? undefined : readOverChecks(token.over);
-    return fresh && over !== null ? { slug, at: token.at, tree: token.tree, ...(over !== undefined && { over }) } : null;
+    const session = token.session === undefined ? undefined : typeof token.session === "string" && token.session !== "" ? token.session : null;
+    return fresh && over !== null && session !== null ? { slug, at: token.at, tree: token.tree, ...(over !== undefined && { over }), ...(session !== undefined && { session }) } : null;
   } catch {
     return null;
   }
@@ -113,14 +118,7 @@ export function landTokenSlug(cwd: string, slug: string): string {
   }
 }
 
-/** Read and delete the token: one land attempt per /fbs:land. */
-export function takeLandToken(commonDir: string, slug: string, now: number): LandToken | null {
-  const token = freshToken(commonDir, slug, now);
-  rmSync(landTokenPath(commonDir, slug), { force: true });
-  return token;
-}
-
-/** Written by `fbs land request`; the user's bare land answer turns it into the land token. */
+/** Written by `fbs land request`; the user's yes, as their next message in that session, turns it into the land token. */
 export interface LandRequest {
   slug: string;
   pr: number;
@@ -160,8 +158,8 @@ const WRITE_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 const COMMAND_TOOLS = ["Bash", "Monitor"];
 // Tools the model could use to make /fbs:land run, or a land answer arrive, as if the user typed it.
 const SCHEDULING_TOOLS = ["Skill", "CronCreate", "ScheduleWakeup", "RemoteTrigger", "Agent", "Monitor", "SendMessage"];
-const ONLY_USER = "only the user lands, with /fbs:land";
-const ASK_TO_LAND = "only the user lands: run fbs land request <slug> and ask them, or have them type /fbs:land <slug>";
+const ONLY_USER = "only the user lands: when they ask you to merge, run fbs land <slug>";
+const ASK_TO_LAND = "only the user lands: when they ask you to merge or land, their message writes a land token and you run fbs land <slug>; to ask them first, run fbs land request <slug>";
 const TYPED_ONLY = "/fbs:land runs only when the user types it: their message must start with /fbs:land (anything after the command is fine), or it arrives as plain text";
 
 /** Why the guard denies this tool call while a PR flow runs; empty to allow. */
@@ -175,10 +173,11 @@ export function denials(toolName: string, toolInput: Record<string, unknown>, cw
   }
   if (WRITE_TOOLS.includes(toolName) || MCP_FILE_WRITE.test(toolName)) {
     const paths = [toolInput.file_path, toolInput.notebook_path, toolInput.path, toolInput.source, toolInput.destination].filter((p): p is string => typeof p === "string");
-    if (paths.some((p) => resolve(cwd, p).toLowerCase().includes("/fbs/land/"))) reasons.push("the land token is written only when the user types /fbs:land");
+    if (paths.some((p) => resolve(cwd, p).toLowerCase().includes("/fbs/land/"))) reasons.push("the land token is written only from the user's own message");
   }
   if (SCHEDULING_TOOLS.includes(toolName) && JSON.stringify(toolInput).toLowerCase().includes("fbs:land")) reasons.push(TYPED_ONLY);
   if (SCHEDULING_TOOLS.includes(toolName) && stringsIn(toolInput).some(isScheduledReply)) reasons.push(`${toolName} would send a land answer as if the user typed it; only the user answers a land request`);
+  reasons.push(...promptSenderDenials(toolName, toolInput));
   if (COMMAND_TOOLS.includes(toolName) && typeof toolInput.command === "string") reasons.push(...commandDenials(toolInput.command, ctx));
   return [...new Set(reasons)];
 }
@@ -189,10 +188,28 @@ function stringsIn(value: unknown): string[] {
   return Object.values(value).flatMap(stringsIn);
 }
 
+// These come back later as an unframed prompt in a session, where a merge request or a yes would write a land token.
+const PROMPT_SENDERS = ["CronCreate", "ScheduleWakeup", "RemoteTrigger"];
+
+/** A scheduled prompt (or a /loop) that asks to land or says yes: denied in an fbs repo even before a PR opens, since it fires later. */
+export function promptSenderDenials(toolName: string, toolInput: Record<string, unknown>): string[] {
+  const loop = toolName === "Skill" && typeof toolInput.skill === "string" && /(^|:)loop$/.test(toolInput.skill);
+  if (!PROMPT_SENDERS.includes(toolName) && !loop) return [];
+  const asks = stringsIn(toolInput).some((text) => landIntent(stripLoop(text)) || landAnswer(stripLoop(text)) !== null);
+  return asks ? [`${toolName} would send a request to merge, or a yes, as if the user typed it; only the user asks to land`] : [];
+}
+
+/** The text after a /loop and an interval such as `5m`. */
+function stripLoop(text: string): string {
+  return text.trim().replace(/^\/?loop\s+/i, "").replace(/^\d+\s*[a-z]*\s+/i, "").trim();
+}
+
+// A bare land answer in any tool input; a short yes is checked only where it would come back as a prompt (promptSenderDenials).
+const STRICT_ANSWER = /^land(?: it| #\d+)?[.!]?$/i;
+
 /** A land answer, alone or after a /loop and an interval such as `5m`. */
 function isScheduledReply(text: string): boolean {
-  const body = text.trim().replace(/^\/?loop\s+/i, "").replace(/^\d+\s*[a-z]*\s+/i, "").trim();
-  return LAND_REPLY.test(text.trim()) || LAND_REPLY.test(body);
+  return STRICT_ANSWER.test(text.trim()) || STRICT_ANSWER.test(stripLoop(text));
 }
 
 function protectedOf(ctx: GuardContext): string[] {
@@ -224,12 +241,13 @@ export function commandDenials(command: string, ctx: GuardContext): string[] {
   if (/(^|[\s/])pulls\/[^/\s]+\/merge\b/.test(text)) reasons.add(`calls the PR merge endpoint; ${ASK_TO_LAND}`);
   if (/repos\/[^/\s]+\/[^/\s]+\/merges\b/.test(text)) reasons.add(`calls the branch merges endpoint; ${ASK_TO_LAND}`);
   if (/mergePullRequest|enablePullRequestAutoMerge/.test(text)) reasons.add(`calls a merge mutation; ${ASK_TO_LAND}`);
+  if (/(^|[\s/])stacks\/[^/\s]+\/merge\b/.test(text)) reasons.add("calls the stack merge endpoint; only the user merges a GitHub stack: give them the command fbs land printed");
   for (const match of text.matchAll(/git\/refs\/heads\/([^\s?]+)/g)) {
     if (protectedOf(ctx).includes(match[1]) && WRITE_METHOD.test(text)) reasons.add(`writes the default branch ref ${match[1]}; ${ONLY_USER}`);
   }
   if (folded.includes("fbs:land")) reasons.add(TYPED_ONLY);
   if (/fbs\/land(\/|\s|$)/.test(folded) || (folded.includes(".token") && (folded.includes("fbs") || folded.includes("land")))) {
-    reasons.add("touches the land tokens, which only the user's /fbs:land writes");
+    reasons.add("touches the land tokens, which only the user's own message writes");
   }
   const segments = text.split(SEGMENT_BREAK).map((segment) => segment.trim().split(/\s+/).filter((t) => t !== ""));
   const echoed = segments.some((tokens) => echoesReply(tokens));
@@ -247,7 +265,7 @@ function claudeSession(tokens: string[], echoed: boolean): string[] {
   if (at === -1) return [];
   const args = tokens.slice(at + 1);
   const words = args.filter((a) => !a.startsWith("-"));
-  const answers = echoed || words.some(isScheduledReply) || isScheduledReply(words.join(" "));
+  const answers = echoed || words.some(isScheduledReply) || isScheduledReply(words.join(" ")) || landIntent(words.join(" "));
   if (!args.some((a) => RESUME_FLAG.test(a)) && !answers) return [];
   return ["a claude run that resumes a session or carries a land answer could answer the land request as if the user typed it; only the user answers it"];
 }
@@ -257,7 +275,7 @@ function echoesReply(tokens: string[]): boolean {
   if (at === -1) return false;
   // The quotes and backslashes are stripped by now, so printf's `land\n` reads `landn`.
   const said = tokens.slice(at + 1).filter((a) => !a.startsWith("-")).join(" ").replace(/%s/g, "").trim();
-  return isScheduledReply(said) || isScheduledReply(said.replace(/n$/, ""));
+  return isScheduledReply(said) || isScheduledReply(said.replace(/n$/, "")) || landIntent(said);
 }
 
 function ghMerge(tokens: string[]): string[] {
@@ -265,7 +283,10 @@ function ghMerge(tokens: string[]): string[] {
   if (gh === -1) return [];
   const rest = tokens.slice(gh + 1);
   const pr = rest.indexOf("pr");
-  return pr !== -1 && rest.slice(pr + 1).includes("merge") ? [`gh pr merge merges a PR; ${ASK_TO_LAND}`] : [];
+  if (pr !== -1 && rest.slice(pr + 1).includes("merge")) return [`gh pr merge merges a PR; ${ASK_TO_LAND}`];
+  const stack = rest.indexOf("stack");
+  if (stack !== -1 && rest.slice(stack + 1).includes("merge")) return ["gh stack merge merges a GitHub stack; only the user merges it: give them the command fbs land printed"];
+  return [];
 }
 
 const GIT_OPTIONS_WITH_VALUE = ["-C", "-c", "--git-dir", "--work-tree", "--namespace"];
@@ -331,7 +352,7 @@ function fbsLand(tokens: string[], ctx: GuardContext): string[] {
   if (rest[0] !== "land" || (rest[1] === "request" && rest[2] !== undefined)) return [];
   const slug = rest[1];
   if (slug !== undefined && SLUG.test(slug) && ctx.hasFreshToken(slug)) return [];
-  return [`fbs land${slug === undefined ? "" : ` ${slug}`} needs a fresh land token, which the user creates by typing /fbs:land`];
+  return [`fbs land${slug === undefined ? "" : ` ${slug}`} needs a fresh land token, written when the user asks you to merge or land it (or answers your land request, or types /fbs:land)`];
 }
 
 // ---- While an afk run is running.
@@ -584,12 +605,15 @@ export function protectedBranches(cwd: string): string[] {
 }
 
 /** The real context for the repo whose common dir is `commonDir`. */
-export function repoContext(cwd: string, commonDir: string, now: number): GuardContext {
+export function repoContext(cwd: string, commonDir: string, now: number, session: string | null = null): GuardContext {
   return {
     protectedBranches: () => protectedBranches(cwd),
     currentBranch: () => currentBranch(cwd),
     openPrs: () => openPrRecords(commonDir),
-    hasFreshToken: (slug) => freshToken(commonDir, landTokenSlug(cwd, slug), now) !== null,
+    hasFreshToken: (slug) => {
+      const token = freshToken(commonDir, landTokenSlug(cwd, slug), now);
+      return token !== null && (token.session === undefined || token.session === session);
+    },
     isCommit: (ref) => commitOf(cwd, ref) !== null,
     isStepAbove: (dir, ref, kept) => {
       try {
@@ -642,18 +666,19 @@ export function guardToolUse(raw: string, fallbackCwd: string, now: number): Gua
   try {
     runs = afkGuardRuns(cwd, commonDir, typeof input?.session_id === "string" ? input.session_id : null);
   } catch {}
-  if (camps.length === 0 && prs.length === 0 && runs.length === 0) return { deny: [] };
+  const session = typeof input?.session_id === "string" && input.session_id !== "" ? input.session_id : null;
+  const toolName = typeof input?.tool_name === "string" ? input.tool_name : "";
+  const toolInput = typeof input?.tool_input === "object" && input.tool_input !== null ? (input.tool_input as Record<string, unknown>) : {};
+  if (camps.length === 0 && prs.length === 0 && runs.length === 0) return { deny: existsSync(join(commonDir, "fbs", "features")) ? promptSenderDenials(toolName, toolInput) : [] };
   // A PR flow (a camp, or any open fbs PR, camp or not) holds its rules for every call in the repo; an afk run only for its own calls.
   const campRules = camps.length > 0 || prs.length > 0 || runs.some((run) => run.ownsCall);
-  const ctx = repoContext(cwd, commonDir, now);
+  const ctx = repoContext(cwd, commonDir, now, session);
   if (input === null) {
     const text = raw.replace(/[{}[\]":,]/g, " ");
     const deny = [...(campRules ? commandDenials(text, ctx) : []), ...afkCommandDenials(text, cwd, commonDir, runs, ctx)];
     if (campRules && /mcp__\S*__merge_pull_request/.test(raw)) deny.push(`a merge_pull_request MCP tool merges a PR; ${ASK_TO_LAND}`);
     return { deny };
   }
-  const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
-  const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? (input.tool_input as Record<string, unknown>) : {};
   return { deny: [...new Set([...(campRules ? denials(toolName, toolInput, cwd, ctx) : []), ...afkDenials(toolName, toolInput, cwd, commonDir, runs, ctx)])] };
 }
 
@@ -680,48 +705,146 @@ export function guardPrompt(raw: string, fallbackCwd: string, now: number): stri
     if (target === slug && featureUnits(cwd, slug).length > 0) return `no land token: no unit of ${slug} has an open PR`;
     const tree = readFeature(cwd, target).stamp?.tree;
     if (tree === undefined) return `no land token: ${target} has no verify stamp`;
-    writeLandToken(commonDir, { slug: target, at: now, tree });
+    const session = typeof input.session_id === "string" && input.session_id !== "" ? input.session_id : undefined;
+    writeLandToken(commonDir, { slug: target, at: now, tree, ...(session !== undefined && { session }) });
     return `land token written for ${target}${target === slug ? "" : `, the next unit of ${slug} to land`}`;
   } catch {
     return null;
   }
 }
 
-/**
- * The whole reply, nothing else: a subagent report or another session's message always carries more text. Not "yes":
- * a pending request plus a yes to an unrelated question would land the PR.
- */
-const LAND_REPLY = /^land(?: it| #(\d+))?[.!]?$/i;
+// A short yes to the land question the agent asked last and alone: no other word, so "no", a condition or a new ask never counts.
+const ANSWER_WORDS = new Set(["yes", "yep", "yeah", "y", "ok", "okay", "sure", "go", "ahead", "do", "it", "please", "lgtm", "ship", "land", "merge", "and", "now", "the", "pr", "this", "that", "anyway", "for"]);
+
+const YES_WORDS = new Set(["yes", "yep", "yeah", "y", "ok", "okay", "sure", "go", "do", "lgtm", "ship", "land", "merge"]);
+
+/** A whole prompt that answers a land request yes, with the PR number it names, if any; null when it isn't one. */
+export function landAnswer(prompt: string): { pr: number | null } | null {
+  const words = normalized(prompt).toLowerCase().split(/[\s,.!]+/).filter((w) => w !== "");
+  if (words.length === 0 || words.length > 8) return null;
+  let pr: number | null = null;
+  for (const word of words) {
+    const named = /^#(\d+)$/.exec(word);
+    if (named !== null && pr === null) pr = Number(named[1]);
+    else if (!ANSWER_WORDS.has(word)) return null;
+  }
+  return words.some((word) => YES_WORDS.has(word)) ? { pr } : null;
+}
+
+const NEGATION = /\b(?:don'?t|dont|do not|not yet|not now|never|hold off|hold on|shouldn'?t|won'?t|can'?t|cannot|no need)\b/i;
+
+/** The prompt as the checks read it: curly apostrophes made straight, and Claude Code's image and paste placeholders removed. */
+function normalized(prompt: string): string {
+  return prompt.replace(/[\u2018\u2019]/g, "'").replace(/\[(?:Image|Pasted text)[^\]]*\]/gi, " ").trim();
+}
+const MERGE_OBJECT = String.raw`(?:it|this|that|them|these|those|both|all|everything|now|away|please|the\s+(?:pr|prs|pull\s+requests?|(?:whole\s+)?stack|feature|unit)|prs?\b|#\d+)`;
+const INTENT = [/\bland\b/i, new RegExp(String.raw`\b(?:squash[- ]?)?merge(?=\s*(?:$|[.,!?;:)]|${MERGE_OBJECT}))`, "i"), /\bship\s+it\b/i];
+// A plain-words request is a short chat message; a pasted document, a log or a report that mentions landing isn't one.
+const INTENT_MAX_LENGTH = 400;
 
 /**
- * The UserPromptSubmit step: while a land request is pending, the user's bare answer (`land`, `land it`, `land #<pr>`)
- * in the session that asked writes the land token, bound to the record's current stamp tree, and takes the request.
- * An expired or stale request (stamped again, PR changed, landed, no session) is dropped. Returns a note for the model
- * when the prompt was a land answer; never throws.
+ * Whether a prompt may ask to land a PR ("go ahead and merge it", "land #12", "ship it"): it only says the user's own words
+ * mention it; the agent judges whether they ask for it now. "merge main into it" and a negation never count.
+ */
+export function landIntent(prompt: string): boolean {
+  const text = normalized(prompt);
+  if (text === "" || text.length > INTENT_MAX_LENGTH || text.startsWith("/") || NEGATION.test(text)) return false;
+  return INTENT.some((pattern) => pattern.test(text));
+}
+
+/** A subagent report, a notification or another session's message, which arrive as prompts but never from the user. */
+function isFramed(prompt: string): boolean {
+  return /^\s*[<[]/.test(prompt) || prompt.includes("<task-notification");
+}
+
+function skillPath(): string {
+  const root = process.env.CLAUDE_PLUGIN_ROOT;
+  return root === undefined || root === "" ? "the land skill (skills/land/SKILL.md in the fbs plugin)" : join(root, "skills", "land", "SKILL.md");
+}
+
+/** PR numbers a prompt names: `#12`, `PR 12`, `pr #12`. */
+function namedPrs(prompt: string): number[] {
+  return [...prompt.matchAll(/(?:#|\bpr\s*#?)(\d+)\b/gi)].map((m) => Number(m[1]));
+}
+
+/** Remove this session's land tokens: the user moved on, so a go they gave earlier no longer stands. */
+function dropSessionTokens(commonDir: string, session: string): void {
+  const dir = join(commonDir, "fbs", "land");
+  if (!existsSync(dir)) return;
+  for (const name of readdirSync(dir).filter((n) => n.endsWith(".token"))) {
+    try {
+      if (JSON.parse(readFileSync(join(dir, name), "utf8"))?.session === session) rmSync(join(dir, name), { force: true });
+    } catch {}
+  }
+}
+
+/**
+ * The UserPromptSubmit step on the user's own prompt (framed reports, notifications and messages are skipped). A pending
+ * land request in the asking session is answered by a short yes or an ask to land that names no other PR, which writes
+ * its token (with any confirmed checks); any other prompt there drops it. Otherwise a prompt that may ask to land ("go
+ * ahead and merge it") writes the token for the PR it names, else the one open PR flow's, and tells the agent to judge
+ * whether the user asks for it now. Every token is bound to the session and lasts until the user's next prompt that
+ * doesn't ask to land (watcher wakes are framed, so a go given for "once CI is green" carries). Never throws.
  */
 export function guardReply(raw: string, fallbackCwd: string, now: number): string | null {
   try {
     const input = parseObject(raw);
     if (input?.hook_event_name !== "UserPromptSubmit" || typeof input.prompt !== "string") return null;
+    const prompt = normalized(input.prompt);
+    const session = typeof input.session_id === "string" && input.session_id !== "" ? input.session_id : null;
+    if (isFramed(prompt)) return null;
     const cwd = hookCwd(input, fallbackCwd);
     const commonDir = gitCommonDir(cwd);
     const path = landRequestPath(commonDir);
-    if (!existsSync(path)) return null;
-    const answer = LAND_REPLY.exec(input.prompt.trim());
-    const request = liveRequest(cwd, path, now);
-    if (request === null) {
-      rmSync(path, { force: true });
-      return answer !== null ? "the land request had expired or gone stale, so no land token was written; run fbs land request <slug> and ask again" : null;
+    const intent = landIntent(prompt);
+    const answer = landAnswer(prompt);
+    if (existsSync(path)) {
+      const request = liveRequest(cwd, path, now);
+      if (request === null) {
+        rmSync(path, { force: true });
+        if (answer !== null && !intent) return "the land request had expired or gone stale, so no land token was written; run fbs land request <slug> and ask again";
+      } else if (session === request.session) {
+        rmSync(path, { force: true });
+        const other = namedPrs(prompt).find((pr) => pr !== request.pr);
+        if (other !== undefined && answer !== null && !intent) return `the user named PR #${other}, but the land request was for PR #${request.pr} (${request.slug}); no land token was written`;
+        if (other === undefined && (answer !== null || intent)) {
+          writeLandToken(commonDir, { slug: request.slug, at: now, tree: request.tree, session, ...(request.over !== undefined && { over: request.over }) });
+          const over = request.over === undefined ? "" : ` over the failing checks ${request.over.map(describeOver).join(", ")}`;
+          return `the user answered yes to landing ${request.slug} (PR #${request.pr})${over}; its land token is written: run fbs land ${request.slug}`;
+        }
+      }
     }
-    if (answer === null || input.session_id !== request.session) return null;
-    if (answer[1] !== undefined && Number(answer[1]) !== request.pr) return `the user named PR #${answer[1]}, but the pending land request is for PR #${request.pr} (${request.slug}); no land token was written`;
-    rmSync(path, { force: true });
-    writeLandToken(commonDir, { slug: request.slug, at: now, tree: request.tree, ...(request.over !== undefined && { over: request.over }) });
-    const over = request.over === undefined ? "" : ` over the failing checks ${request.over.map(describeOver).join(", ")}`;
-    return `the user answered land for ${request.slug} (PR #${request.pr})${over}; its land token is written: run fbs land ${request.slug}`;
+    if (session === null) return null;
+    // A typed /fbs:land writes its own token in the expansion hook, which may run before this one.
+    if (!intent) {
+      if (!/^\/(?:fbs:)?land\b/.test(prompt)) dropSessionTokens(commonDir, session);
+      return null;
+    }
+    return landFromPrompt(cwd, commonDir, prompt, session, now);
   } catch {
     return null;
   }
+}
+
+/** Write the land token for the open fbs PR a plain-words request names, or say why none was written. */
+function landFromPrompt(cwd: string, commonDir: string, prompt: string, session: string, now: number): string | null {
+  const open = listFeatures(cwd, () => {}).filter((rec) => rec.pr !== null && rec.landed === undefined);
+  if (open.length === 0) return null;
+  const numbers = namedPrs(prompt);
+  const named = (rec: FeatureRecord) => [rec.slug, ...(isUnit(rec) ? [rec.unitOf] : [])].some((slug) => new RegExp(`(?<![\\w-])${slug}(?![\\w-])`, "i").test(prompt));
+  const byNumber = open.filter((rec) => numbers.includes(rec.pr as number));
+  if (numbers.length > 0 && byNumber.length === 0) return `the user's message names PR #${numbers.join(", #")}, which isn't an open fbs PR; no land token was written`;
+  const candidates = byNumber.length > 0 ? byNumber : open.some(named) ? open.filter(named) : open;
+  const features = [...new Set(candidates.map((rec) => (isUnit(rec) ? rec.unitOf : rec.slug)))];
+  const list = candidates.map((rec) => `${rec.slug} (PR #${rec.pr})`).join(", ");
+  if (features.length > 1) return `the user's message may ask to land a PR, but several fbs PRs are open (${list}), so no land token was written. If they're asking to land one, ask which, then run fbs land request <slug>: their yes lands it`;
+  // A PR named by number lands that unit; a feature named or implied lands its lowest open unit.
+  const target = byNumber.length === 1 ? byNumber[0].slug : landTokenSlug(cwd, features[0]);
+  const rec = readFeature(cwd, target);
+  if (rec.pr === null || rec.landed !== undefined) return `the user's message may ask to land ${features[0]}, but ${target} has no open PR; no land token was written`;
+  if (rec.stamp === undefined) return `the user's message may ask to land ${target} (PR #${rec.pr}), but it has no verify stamp, so no land token was written: it needs verify first`;
+  writeLandToken(commonDir, { slug: target, at: now, tree: rec.stamp.tree, session });
+  return `the user's message may ask to land ${target} (PR #${rec.pr}); a land token for it is written, for this session until their next message that doesn't ask to land. If they are asking you to merge or land it now, follow ${skillPath()}: run fbs land ${target}. If not (a question, a condition, a later time, another PR), don't land: answer them`;
 }
 
 /** One confirmed check as the user reads it: `CI / e2e (cancelled)`, `deploy (didn't run)`. */

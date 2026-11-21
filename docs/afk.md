@@ -108,7 +108,7 @@ When every check is met:
 3. **Report.** Each check's baseline and final value, iterations kept and discarded, the judge cost, and an attention list: flags, heuristic notes, preflight warnings, criteria that passed narrowly, and what only a human can check by eye.
 4. **Verify, open-pr, camp-pr** run as usual. Verify takes the approved goal as the outcome, so it doesn't ask again. If a review fix changes the code, verify re-runs `fbs afk final` for fresh evidence.
 
-The run never merges. You land it with `/fbs:land` like any other PR.
+The run never merges. You land it like any other PR: tell the agent to merge it, or type `/fbs:land`.
 
 ## Stops
 

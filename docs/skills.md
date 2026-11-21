@@ -29,7 +29,7 @@ fbs has three kinds of skills and a set of agents.
 | [`/fbs:organize-commits`](#organize-commits) | Folds fix rounds into one commit per task; makes every subject conventional | a rewritten feature branch | nothing |
 | [`/fbs:open-pr`](#open-pr) | Opens a draft PR for a verified feature | the PR | nothing |
 | [`/fbs:camp-pr`](#camp-pr) | Works the PR round by round until it is ready to land | commits, replies | security, data or billing findings, scope changes |
-| [`/fbs:land`](#land) | The only merge, typed by you | the merge | nothing |
+| [`/fbs:land`](#land) | The only merge, on your go | the merge | nothing |
 | [`/fbs:afk`](#afk) | Autopilot for a task whose finish line is a set of checks | a reviewed, verified PR | one approval at the start |
 
 ## Building blocks
@@ -150,7 +150,9 @@ Stays with the PR until it is ready to land. `fbs watch-pr` runs in the backgrou
 
 ### land
 
-The only merge. You type `/fbs:land <slug>`, or answer the agent's land request with a bare `land`; a hook turns that into a one-time token. `fbs land` then refuses unless the PR is approved (on your own solo repo, your go is the approval), green, clean, based on the default branch and carrying exactly the stamped tree. It squash-merges with the head pinned, then restacks what was stacked on it. You can land over failing or cancelled checks only by asking for it; the request lists every such check for you to confirm.
+The only merge. You tell the agent to merge or land the PR in plain words ("go ahead and merge it"), answer its land question with a yes, or type `/fbs:land <slug>`; a hook turns your message into a one-time token, and the agent judges whether your words ask to land now. `fbs land` then refuses unless the PR is approved (on your own solo repo, your go is the approval), green, clean, based on the default branch and carrying exactly the stamped tree. A PR with no checks at all lands when the base branch requires none: a repo without CI lands on the local verify. It squash-merges with the head pinned, then restacks what was stacked on it. You can land over failing or cancelled checks only by asking for it; the agent lists every such check for you to confirm.
+
+A PR in a GitHub stack with other open PRs isn't merged by fbs: it checks every PR in the stack as it would before landing, and hands you `gh stack merge <pr> --squash` for the highest PR with only ready PRs below it (or the merge button on that PR), since GitHub merges the stack in one step and restacks what's left. Once you've merged it, `fbs stack sync` records each PR as landed.
 
 ### afk
 

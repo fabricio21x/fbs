@@ -113,14 +113,21 @@ function restackBranch(cwd: string, gh: GhRunner, rec: FeatureRecord, move: Move
 
   const retarget = move.retarget !== null && rec.pr !== null && rec.repo !== undefined && rec.landed === undefined;
   const edit = retarget ? gh(["pr", "edit", String(rec.pr), "--repo", rec.repo as string, "--base", move.retarget as string], cwd) : null;
-  if (edit !== null && edit.code !== 0) {
+  const failed = edit !== null && edit.code !== 0 && !alreadyBasedOn(cwd, gh, rec, move.retarget as string);
+  if (edit !== null && failed) {
     problems.unshift({ kind: "retarget-failed", reason: `pushed ${name}, but gh pr edit could not retarget PR #${rec.pr} to ${move.retarget}: ${edit.stderr.trim().split("\n")[0] ?? ""}` });
   } else {
     // The parent waits for the retarget: until it is recorded, the next sync takes this path again and retries it.
     updateFeature(cwd, rec.slug, (current) => (current.branch?.name === name ? { ...current, branch: { ...current.branch, parent: move.parent } } : current));
   }
   const stop = problems.length === 0 ? undefined : { kind: problems[0].kind, reason: problems.map((p) => p.reason).join("; ") };
-  return { rebased, retargeted: retarget && edit?.code === 0, ...(stop && { stop }) };
+  return { rebased, retargeted: retarget && !failed, ...(stop && { stop }) };
+}
+
+/** GitHub retargets a PR in a GitHub stack itself and refuses gh pr edit on it; what counts is that its base is right. */
+function alreadyBasedOn(cwd: string, gh: GhRunner, rec: FeatureRecord, base: string): boolean {
+  const view = gh(["pr", "view", String(rec.pr), "--repo", rec.repo as string, "--json", "baseRefName", "--jq", ".baseRefName"], cwd);
+  return view.code === 0 && view.stdout.trim() === base;
 }
 
 /** Run `body` in a temporary worktree detached at `commit`, then remove it. */
@@ -147,10 +154,11 @@ function restackFromOrigin(cwd: string, gh: GhRunner, rec: FeatureRecord, defaul
   try {
     if (!fetchOriginBranch(cwd, defaultBranch)) return fail({ kind: "gone", reason: `origin has no branch ${defaultBranch}` });
     const remote = fetchOriginBranch(cwd, name) ? commitOf(cwd, `refs/remotes/origin/${name}`) : null;
-    const local = commitOf(cwd, `refs/heads/${name}`);
+    let local = commitOf(cwd, `refs/heads/${name}`);
     if (remote === null && (rec.pr !== null || rec.branch.pushed !== undefined)) return fail({ kind: "gone", reason: `origin has no branch ${name}` });
     if (remote !== null && local !== null && !isAncestor(cwd, remote, local) && !isAncestor(cwd, local, remote)) {
-      return fail({ kind: "diverged", reason: `diverged: ${name} and origin/${name} each have commits the other lacks; merge origin/${name} into it by hand, then sync again` });
+      if (!adoptOriginRewrite(cwd, name, local, remote, rec.branch.pushed)) return fail({ kind: "diverged", reason: `diverged: ${name} and origin/${name} each have commits the other lacks; merge origin/${name} into it by hand, then sync again` });
+      local = remote;
     }
     const tip = remote !== null && (local === null || !isAncestor(cwd, remote, local)) ? remote : local;
     if (tip === null) return fail({ kind: "gone", reason: `branch ${name} is gone: not here and not on origin` });
@@ -306,9 +314,10 @@ function noticeLanding(cwd: string, gh: GhRunner, rec: FeatureRecord, main: stri
   }
   if (view.state === "CLOSED") return note("closed", `PR #${pr} was closed without merging; ${slug} is left as it was`);
   if (view.state !== "MERGED") return null;
-  if (view.baseRefName !== main) return note("merged-elsewhere", `PR #${pr} was merged into ${String(view.baseRefName)}, not ${main}; ${slug} is left as it was`);
   const head = view.headRefOid;
   const commit = view.mergeCommit?.oid;
+  // A GitHub stack merged whole squashes each PR onto main while the upper ones still name the branch below as their base.
+  if (view.baseRefName !== main && !(typeof commit === "string" && onOriginMain(cwd, commit, main))) return note("merged-elsewhere", `PR #${pr} was merged into ${String(view.baseRefName)}, not ${main}; ${slug} is left as it was`);
   if (typeof head !== "string" || typeof commit !== "string") return note("gh-failed", `gh pr view answered without the head or merge commit of PR #${pr}; nothing was recorded`);
 
   const dropped = rec.branch === undefined ? 0 : droppedCommits(cwd, rec.branch, head, main);
@@ -320,6 +329,23 @@ function noticeLanding(cwd: string, gh: GhRunner, rec: FeatureRecord, main: stri
   const landed = note("landed", `PR #${pr} was merged outside fbs land; recorded ${slug} as landed at ${commit}${warning}`);
   const stacked = plainFeaturesOn(cwd, rec).map((feature) => restackAbove(cwd, gh, feature, main, { head, squash: commit }));
   return stacked.length === 0 ? landed : { ...landed, stacked };
+}
+
+function onOriginMain(cwd: string, commit: string, main: string): boolean {
+  return fetchOriginBranch(cwd, main) && commitOf(cwd, commit) !== null && isAncestor(cwd, commit, `refs/remotes/origin/${main}`);
+}
+
+/**
+ * Take origin's rewrite of `name` when nothing here is newer than fbs's last push of it: GitHub restacks the rest of a
+ * GitHub stack onto the default branch after a merge below. False, leaving it, when there is local work or a dirty checkout.
+ */
+function adoptOriginRewrite(cwd: string, name: string, local: string, remote: string, pushed: string | undefined): boolean {
+  if (pushed === undefined || local !== pushed) return false;
+  const checkout = worktreeOf(cwd, name);
+  if (checkout === null) updateRef(cwd, `refs/heads/${name}`, remote, local);
+  else if (!isWorkTreeClean(checkout)) return false;
+  else resetHard(checkout, remote);
+  return true;
 }
 
 /**
@@ -368,7 +394,11 @@ function syncUnit(cwd: string, gh: GhRunner, unit: UnitRecord, below: FeatureRec
 
   if (remote !== null && local !== remote) {
     if (local !== null && !isAncestor(cwd, local, remote)) {
-      if (!isAncestor(cwd, remote, local)) return stop("diverged", `diverged: ${name} and origin/${name} each have commits the other lacks; merge origin/${name} into it by hand`);
+      if (!isAncestor(cwd, remote, local)) {
+        if (!adoptOriginRewrite(cwd, name, local, remote, unit.branch?.pushed)) return stop("diverged", `diverged: ${name} and origin/${name} each have commits the other lacks; merge origin/${name} into it by hand`);
+        local = remote;
+        result.fastForwarded = true;
+      }
     } else {
       if (local === null) updateRef(cwd, ref, remote, "");
       else if (checkout === null) updateRef(cwd, ref, remote, local);

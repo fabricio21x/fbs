@@ -13,10 +13,16 @@ open_pr() {
   done
   return 1
 }
+scheduled_ask() {
+  printf '%s' "$input" | grep -qE '"tool_name"[[:space:]]*:[[:space:]]*"(CronCreate|ScheduleWakeup|RemoteTrigger|Skill)"' &&
+    ls "$common"/fbs/features/*.json >/dev/null 2>&1 && printf '%s' "$input" | grep -qiwE 'land|merge|ship|yes|yep|yeah|y|ok|okay|sure|go|lgtm'
+}
 case "$1" in
   --prompt) ;;
-  --reply) [ -f "$common/fbs/land/request.json" ] || exit 0 ;;
-  *) ls "$common"/fbs/pr/*.camp >/dev/null 2>&1 || open_pr || afk_run || exit 0 ;;
+  # A prompt starts Bun only to answer or drop a land request or token, or when it may ask to land while an fbs PR is open.
+  --reply) [ -f "$common/fbs/land/request.json" ] || ls "$common"/fbs/land/*.token >/dev/null 2>&1 || { printf '%s' "$input" | grep -qiwE 'land|merge|ship' && open_pr; } || exit 0 ;;
+  # A scheduled prompt that asks to land is checked in any fbs repo, since it fires later, when a PR may be open.
+  *) ls "$common"/fbs/pr/*.camp >/dev/null 2>&1 || open_pr || afk_run || scheduled_ask || exit 0 ;;
 esac
 dir="$(dirname "$0")"
 printf '%s' "$input" | "$dir/fbs" guard "$@"

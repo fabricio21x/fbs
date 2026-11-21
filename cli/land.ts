@@ -1,10 +1,10 @@
 import { rmSync } from "node:fs";
 import { markLanded } from "./afk";
-import { campMarkerPath, isSlug, type LandRequest, landTokenSlug, pendingLandRequest, REQUEST_TTL_MS, takeLandToken, writeLandRequest } from "./guard";
+import { campMarkerPath, freshToken, isSlug, type LandRequest, landTokenPath, landTokenSlug, pendingLandRequest, writeLandRequest } from "./guard";
 import { commitTree, fetchBranch, gitCommonDir } from "./git";
 import { GhError, type GhRunner } from "./github";
 import { plainFeaturesOn, type Restack, restackAbove, restackUnits } from "./stack";
-import { type FeatureRecord, type OverCheck, featurePr, featureUnits, isUnit, nextToLand, readFeature, StatusError, type UnitRecord, updateFeature } from "./status";
+import { type FeatureRecord, type OverCheck, featurePr, featureUnits, isUnit, listFeatures, nextToLand, readFeature, StatusError, type UnitRecord, updateFeature } from "./status";
 
 export class LandRefusedError extends Error {
   readonly reasons: string[];
@@ -42,6 +42,7 @@ const sameCheck = (a: { name: string; workflow?: string }, b: { name: string; wo
 const label = (check: Check) => (check.workflow === undefined ? check.name : `${check.workflow} / ${check.name}`);
 
 const MERGEABLE_STATES = ["CLEAN", "HAS_HOOKS"];
+const UNKNOWN_REREADS = 5;
 const PASSING = ["SUCCESS", "NEUTRAL", "SKIPPED"];
 const FAILED_STATUSES = ["FAILURE", "ERROR"];
 
@@ -146,8 +147,10 @@ function readProtection(gh: GhRunner, cwd: string, repo: string, base: string, r
       const off = value === null || (typeof value === "object" && (value as { enabled?: unknown }).enabled === false);
       if (!off && !CLASSIC_UNDERSTOOD.includes(key)) problems.push(`${base}'s branch protection has ${key} on, which fbs doesn't merge past with --admin`);
     }
-  } else if (!classic.stderr.includes("Branch not protected")) {
-    throw new GhError(`cannot read the branch protection of ${base}`);
+  } else {
+    // A free private repo can't have classic protection at all, so GitHub answers 403 "Upgrade to GitHub Pro".
+    const unprotected = classic.stderr.includes("Branch not protected") || classic.stderr.includes("Upgrade to GitHub Pro");
+    if (!unprotected) throw new GhError(`cannot read the branch protection of ${base}`);
   }
   let ruleset: unknown;
   try {
@@ -180,28 +183,141 @@ function ghLine(gh: GhRunner, cwd: string, args: string[]): string | null {
  * PR stacked on it). `stacked`, present when there are any, is what restacking each other branch did: the units further
  * up the stack, each onto the one below, then the plain features stacked on the landed branch.
  */
-export type LandResult = ({ pr: number; mergeCommit: string } | { pr: number; mergeCommit: string; slug: string; unit: number; restack: Restack | null }) & { stacked?: Restack[] };
+export type LandResult = (({ pr: number; mergeCommit: string } | { pr: number; mergeCommit: string; slug: string; unit: number; restack: Restack | null }) & { stacked?: Restack[]; checks?: "none" }) | { stack: StackLanding };
+
+/** One open PR of a GitHub stack, lowest first: whether fbs would land it (`reasons` when not), and its record's slug if fbs has one. */
+export interface StackPr {
+  pr: number;
+  slug: string | null;
+  ready: boolean;
+  reasons?: string[];
+}
+
+/**
+ * A PR in a GitHub stack with other open PRs isn't merged by fbs: GitHub merges the stack in one step and restacks what
+ * is left, so the user runs `command`, which merges every PR up to `upTo`, the highest ready one with only ready PRs below.
+ */
+export interface StackLanding {
+  number: number;
+  prs: StackPr[];
+  upTo: number;
+  command: string;
+}
+
+/** A GitHub stack as its GraphQL `stack` field reads: its number, base, and every PR in it with its position. */
+interface NativeStack {
+  number: number;
+  baseRefName: string;
+  entries: { position: number; pr: number; state: string }[];
+}
+
+const STACK_QUERY = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){stack{number baseRefName entries(first:100){nodes{position pullRequest{number state}}}}}}}";
+
+/**
+ * The GitHub stack `pr` belongs to; null when it belongs to none, or the server has no stacks (an older GitHub Enterprise).
+ * Any other failure throws: guessing "no stack" would merge one PR out of a stack.
+ */
+export function readNativeStack(gh: GhRunner, cwd: string, repo: string, pr: number): NativeStack | null {
+  const [owner, name] = repo.split("/");
+  const result = gh(["api", "graphql", "-f", `query=${STACK_QUERY}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-F", `number=${pr}`], cwd);
+  if (result.code !== 0) {
+    if (/Field '(?:stack|entries)' doesn't exist|undefinedField/.test(result.stderr + result.stdout)) return null;
+    throw new GhError(`cannot read whether PR #${pr} is in a GitHub stack: ${result.stderr.trim().split("\n")[0] ?? ""}`);
+  }
+  try {
+    const stack = JSON.parse(result.stdout)?.data?.repository?.pullRequest?.stack;
+    if (typeof stack?.number !== "number" || typeof stack.baseRefName !== "string" || !Array.isArray(stack.entries?.nodes)) return null;
+    const entries = (stack.entries.nodes as { position?: unknown; pullRequest?: { number?: unknown; state?: unknown } | null }[])
+      .filter((node) => typeof node?.position === "number" && typeof node.pullRequest?.number === "number")
+      .map((node) => ({ position: node.position as number, pr: node.pullRequest?.number as number, state: String(node.pullRequest?.state) }))
+      .sort((a, b) => a.position - b.position);
+    return { number: stack.number, baseRefName: stack.baseRefName, entries };
+  } catch {
+    return null;
+  }
+}
+
+/** The stack `pr` is in when it holds another open PR, the only case where landing it alone would split the stack. */
+function openStack(gh: GhRunner, cwd: string, repo: string, pr: number): NativeStack | null {
+  const stack = readNativeStack(gh, cwd, repo, pr);
+  return stack !== null && stack.entries.filter((entry) => entry.state === "OPEN").length > 1 ? stack : null;
+}
+
+/** What fbs would check before merging each open PR of the stack, bottom-up; refuses when the bottom one isn't ready. */
+function stackLanding(cwd: string, gh: GhRunner, repo: string, stack: NativeStack): StackLanding {
+  const defaultBranch = ghLine(gh, cwd, ["repo", "view", repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"]);
+  if (defaultBranch === null) throw new GhError(`cannot read the default branch of ${repo}`);
+  if (stack.baseRefName !== defaultBranch) throw new LandRefusedError([`GitHub stack #${stack.number} is based on ${stack.baseRefName}, not the default branch ${defaultBranch}`]);
+  const records = listFeatures(cwd, () => {}).filter((rec) => rec.pr !== null && rec.repo === repo && rec.landed === undefined);
+  const prs: StackPr[] = stack.entries
+    .filter((entry) => entry.state === "OPEN")
+    .map(({ pr }) => {
+      const rec = records.find((candidate) => candidate.pr === pr);
+      if (rec === undefined) return { pr, slug: null, ready: false, reasons: ["it has no fbs record, so fbs hasn't verified it"] };
+      // Every PR of a stack merges into its base, so each must meet the base's rules, not the branch below's.
+      const facts = { ...readLandFacts(gh, cwd, repo, pr), baseRefName: defaultBranch };
+      const reasons: string[] = [];
+      if (facts.isDraft) reasons.push("it's a draft");
+      const notPassed = facts.checks.filter((c) => c.state !== "passed").map(label);
+      if (notPassed.length > 0) reasons.push(`checks not passed: ${notPassed.join(", ")}`);
+      if (facts.checks.length === 0) {
+        const none = noChecksProblem(gh, cwd, repo, pr, facts, []);
+        if (none !== null) reasons.push(none);
+      }
+      fetchBranch(cwd, facts.headRefName);
+      const headTree = commitTree(cwd, facts.headRefOid);
+      if (headTree !== rec.stamp?.tree) reasons.push(`its head's tree ${headTree ?? "(missing)"} is not the stamped tree ${rec.stamp?.tree ?? "(none)"}; verify ${rec.slug} again`);
+      const approval = approvalProblem(gh, cwd, repo, pr, facts);
+      if (approval !== null) reasons.push(approval);
+      return reasons.length === 0 ? { pr, slug: rec.slug, ready: true } : { pr, slug: rec.slug, ready: false, reasons };
+    });
+  const firstNotReady = prs.findIndex((p) => !p.ready);
+  if (firstNotReady === 0) throw new LandRefusedError((prs[0].reasons ?? []).map((reason) => `PR #${prs[0].pr}: ${reason}`));
+  const upTo = prs[firstNotReady === -1 ? prs.length - 1 : firstNotReady - 1].pr;
+  return { number: stack.number, prs, upTo, command: `gh stack merge ${upTo} --squash` };
+}
+
+/** Why a PR with no checks at all can't land: the base requires some that never ran (and the user didn't confirm), or fbs can't tell. */
+function noChecksProblem(gh: GhRunner, cwd: string, repo: string, pr: number, facts: LandFacts, over: OverCheck[]): string | null {
+  let required: string[];
+  try {
+    required = readProtection(gh, cwd, repo, facts.baseRefName, facts.reviewDecision).required;
+  } catch (e) {
+    if (!(e instanceof GhError)) throw e;
+    return `no checks ran on PR #${pr}, and fbs ${e.message}, so it can't tell whether ${facts.baseRefName} requires any`;
+  }
+  const unconfirmed = required.filter((name) => !over.some((o) => o.state === "missing" && o.name === name));
+  return unconfirmed.length === 0 ? null : `no checks ran on PR #${pr}, and ${facts.baseRefName} requires ${unconfirmed.join(", ")}`;
+}
 
 /**
  * Land the feature's PR if everything holds; throws LandRefusedError with every reason otherwise. A feature with units
  * lands its next unit, and a unit lands only when it is the next: bottom-up.
  */
-export function land(cwd: string, typed: string, gh: GhRunner, now: number, today: string): LandResult {
+export function land(cwd: string, typed: string, gh: GhRunner, now: number, today: string, session: string | null = null, sleep: (ms: number) => void = () => {}): LandResult {
   if (!isSlug(typed)) throw new StatusError("bad-slug", `${JSON.stringify(typed)} must be lowercase words joined by single hyphens`);
   const commonDir = gitCommonDir(cwd);
   const slug = landTokenSlug(cwd, typed);
-  // Taken before anything else, so each /fbs:land allows one attempt, refused or not.
-  const token = takeLandToken(commonDir, slug, now);
+  // Used up only by a merge attempt: a refusal (a check still running) keeps the user's go for this verified tree.
+  const token = freshToken(commonDir, slug, now);
   const { rec, problems } = localProblems(cwd, typed, slug);
-  const local = token === null ? [`no fresh land token for ${slug}: the user types /fbs:land ${typed}`, ...problems] : problems;
-  if (token !== null && rec.stamp && token.tree !== rec.stamp.tree) local.push(`${slug} was stamped again after the user typed /fbs:land; the user types it again`);
+  const local = token === null ? [`no fresh land token for ${slug}: the user asks you to land it (or types /fbs:land ${typed})`, ...problems] : problems;
+  if (token !== null && rec.stamp && token.tree !== rec.stamp.tree) local.push(`${slug} was stamped again after the user asked to land it; ask them again`);
+  if (token?.session !== undefined && token.session !== session) local.push(`the user asked to land ${slug} in another Claude Code session; ask them again here`);
   if (local.length > 0) throw new LandRefusedError(local);
   const { pr, repo } = featurePr(cwd, slug);
+  const stack = openStack(gh, cwd, repo, pr);
+  if (stack !== null) return { stack: stackLanding(cwd, gh, repo, stack) };
   const stampTree = rec.stamp?.tree;
   const above = isUnit(rec) ? unitsOn(cwd, rec) : [];
   const stackedOn = plainFeaturesOn(cwd, rec);
 
-  const facts = readLandFacts(gh, cwd, repo, pr);
+  let facts = readLandFacts(gh, cwd, repo, pr);
+  // GitHub computes mergeability lazily, so UNKNOWN right after a push or a merge into the base usually settles in seconds.
+  for (let reread = 0; reread < UNKNOWN_REREADS && facts.mergeStateStatus === "UNKNOWN"; reread++) {
+    sleep(3000);
+    facts = readLandFacts(gh, cwd, repo, pr);
+  }
   const reasons: string[] = [];
   if (facts.state !== "OPEN") reasons.push(`PR #${pr} is ${facts.state.toLowerCase()}`);
   if (facts.isDraft) reasons.push(`PR #${pr} is a draft`);
@@ -214,7 +330,12 @@ export function land(cwd: string, typed: string, gh: GhRunner, now: number, toda
   const notPassed = facts.checks.filter((c) => c.state === "pending" || (isRed(c) && over.length === 0)).map(label);
   if (notPassed.length > 0) reasons.push(`checks not passed: ${notPassed.join(", ")}`);
   if (over.length > 0) for (const check of red.filter((c) => !covered(c))) reasons.push(`${label(check)} ${check.state === "cancelled" ? "was cancelled" : "failed"} and isn't in the list the user confirmed; request again`);
-  if (facts.checks.length === 0) reasons.push(`no checks registered on the head of PR #${pr}`);
+  // A repo with no CI, the base requiring no check, lands on the verify stamp alone: the head is the tree verify passed.
+  const noChecks = facts.checks.length === 0;
+  if (noChecks) {
+    const none = noChecksProblem(gh, cwd, repo, pr, facts, over);
+    if (none !== null) reasons.push(none);
+  }
   const mergeable = applied.length > 0 ? [...MERGEABLE_STATES, "UNSTABLE", "BLOCKED"] : MERGEABLE_STATES;
   if (!mergeable.includes(facts.mergeStateStatus)) {
     reasons.push(`merge state is ${facts.mergeStateStatus}, not ${applied.length > 0 ? "CLEAN, HAS_HOOKS, or UNSTABLE or BLOCKED over the confirmed checks" : "CLEAN or HAS_HOOKS"}`);
@@ -237,6 +358,7 @@ export function land(cwd: string, typed: string, gh: GhRunner, now: number, toda
 
   // Without --subject, GitHub names a one-commit PR's squash after that commit instead of the PR title.
   const subject = `${facts.title} (#${pr})`;
+  rmSync(landTokenPath(commonDir, slug), { force: true });
   const merge = gh(["pr", "merge", String(pr), "--repo", repo, "--squash", ...(admin ? ["--admin"] : []), "--subject", subject, "--match-head-commit", facts.headRefOid], cwd);
   if (merge.code !== 0) throw new LandRefusedError([`gh pr merge failed: ${merge.stderr.trim().split("\n")[0] ?? ""}`]);
   const after = ghJson(gh, cwd, ["pr", "view", String(pr), "--repo", repo, "--json", "state,mergeCommit"]) as { state?: unknown; mergeCommit?: { oid?: unknown } | null };
@@ -252,7 +374,7 @@ export function land(cwd: string, typed: string, gh: GhRunner, now: number, toda
   const landed = { head: facts.headRefOid, squash: commit };
   const [restack = null, ...further] = restackUnits(cwd, gh, above, defaultBranch, landed);
   const stacked = [...further, ...stackedOn.map((feature) => restackAbove(cwd, gh, feature, defaultBranch, landed))];
-  const extra = stacked.length > 0 ? { stacked } : {};
+  const extra = { ...(stacked.length > 0 && { stacked }), ...(noChecks && { checks: "none" as const }) };
   if (!isUnit(rec)) return { pr, mergeCommit: commit, ...extra };
   try {
     if (featureUnits(cwd, rec.unitOf).every((unit) => unit.landed !== undefined)) rmSync(campMarkerPath(commonDir, rec.unitOf), { force: true });
@@ -276,26 +398,29 @@ function localProblems(cwd: string, typed: string, slug: string): { rec: Feature
 }
 
 /**
- * Ask for a land: write the pending request the user's bare land answer turns into the land token (guardReply). A feature with
+ * Ask for a land: write the pending request the user's yes turns into the land token (guardReply). A feature with
  * units requests its next unit. The model may write a request but never a token; the token binds the stamp the record
  * has when the user answers. With `overFailing`, the request also names the PR's checks that completed without passing,
  * which the user confirms with their answer; it refuses while any check still runs.
  */
-export function requestLand(cwd: string, typed: string, now: number, session: string | null, overFailing?: GhRunner): LandRequest {
+export function requestLand(cwd: string, typed: string, now: number, session: string | null, gh?: GhRunner, overFailing = false): LandRequest | { stack: StackLanding } {
   if (!isSlug(typed)) throw new StatusError("bad-slug", `${JSON.stringify(typed)} must be lowercase words joined by single hyphens`);
   const slug = landTokenSlug(cwd, typed);
   const { rec, problems } = localProblems(cwd, typed, slug);
   if (!isUnit(rec) && rec.landed !== undefined) problems.push(`${slug} has landed already`);
-  if (session === null || session === "") problems.push(`no Claude Code session ($CLAUDE_CODE_SESSION_ID is empty), so no answer can be matched to the request: the user types /fbs:land ${typed}`);
+  if (session === null || session === "") problems.push(`no Claude Code session ($CLAUDE_CODE_SESSION_ID is empty), so no answer can be matched to the request: the user asks you to land it, or types /fbs:land ${typed}`);
   // A request for another feature still waiting would be answered by an answer meant for it.
   const pending = pendingLandRequest(cwd, now);
-  if (pending !== null && pending.slug !== slug) problems.push(`a land request for ${pending.slug} (PR #${pending.pr}) is waiting for the user's answer; ask again after it is answered or expires in ${Math.ceil((pending.at + REQUEST_TTL_MS - now) / 60_000)} min`);
+  if (pending !== null && pending.slug !== slug) problems.push(`a land request for ${pending.slug} (PR #${pending.pr}) is waiting for the user's answer; ask again after they reply`);
   if (problems.length > 0 || rec.pr === null || !rec.stamp || session === null) throw new LandRefusedError(problems);
-  const over = overFailing === undefined ? [] : redChecks(cwd, slug, overFailing);
+  // Nothing to answer in a GitHub stack: the user merges it with GitHub's command, which needs no land token.
+  const stack = gh === undefined || rec.repo === undefined ? null : openStack(gh, cwd, rec.repo, rec.pr);
+  if (stack !== null && gh !== undefined && rec.repo !== undefined) return { stack: stackLanding(cwd, gh, rec.repo, stack) };
+  const over = overFailing && gh !== undefined ? redChecks(cwd, slug, gh) : [];
   // The user may be reading the list already; a refresh may drop checks from it, never add one they weren't asked about.
   const key = (o: OverCheck) => `${o.name}\0${o.workflow ?? ""}\0${o.state}`;
   if (pending !== null && pending.slug === slug && over.some((o) => !(pending.over ?? []).some((p) => key(p) === key(o)))) {
-    throw new LandRefusedError([`a land request for ${slug} with fewer failing checks is waiting for the user's answer; let it be answered or expire in ${Math.ceil((pending.at + REQUEST_TTL_MS - now) / 60_000)} min, then ask again`]);
+    throw new LandRefusedError([`a land request for ${slug} with fewer failing checks is waiting for the user's answer; ask again after they reply`]);
   }
   const request = { slug, pr: rec.pr, tree: rec.stamp.tree, at: now, session, ...(over.length > 0 && { over }) };
   writeLandRequest(gitCommonDir(cwd), request);
