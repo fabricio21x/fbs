@@ -96,7 +96,7 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 | `afk preflight [--force]` | Whether merges and default-branch pushes are denied in your settings, and whether the branch is protected |
 | `afk start <slug> --spec <file> [--session <id>] [--restart]` | Records a run from its JSON spec and measures the baseline; binds it to the session |
 | `afk check <slug>` | Runs afk-guard and every check on HEAD; prints `kept`, `discarded` (and resets), `held` or `stopped` |
-| `afk show <slug>` | The run and a summary |
+| `afk show <slug>` | The run and a summary, or `none` when the slug has no run |
 | `afk resume <slug>` | Logs the resume and rebinds the run to this session |
 | `afk stop <slug> --reason <text>` | Stops the run |
 | `afk final <slug>` | Measures a met run's final tree on both votes and writes the evidence verify reads |

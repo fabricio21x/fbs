@@ -26,7 +26,7 @@ Run every `fbs` command as its own Bash call, with nothing chained, piped or red
 
 From the record and the feature's folder (`dir`, read under `docsRoot`, which `fbs status show` prints with `docs`), in this order, the first that applies is the starting point:
 
-1. **A running or met afk run with no PR yet:** `fbs afk show <slug>` prints a run whose `status` is `running` or `met`, and the record has no `pr`: afk, which resumes it. A stopped run falls through to the rules below.
+1. **A running or met afk run with no PR yet:** `fbs afk show <slug>` prints a run whose `status` is `running` or `met`, and the record has no `pr`: afk, which resumes it. A stopped run, or `none` (the feature never had one), falls through to the rules below.
 2. **The input asks for a change**, or `changes.md` has an `open` entry: load `fbs:changes` with the Skill tool and follow it. The stage it hands back to is the starting point.
 3. **Spec not approved** (Big), or not gated (Mid): plan.
 4. **Big design not approved, or Mid spec gated but not approved:** architect. Also architect when the project has a tracker (`fbs tracker show` names one) and `<dir>/tracker.md` is missing or not `created` or `Skipped`: the tracker structure exists before any implementation.

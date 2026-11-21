@@ -23,7 +23,7 @@ Run every `fbs` command as its own Bash call, with nothing chained, piped or red
 
 ## 1. Resume or new
 
-When the input's first word could be a slug, run `fbs afk show <it>`. On `error: missing`, the whole input is a new task: go to section 2. Otherwise the rest of the input is the user's message to that run, and the JSON has `run` and `summary`; by `run.status`:
+When the input's first word could be a slug, run `fbs afk show <it>`. When it prints `none` (no run by that slug), the whole input is a new task: go to section 2. Otherwise the rest of the input is the user's message to that run, and the JSON has `run` and `summary`; by `run.status`:
 
 - **running:** run `fbs afk resume <slug>`. It logs the pickup and binds the run to this session. When the run it prints is `stopped`, go to section 9. Otherwise, when the tree isn't on `run.branch`, run `fbs branch <slug> --existing`. Then settle an interrupted step:
   - HEAD is a committed step that was never checked (neither `run.kept.sha` nor `run.lastChecked`): run the check first (section 8, step 3).

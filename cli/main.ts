@@ -225,7 +225,7 @@ const USAGE = [
   "                            nothing changes, check the same HEAD again) or stopped; stop rules: met, max-iterations,",
   "                            discards-in-row, protected-changed, guard-flag, judge-error (3 held in a row), state-changed",
   "  afk stop <slug> --reason <text>",
-  "  afk show <slug>",
+  "  afk show <slug>           print the run and a summary, or none when the slug has no afk run",
   "  afk resume <slug>         log a new pickup of a running run and rebind it to $CLAUDE_CODE_SESSION_ID; prints the run",
   "  afk final <slug>          measure a met run's HEAD after the final review: afk-guard and every check, both votes;",
   "                            records it and writes verify's evidence index; prints one JSON line",
@@ -845,9 +845,11 @@ function runAfk(args: string[], io: Io, deps: PrDeps, afkDeps: AfkDeps): number 
       case "stop":
         io.out(JSON.stringify(stopRun(io.cwd, slug, parsed.values["--reason"], deps.now())));
         return 0;
-      case "show":
-        io.out(JSON.stringify(showRun(io.cwd, slug)));
+      case "show": {
+        const shown = showRun(io.cwd, slug);
+        io.out(shown === null ? "none" : JSON.stringify(shown));
         return 0;
+      }
       case "resume":
         io.out(JSON.stringify(resumeRun(io.cwd, slug, deps.now(), afkDeps.sessionId())));
         return 0;

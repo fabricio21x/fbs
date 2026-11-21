@@ -39,7 +39,7 @@ fbs has three kinds of skills and a set of agents.
 | `changes` | The change path after approval: record the change verbatim in `changes.md`, size it (build, design or scope), amend the spec or design in place, approve inline, add plan tasks, carry on | every stage that can meet feedback, and assemble |
 | `grilling` | Rounds of up to four questions, each with one recommended answer, in the question UI when available. Looks code facts up instead of asking, asks business facts directly and never takes them from code, pushes back once | plan, architect, changes |
 | `impact-map` | Everything a change touches (code paths and consumers, APIs, data, jobs, external services, UI, permissions, tests, docs), each with `path:line`: four explorers by lens, then a completeness pass | architect |
-| `tracker` | The project's issue tracker: detects it and confirms it once, reads a ticket the work starts from, proposes the structure after an approval and creates it on your go-ahead. Adapters for Linear and GitHub Issues | plan, architect, tdd, the tiny route |
+| `tracker` | The project's issue tracker: detects it and confirms it once, reads a ticket the work starts from, proposes the structure after an approval and creates it on your go-ahead, assigned to you; after an approved change, updates the issues it moves with what changed and why. Adapters for Linear and GitHub Issues | plan, architect, tdd, the tiny route, changes |
 
 ## Principles
 

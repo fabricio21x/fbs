@@ -32,7 +32,7 @@ Restate the bug in one line each: what happens, what should happen, how to trigg
 
 1. If `git status --porcelain` isn't empty, show what's dirty and ask once (the question UI when available): commit it, ignore it locally (add it to `.git/info/exclude`, which changes nothing in the repo), or set it aside with `git stash -u` until this stage ends. Do what the user chooses and go on; never discard their changes.
 2. Find the project's test command in `CLAUDE.md`, the `package.json` scripts or the equivalent. If you can't find one, ask once.
-3. Run the whole suite before changing anything and keep its summary line. Failures that exist now are not yours: list them, and don't fix them here.
+3. Run the whole suite before changing anything, in the foreground with a Bash `timeout` (per workspace or package when the root command hangs), and keep its summary line. Failures that exist now are not yours: list them, and don't fix them here.
 
 ## 3. Reproduce
 

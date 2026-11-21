@@ -19,5 +19,8 @@
 ## Cleanup
 <!-- How to stop everything Launch started, and any test data to remove. Close the browser pages you opened and kill what you started, nothing else. -->
 
+## Permissions
+<!-- The allow rules validation needs, as proposed to the user: the Bash patterns and the exact browser tool names; or None. -->
+
 ## Helpers
 <!-- Scripts under .fbs/validation/ (seeding, resetting, signing in), each with one line on what it does; or None. -->

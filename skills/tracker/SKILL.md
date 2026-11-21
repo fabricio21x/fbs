@@ -1,6 +1,6 @@
 ---
 name: tracker
-description: "The project's issue tracker in fbs's flow: find which tracker a repo uses and confirm it once, read a ticket the work starts from, and after an approval propose the tracker structure (a parent issue with a sub-issue per work unit), create it on the user's go-ahead and record the ids. Use from plan, architect, tdd and the tiny route; never on its own initiative."
+description: "The project's issue tracker in fbs's flow: find which tracker a repo uses and confirm it once, read a ticket the work starts from, and after an approval propose the tracker structure (a parent issue with a sub-issue per work unit), create it on the user's go-ahead and record the ids, assigned to the user; after an approved change, update the issues it moves with what changed and why. Use from plan, architect, tdd, the tiny route and changes; never on its own initiative."
 user-invocable: false
 ---
 
@@ -8,7 +8,7 @@ user-invocable: false
 
 Plan with the tracker, not around it. When a project tracks work in Linear or GitHub Issues, the structure a feature needs exists there before any code: one issue per work unit, so each PR has its ticket and its branch carries the ticket's id. Nothing is created in the tracker without the user's go-ahead.
 
-Input from the calling stage: the operation (setting, read, propose and create), the feature slug and its `dir`. `fbs status show <slug>` prints `docsRoot`, where `tracker.md` is written, and `docs`: commit it only when that is `tracked`.
+Input from the calling stage: the operation (setting, read, propose and create, update after a change), the feature slug and its `dir`. `fbs status show <slug>` prints `docsRoot`, where `tracker.md` is written, and `docs`: commit it only when that is `tracked`.
 
 Run every `fbs` command as its own Bash call, with nothing chained, piped or redirected.
 
@@ -38,9 +38,9 @@ After the approval the calling stage names (Big: the design; Mid: its single app
 - **Mid:** one issue for the feature (or the ticket it came from).
 - **Tiny and bug:** the ticket the work came from, or one issue.
 
-**Each issue** says, in a few lines: the context (why this unit exists, one or two sentences from the spec), the acceptance criteria it covers (quoted short, as `AC<i>`), what it ships and what it leaves to other units, and the link to the design (or spec) pinned to the pushed commit that holds it (`https://github.com/<owner>/<repo>/blob/<sha>/<path>`; just the path without a GitHub remote; none when `docs` is `local`, since the document isn't pushed), so it survives a branch rename and the squash when it lands. A unit's implementation tasks never become issues: they live in its plan. A finding or change during the build stays in the unit that owns the code, or becomes a follow-up unit when that's decided, and then gets its own sub-issue on the user's go-ahead.
+**Each issue** says, in a few lines: the context (why this unit exists, one or two sentences from the spec), the acceptance criteria it covers (quoted short, as `AC<i>`), what it ships and what it leaves to other units, and the link to the design (or spec) pinned to the pushed commit that holds it (`https://github.com/<owner>/<repo>/blob/<sha>/<path>`; just the path without a GitHub remote; none when `docs` is `local`, since the document isn't pushed), so it survives a branch rename and the squash when it lands. Every issue is assigned to the user (the adapter says how). A unit's implementation tasks never become issues: they live in its plan. A finding or change during the build stays in the unit that owns the code, or becomes a follow-up unit when that's decided, and then gets its own sub-issue on the user's go-ahead.
 
-**Propose.** Read `${CLAUDE_SKILL_DIR}/tracker-template.md` (if unexpanded: `<plugin root>/skills/tracker/tracker-template.md`) and write `<dir>/tracker.md` from it: every item to create, with its title, its body and its relations. Ids go in this file, never in `spec.md` or `design.md`: their approvals are bound to their exact content. Show the structure in the chat (titles, which unit each is, relations) and ask for the go-ahead with the question UI: create it, change it, or skip the tracker for this feature. Only an explicit go-ahead counts. On a change, rewrite `tracker.md` and ask again; on skip, write `Skipped by the user (<YYYY-MM-DD>)` under its status and go on.
+**Propose.** Read `${CLAUDE_SKILL_DIR}/tracker-template.md` (if unexpanded: `<plugin root>/skills/tracker/tracker-template.md`) and write `<dir>/tracker.md` from it: every item to create, with its title, its body and its relations. Ids go in this file, never in `spec.md` or `design.md`: their approvals are bound to their exact content. Show the structure in the chat (titles, which unit each is, relations) and ask for the go-ahead with the question UI (`fbs:grilling`'s rules): create it, change it, or skip the tracker for this feature. Only an explicit go-ahead counts. On a change, rewrite `tracker.md` and ask again; on skip, write `Skipped by the user (<YYYY-MM-DD>)` under its status and go on.
 
 **Create**, in this order, with the adapter: the parent (or project), then the sub-issues, then the relations once both ends exist.
 - Before each item, check it doesn't exist already (an id in `tracker.md`, or an issue with the same title under the same parent): a rerun after a failure never creates twice.
@@ -49,6 +49,16 @@ After the approval the calling stage names (Big: the design; Mid: its single app
 - Record the feature's ticket: `fbs status ticket <slug> '<parent id>' --url <url>` (Mid, tiny, bug: its one issue), and each unit's on its unit record: `fbs status ticket <unit slug> '<id>' --url <url>` (the units are listed by `fbs status show <slug>`, in order; a unit's branch takes its ticket when it is created). Then run `fbs branch <slug> --ticket '<the parent id>'` (Mid, tiny, bug: its one issue): a branch without a PR is renamed to carry the id; say its `note:` in one line, and a `refused:` too (the branch keeps its name; Linear still links the PR through its `Fixes` line).
 - Commit `tracker.md` when `docs` is `tracked` (`docs: tracker structure for <slug>`).
 
-## 4. Hand back
+## 4. Update after a change
+
+`fbs:changes` calls this once a change is approved, when `tracker.md` is `created`. For each issue the change moves (the criteria it covers, what it ships, a unit added, merged or dropped), with the adapter:
+
+- rewrite its body to match the amended documents;
+- add a comment saying what changed and why, in two or three lines, citing change C<n>;
+- a dropped unit's issue is closed with that comment; a new unit's sub-issue is proposed and created as section 3 says.
+
+These edits run only on the user's go-ahead: their approval of a change overview whose Tracker line listed them, or a go-ahead asked here with the list (`fbs:grilling`'s rules). Then update `tracker.md` to match, and commit it when `docs` is `tracked` (`docs: tracker update for <slug>`). With no issue moved, say so in one line.
+
+## 5. Hand back
 
 Say in one line what exists in the tracker (`ACM-120 with 3 sub-issues, ACM-121 to ACM-123`) and hand back to the calling stage.

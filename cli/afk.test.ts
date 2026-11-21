@@ -757,6 +757,14 @@ describe("fbs afk stop, resume and show", () => {
     expect(shown.summary).toMatchObject({ iterations: 2, kept: 1, discarded: 1 });
     expect(shown.summary.lastResults[0]).toMatchObject({ id: "seo", value: 20 });
   });
+
+  test("show for a feature with no afk run prints none and succeeds", () => {
+    const cwd = repo({});
+    const { judge } = fakeJudge();
+    const r = afk(cwd, judge, ["show", "nope"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toEqual(["none"]);
+  });
 });
 
 describe("afk-guard in the run", () => {

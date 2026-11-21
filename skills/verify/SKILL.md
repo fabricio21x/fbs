@@ -41,7 +41,7 @@ Load `fbs:principle-prove-it-works` with the Skill tool and follow it for the re
 
 ## 3. The suite
 
-Find the test and type-check commands (the ones `<dir>/plan.md` or `<dir>/bug.md` records, otherwise `CLAUDE.md`, `package.json` scripts or the equivalent) and run both. Quote the summary lines. A failing test not in the baseline that `plan.md` or `bug.md` records (none when neither exists) is an open issue. For a feature with an afk run (`fbs afk show <slug>` prints one), the baseline is its `run.testBaseline`.
+Find the test and type-check commands (the ones `<dir>/plan.md` or `<dir>/bug.md` records, otherwise `CLAUDE.md`, `package.json` scripts or the equivalent) and run both in the foreground with a Bash `timeout`, per workspace or package when the root command hangs; never wait on a background run. Quote the summary lines. A failing test not in the baseline that `plan.md` or `bug.md` records (none when neither exists) is an open issue. For a feature with an afk run (`fbs afk show <slug>` prints one), the baseline is its `run.testBaseline`.
 
 ## 4. Each criterion
 

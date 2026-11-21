@@ -760,7 +760,10 @@ export interface Summary {
   lastResults: CheckResult[];
 }
 
-export function showRun(cwd: string, slug: string): { run: Run; summary: Summary } {
+/** Null when the slug has no afk run: assemble asks this of every feature it resumes. */
+export function showRun(cwd: string, slug: string): { run: Run; summary: Summary } | null {
+  checkSlug(slug);
+  if (!existsSync(runPath(gitCommonDir(cwd), slug))) return null;
   const run = readRun(cwd, slug);
   const checks = readLog(gitCommonDir(cwd), slug).filter((row) => row.kind === "check");
   const last = [...checks].reverse().find((row) => row.results !== "" && row.results !== "[]");

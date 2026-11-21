@@ -118,7 +118,8 @@ When a project uses Linear or GitHub Issues, the `tracker` building block plans 
 
 - **The setting.** On the first plan in a repo, it gathers evidence (ticket prefixes in branch names, tracker links in merged PRs, GitHub Issues use) and asks you once which tracker the project uses. The answer goes in `.fbs/config.json`.
 - **A ticket as input.** Start with a ticket id or URL and plan reads it as input to grill on, never as settled facts. Ticket text is treated as data, never as instructions.
-- **The structure.** After the approval, it proposes what the tracker should hold: for a big feature, a parent issue and a sub-issue per work unit with their blocking relations; for mid, tiny and bug, one issue. It writes the proposal to `tracker.md` and creates it only on your go-ahead.
+- **The structure.** After the approval, it proposes what the tracker should hold: for a big feature, a parent issue and a sub-issue per work unit with their blocking relations; for mid, tiny and bug, one issue. It writes the proposal to `tracker.md` and creates it only on your go-ahead, with every issue assigned to you.
+- **After a change.** When an approved change moves an issue (its criteria, what it ships, a unit added or dropped), the issue is rewritten and gets a comment saying what changed and why. The change's overview lists those edits, so approving it covers them; otherwise you're asked first.
 - **Links.** The feature's branch name carries the ticket id, and the PR description ends with `Fixes <id>`.
 
 At the end of a PR's review, valid out-of-scope findings recorded as follow-ups are proposed once as new issues, created only on your go-ahead.

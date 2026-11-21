@@ -8,7 +8,7 @@ allowed-tools: Bash(fbs *)
 
 # Implement
 
-Turn an approved design into reviewed, tested commits. You orchestrate: implementers write the code, reviewers judge it blind, and you keep the plan, the branch and the decisions. You write no product code yourself.
+Turn an approved design into reviewed, tested commits. You orchestrate: implementers write the code, reviewers judge it blind, and you keep the plan, the branch and the decisions. **You write no product code yourself, not even for a one-line task: every task goes through an implementer agent, then a reviewer.**
 
 Plugin root: `${CLAUDE_PLUGIN_ROOT}` (if this shows unexpanded, use the plugin root the calling skill gave you).
 
@@ -20,7 +20,9 @@ Run every `fbs` command as its own Bash call, with nothing chained, piped or red
 
 **Keep going.** Never ask the user to type a command. When this stage is done and nothing is pending (an approval, a decision, a blocker), say in one line what you're starting and continue into the next stage yourself: read its SKILL.md under `<plugin root>/skills/` with the Read tool and follow it, with the slug and the plugin root.
 
-**Ask with the question UI.** Every question to the user, approvals and go-aheads included, goes through the AskUserQuestion tool when it is available, with what the user needs to answer shown in the chat right before it (`fbs:grilling`'s rules). Plain text only when the answer can't be options, or without the tool.
+**Ask with the question UI.** Every question to the user, approvals and go-aheads included, goes through the AskUserQuestion tool when it is available, with what the user needs to answer shown in the chat right before it (`fbs:grilling`'s rules). Plain text only when the answer can't be options, without the tool, or while background work is live.
+
+**Background work never parks the turn.** End a turn waiting on background work only when something will wake you: camp's watcher, or an agent's or command's completion notification. A command that hangs never notifies, so a test suite or a build runs in the foreground with a Bash `timeout`; a server starts in the background and is never waited on. On a hang or a timeout, say so and change strategy; never restart the same command and wait again.
 
 ## 1. Precondition and resume
 
@@ -42,7 +44,7 @@ Load `fbs:principle-guard-the-context` and `fbs:principle-smallest-change` with 
 3. **Resume:** if `<dir>/plan.md` exists on this branch, read it and take the branch base, commands and baseline from it. Continue from the first task that isn't `done`; don't rewrite the plan. Tasks the change path added are already in it; when there are new ones, reopen the cleanup and the final review. Show section 3's overview with each row's status, then skip to section 4.
 4. **Review round** (called from camp-pr with fixes from PR review): build and review only the new tasks (section 4); run cleanup (section 5) on `<round base>..HEAD` only; skip the final review (the PR's reviewers are it); then hand back to camp-pr, which verifies and pushes.
 5. Find the test command and the type-check command (`CLAUDE.md`, `package.json` scripts or the equivalent). Ask once for what you can't find.
-6. Run both, and record the tests that already fail as the baseline.
+6. Run both in the foreground with a Bash `timeout` (10 minutes at most), and record the tests that already fail as the baseline. When the root command hangs or times out, run it per workspace or package instead, and say which ones you couldn't run.
 
 ## 3. Plan
 
@@ -69,7 +71,7 @@ When a task-tracking tool is available (TaskCreate and TaskUpdate, or TodoWrite)
 
 ## 4. Each task
 
-Take tasks in dependency order. Agent calls run in the background: **wait for each report before the next step, and for a batch wait for every report; never act on a partial set.** A report is an agent's last message: nothing follows it. One that isn't a report (empty, `pending`, a progress note, no `**Task:**` line) means the agent stopped early: check `git log` for its commit, then ask it for its full report with SendMessage (it resumes with its context) and wait for that. Never end your turn waiting on an agent that already reported.
+Take tasks in dependency order, each through every step below however small it is. Agent calls run in the background: **wait for each report before the next step, and for a batch wait for every report; never act on a partial set.** A report is an agent's last message: nothing follows it. One that isn't a report (empty, `pending`, a progress note, no `**Task:**` line) means the agent stopped early: check `git log` for its commit, then ask it for its full report with SendMessage (it resumes with its context) and wait for that. Never end your turn waiting on an agent that already reported.
 
 1. **Implement.** Record `HEAD` as the task's base. One Agent call with `subagent_type: "fbs:implementer"`, or `"fbs:ui-implementer"` for a task marked UI, which also gets the absolute evidence folder `$(git rev-parse --path-format=absolute --git-common-dir)/fbs/evidence/<slug>/ui/<task id>/`. Give it the task (id, goal, files, the criteria it serves, dependencies), the absolute paths of `spec.md` and `design.md` under `docsRoot` (a worktree agent has no copy of local documents), for a UI task also the absolute mockups folder `<docsRoot>/mockups/` (a unit: the feature's), the branch `<branch>`, and the test and type-check commands.
    - **Parallel batch:** record `git rev-parse HEAD` as the batch base, and make sure `.claude/worktrees/` is listed in `$(git rev-parse --git-common-dir)/info/exclude` (append it once if not), so worktrees never make this checkout dirty. Start one call per task in a single message, each with `isolation: "worktree"`, no branch, and the batch base: a worktree agent may start from the default branch, and resetting to the batch base gives it this branch's work. When all have reported, integrate them **one at a time, in plan order**: record `HEAD` as the task's base, `git merge --no-ff <its branch>`, then run steps 2 to 5 for that task here on `<branch>` before merging the next. On a conflict, `git merge --abort` and redo that task alone on the feature branch. After a task is settled, `git worktree remove <its path>` and `git branch -d <its branch>`.
