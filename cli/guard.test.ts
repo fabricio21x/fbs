@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { type AfkGuardRun, afkDenials, campMarkerPath, commandDenials, denials, freshToken, type GuardContext, guardPrompt, guardReply, guardToolUse, landRequestPath, landTokenPath, afkRunsIn, REQUEST_TTL_MS, TOKEN_TTL_MS, writePendingRequest, writeLandToken } from "./guard";
+import { type AfkGuardRun, afkDenials, campDenials, campMarkerPath, commandDenials, denials, freshToken, type GuardContext, guardPrompt, guardReply, guardToolUse, landRequestPath, landTokenPath, afkRunsIn, MCP_REVIEW_TOOLS, REQUEST_TTL_MS, TOKEN_TTL_MS, writePendingRequest, writeLandToken } from "./guard";
 import { REAL_AFK_DEPS } from "./afk";
 import { run } from "./main";
 import { updateFeature } from "./status";
@@ -110,7 +110,7 @@ describe("commandDenials", () => {
   });
 
   test("a lease push is denied to an open fbs PR's branch only, however the branch is named", () => {
-    const open = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x" }, { slug: "y", branch: null }] });
+    const open = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }, { slug: "y", branch: null, pr: 8 }] });
     for (const command of ["git push --force-with-lease origin feat/x", "git push --force-with-lease", "git push --force-with-lease=feat/x:abc origin HEAD", "git push --force-if-includes --force-with-lease origin HEAD:feat/x"]) {
       expect(commandDenials(command, open).join("\n")).toContain("fbs stack sync x");
     }
@@ -126,7 +126,7 @@ describe("commandDenials", () => {
       pushed.push(`${src} -> ${branch}`);
       return src === source && branch === "feat/x";
     };
-    const open = (source: string) => ctx({ openPrs: () => [{ slug: "x", branch: "feat/x" }], onlyMessagesChanged: sameTree(source) });
+    const open = (source: string) => ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }], onlyMessagesChanged: sameTree(source) });
     expect(commandDenials("git push --force-with-lease", open("HEAD"))).toEqual([]);
     expect(commandDenials("git push --force-with-lease origin feat/x", open("feat/x"))).toEqual([]);
     expect(commandDenials("git push --force-with-lease origin HEAD:feat/x", open("HEAD"))).toEqual([]);
@@ -137,14 +137,14 @@ describe("commandDenials", () => {
 
   test("with several refspecs, only the one to the PR's branch is checked, against its own source", () => {
     const seen: string[] = [];
-    const open = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x" }], onlyMessagesChanged: (src, branch) => (seen.push(`${src} -> ${branch}`), src === "fix" && branch === "feat/x") });
+    const open = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }], onlyMessagesChanged: (src, branch) => (seen.push(`${src} -> ${branch}`), src === "fix" && branch === "feat/x") });
     expect(commandDenials("git push --force-with-lease origin HEAD:feat/other fix:feat/x", open)).toEqual([]);
     expect(seen).toEqual(["fix -> feat/x"]);
     expect(commandDenials("git push --force-with-lease origin fix:feat/other HEAD:feat/x", open).join("\n")).toContain("rewrites feat/x");
   });
 
   test("the messages-only pass needs the push alone in the command, on origin's tip, where the refs are read", () => {
-    const same = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x" }], onlyMessagesChanged: () => true });
+    const same = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }], onlyMessagesChanged: () => true });
     for (const command of [
       "git push --force-with-lease=feat/x:abc123 origin feat/x",
       "git -C ../other push --force-with-lease origin feat/x",
@@ -162,7 +162,7 @@ describe("commandDenials", () => {
   });
 
   test("push options that take a value don't shift the remote: the lease and default-branch rules still see the target", () => {
-    const open = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x" }], currentBranch: () => "feat/x" });
+    const open = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }], currentBranch: () => "feat/x" });
     for (const options of ["-o ci.skip", "--push-option ci.skip", "--repo origin", "--receive-pack git-receive-pack", "--exec git-receive-pack"]) {
       expect(commandDenials(`git push ${options} --force-with-lease origin`, open).join("\n")).toContain("rewrites feat/x");
       expect(commandDenials(`git push ${options} origin`, ctx({ currentBranch: () => "main" })).join("\n")).toContain("default branch (main)");
@@ -171,7 +171,7 @@ describe("commandDenials", () => {
   });
 
   test("a rewrite token lets a lease push through; --force, -f and a + refspec stay denied with it or the same tree", () => {
-    const allowed = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x" }], hasRewriteToken: () => true, onlyMessagesChanged: () => true });
+    const allowed = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }], hasRewriteToken: () => true, onlyMessagesChanged: () => true });
     expect(commandDenials("git push --force-with-lease origin feat/x", allowed)).toEqual([]);
     for (const command of ["git push --force origin feat/x", "git push -f origin feat/x", "git push origin +feat/x", "git push --force-with-lease --force origin feat/x", "git push --force-with-lease origin +HEAD:feat/x"]) {
       expect(commandDenials(command, allowed).join("\n")).toContain("use --force-with-lease alone");
@@ -179,7 +179,7 @@ describe("commandDenials", () => {
   });
 
   test("a lease push's denial names the two ways through: a messages-only amend, or the user's own words", () => {
-    const reason = commandDenials("git push --force-with-lease origin feat/x", ctx({ openPrs: () => [{ slug: "x", branch: "feat/x" }] })).join("\n");
+    const reason = commandDenials("git push --force-with-lease origin feat/x", ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }] })).join("\n");
     expect(reason).toContain("only messages changed");
     expect(reason).toContain("run fbs rewrite request x and ask the user");
   });
@@ -279,6 +279,106 @@ describe("denials", () => {
   test("Monitor commands are checked like Bash", () => {
     expect(deny("Monitor", { command: "gh pr merge 7" })).toHaveLength(1);
     expect(deny("Monitor", { command: "gh pr checks 7 --watch" })).toEqual([]);
+  });
+});
+
+describe("campDenials", () => {
+  // PR #7 is the open fbs PR; #45 is a tracker issue or someone else's PR.
+  const deny = (tool: string, input: Record<string, unknown>) => campDenials(tool, input, [7]);
+  const bashDeny = (command: string) => deny("Bash", { command });
+
+  test.each([
+    "gh api -X POST repos/acme/app/pulls/7/comments/123/replies -f body=Fixed",
+    "gh api repos/acme/app/pulls/7/comments/123/replies -f body='Fixed in abc1234'",
+    "gh api repos/{owner}/{repo}/pulls/7/comments/123/replies --input /tmp/r.json",
+    "gh api --method POST repos/acme/app/pulls/7/comments --input c.json",
+    "gh api repos/acme/app/pulls/7/comments/123/replies -fbody=x",
+    "gh api repos/acme/app/issues/7/comments -F body=@r.md",
+    "gh api repos/acme/app/issues/7/comments -Fbody=@r.md",
+    "gh api repos/acme/app/issues/$PR/comments -F body=@r.md",
+    "gh api repos/acme/app/issues/${PR}/comments -F body=@r.md",
+    "gh api repos/acme/app/pulls/${PR}/comments/1/replies -f body=x",
+    "gh api repos/acme/app/pulls/7/reviews -f event=COMMENT -f body=done",
+    "gh api -X POST repos/acme/app/pulls/7/reviews/99/events -f event=COMMENT",
+    `curl -X POST https://api.github.com/repos/acme/app/issues/7/comments -d '{"body":"x"}'`,
+    "curl --data-binary @r.json https://api.github.com/repos/acme/app/issues/7/comments",
+    `curl --json '{"body":"x"}' https://api.github.com/repos/acme/app/pulls/7/comments/1/replies`,
+    "curl -d@r.json https://api.github.com/repos/acme/app/issues/7/comments",
+    `gh api graphql -f query='mutation { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: "PRRT_a", body: "done"}) { comment { id } } }'`,
+    `gh api graphql -f query='mutation($id: ID!) { addPullRequestReviewComment(input: {pullRequestReviewId: $id, body: "x"}) { comment { id } } }'`,
+    `gh api graphql -f query='mutation { addPullRequestReview(input: {pullRequestId: "PR_a", event: COMMENT}) { pullRequestReview { id } } }'`,
+    `gh api graphql -f query='mutation { addComment(input: {subjectId: "PR_a", body: "x"}) { clientMutationId } }'`,
+    `gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { isResolved } } }'`,
+    `gh api graphql -f query='\nmutation {\n  addComment(input: {subjectId: "PR_a", body: "x; y"}) { clientMutationId }\n}'`,
+    "gh pr comment 7 --body done",
+    "gh pr comment --body-file r.md",
+    "gh pr comment https://github.com/acme/app/pull/7 -b done",
+    "gh pr comment $PR -b done",
+    "gh pr review 7 --approve",
+    "gh pr review --comment -b looks good",
+    "gh issue comment 7 --body-file r.md",
+    "gh issue comment https://github.com/acme/app/pull/7 -b done",
+    "gh issue comment $PR -b done",
+    "cd /repo && gh pr comment 7 -b done",
+    "GH_TOKEN=x command gh pr comment 7 -b done",
+    "env GH_HOST=github.com gh pr comment 7 -b done",
+    "echo $(gh pr comment 7 -b done)",
+  ])("a raw comment, reply, review or resolve on the camp's PR is denied, pointing to fbs: %s", (command) => {
+    const reasons = bashDeny(command);
+    expect(reasons).toHaveLength(1);
+    for (const way of ["fbs pr reply <slug>", "fbs pr comment <slug>", "fbs pr resolve <slug>", "ask the user to do it on GitHub"]) expect(reasons[0]).toContain(way);
+  });
+
+  test.each([
+    "gh api repos/acme/app/pulls/7/comments",
+    "gh api repos/acme/app/pulls/7/comments --paginate --jq '.[] | {id, body}'",
+    "gh api -X GET repos/acme/app/pulls/7/comments -f per_page=100",
+    "gh api repos/acme/app/issues/7/comments",
+    "gh api repos/acme/app/pulls/7/reviews",
+    "curl -fsSL https://api.github.com/repos/acme/app/issues/7/comments",
+    `gh api graphql -f query='query { repository(owner: "acme", name: "app") { pullRequest(number: 7) { reviewThreads(first: 50) { nodes { id isResolved } } } } }'`,
+    "gh pr view 7 --comments",
+    "gh pr checks 7 --watch",
+    "gh pr ready 7",
+    "gh issue comment 45 --body-file /repo/.git/fbs/c.md",
+    "gh api repos/acme/app/issues/45/comments -F body=@c.md",
+    "gh api -X POST repos/acme/app/issues/45/sub_issues -F sub_issue_id=99",
+    "gh pr comment 45 -b done",
+    "gh pr review 45 --approve",
+    "gh api -X POST repos/acme/app/pulls/45/comments/1/replies -f body=x",
+    "gh api -X POST repos/acme/app/pulls/7/comments/1/reactions -f content=+1",
+    "gh api -X POST repos/acme/app/issues/comments/9/reactions -f content=+1",
+    "fbs pr reply x --comment thread:123 --body-file /repo/.git/fbs/pr/r.md",
+    "fbs pr comment x --body-file /repo/.git/fbs/pr/c.md",
+    "fbs pr resolve x --thread PRRT_abc",
+    "grep -rn addComment src/graphql",
+    "grep -rn 'gh pr comment' skills/",
+    "git log --grep 'gh pr review'",
+    "git commit -m 'fix: gh api graphql addComment -f body=x for issues/7/comments'",
+    "rg addComment && gh api graphql -f query='query{viewer{login}}'",
+  ])("reads, other numbers, other commands and fbs's own commands stay allowed: %s", (command) => {
+    expect(bashDeny(command)).toEqual([]);
+  });
+
+  test("GitHub MCP tools that post a review, a reply or a comment on the PR are denied; reads and tracker comments are allowed", () => {
+    for (const tool of ["pull_request_review_write", "add_reply_to_pull_request_comment", "create_and_submit_pull_request_review", ...MCP_REVIEW_TOOLS]) {
+      expect(deny(`mcp__github__${tool}`, { owner: "acme", repo: "app", pullNumber: 7 }).join("\n")).toContain("fbs pr reply <slug>");
+    }
+    expect(deny("mcp__github__add_issue_comment", { owner: "acme", repo: "app", issue_number: 7, body: "x" })).toHaveLength(1);
+    expect(deny("mcp__github__add_issue_comment", { owner: "acme", repo: "app", issue_number: "7", body: "x" })).toHaveLength(1);
+    expect(deny("mcp__github__add_issue_comment", { owner: "acme", repo: "app", issue_number: 45, body: "x" })).toEqual([]);
+    expect(deny("mcp__github__get_pull_request_comments", { owner: "acme", repo: "app", pullNumber: 7 })).toEqual([]);
+  });
+
+  test("Monitor commands are checked like Bash", () => {
+    expect(deny("Monitor", { command: "gh pr comment 7 -b x" })).toHaveLength(1);
+  });
+
+  test("the guard's hook sees every MCP tool it denies during a camp", () => {
+    const hooks = JSON.parse(readFileSync(join(import.meta.dir, "..", "hooks", "hooks.json"), "utf8")).hooks.PreToolUse as { matcher: string; hooks: { command: string }[] }[];
+    const guard = hooks.filter((h) => h.hooks.some((hook) => hook.command.endsWith("/bin/fbs-guard")));
+    for (const tool of ["pull_request_review_write", "add_reply_to_pull_request_comment", "add_issue_comment", ...MCP_REVIEW_TOOLS]) expect(guard.some((h) => new RegExp(h.matcher).test(`mcp__github__${tool}`))).toBe(true);
+    expect(guard.some((h) => new RegExp(h.matcher).test("mcp__github__get_pull_request_comments"))).toBe(false);
   });
 });
 
@@ -417,6 +517,21 @@ describe("guardToolUse", () => {
     expect(guardToolUse(bash(dir, "fbs land x"), dir, NOW).deny).toHaveLength(1);
     writeLandToken(join(dir, ".git"), { slug: "x", at: NOW - 60_000, tree: TREE });
     expect(guardToolUse(bash(dir, "fbs land x"), dir, NOW).deny).toEqual([]);
+  });
+
+  test("raw PR replies are denied only while a camp runs, against the open fbs PR's number", () => {
+    const dir = repo();
+    prRecord(dir, "x", { pr: 12 });
+    const reply = "gh api repos/acme/app/pulls/12/comments/5/replies -f body=Fixed";
+    const comment = (issue: number) => JSON.stringify({ cwd: dir, tool_name: "mcp__github__add_issue_comment", tool_input: { owner: "acme", repo: "app", issue_number: issue, body: "x" } });
+    expect(guardToolUse(bash(dir, reply), dir, NOW).deny).toEqual([]);
+    mark(dir);
+    expect(guardToolUse(bash(dir, reply), dir, NOW).deny.join("\n")).toContain("fbs pr reply <slug>");
+    expect(guardToolUse(bash(dir, "gh issue comment 12 -b done"), dir, NOW).deny).toHaveLength(1);
+    expect(guardToolUse(bash(dir, "gh issue comment 45 -b done"), dir, NOW).deny).toEqual([]);
+    expect(guardToolUse(comment(12), dir, NOW).deny).toHaveLength(1);
+    expect(guardToolUse(comment(45), dir, NOW).deny).toEqual([]);
+    expect(guardToolUse(bash(dir, "fbs pr reply x --comment thread:5 --body-file .git/fbs/pr/r.md"), dir, NOW).deny).toEqual([]);
   });
 });
 

@@ -818,7 +818,7 @@ test("the help lists the PR commands", () => {
   const out: string[] = [];
   expect(run(["help"], io(out, []))).toBe(0);
   const help = out.join("\n");
-  for (const line of ["status pr <slug> <number|url|none>", "watch-pr <slug> [--interval <s>] [--timeout <s>] [--once]", "pr reply <slug> --comment <thread|issue|review>:<id> --body-file <path>", "pr resolve <slug> --thread <id>"]) {
+  for (const line of ["status pr <slug> <number|url|none>", "watch-pr <slug> [--interval <s>] [--timeout <s>] [--once]", "pr reply <slug> --comment <thread|issue|review>:<id> --body-file <path>", "pr comment <slug> --body-file <path>", "pr resolve <slug> --thread <id>"]) {
     expect(help).toContain(line);
   }
   expect(help).toContain("6 conflict");
@@ -1184,6 +1184,34 @@ test("pr reply with a missing body file or a failing gh is an environment error"
   const failed = prCommand(repo, broken, "pr", "reply", "x", "--comment", "thread:5", "--body-file", "reply.md");
   expect(failed.code).toBe(2);
   expect(failed.err[0]).toContain("Bad credentials");
+});
+
+test("pr comment posts a new top-level PR comment from the body file and marks it seen, so a watch doesn't wake on it", () => {
+  const repo = prRepo();
+  writeFileSync(join(repo, "comment.md"), "@alex could you review the retry change?\n");
+  const { deps, calls } = prDeps({
+    "repos/acme/app/issues/7/comments": { stdout: JSON.stringify({ id: 11, updated_at: "2026-10-25T11:00:00Z", html_url: "https://github.com/c/11" }) },
+    graphql: { stdout: graphqlAnswer({ state: "CLOSED" }) },
+  });
+  const r = prCommand(repo, deps, "pr", "comment", "x", "--body-file", "comment.md");
+  expect(r.code).toBe(0);
+  expect(JSON.parse(r.out.join("\n"))).toEqual({ kind: "issue", id: 11, updatedAt: "2026-10-25T11:00:00Z", url: "https://github.com/c/11" });
+  expect(calls[0].args).toEqual(["api", "--method", "POST", "repos/acme/app/issues/7/comments", "--input", expect.any(String)]);
+  expect(JSON.parse(calls[0].input ?? "")).toEqual({ body: "@alex could you review the retry change?\n" });
+  expect(prCommand(repo, deps, "watch-pr", "x", "--once").code).toBe(4);
+  expect(JSON.parse(readFileSync(cursorFile(repo), "utf8")).comments).toEqual({ "issue:11": "2026-10-25T11:00:00Z" });
+});
+
+test("pr comment refuses an empty body and a feature without a PR, and needs --body-file", () => {
+  const repo = prRepo();
+  writeFileSync(join(repo, "empty.md"), "\n");
+  writeFileSync(join(repo, "comment.md"), "ok");
+  const { deps, calls } = prDeps({});
+  expect(prCommand(repo, deps, "pr", "comment", "x", "--body-file", "empty.md").out[0]).toStartWith("error: bad-body: ");
+  expect(prCommand(featureRepo(), deps, "pr", "comment", "x", "--body-file", "comment.md").out[0]).toStartWith("error: no-pr: ");
+  expect(prCommand(repo, deps, "pr", "comment", "x").err[0]).toStartWith("unknown command: pr comment");
+  expect(prCommand(repo, deps, "pr", "comment", "x", "--body-file", "comment.md", "--comment", "issue:9").code).toBe(2);
+  expect(calls).toEqual([]);
 });
 
 test("pr resolve resolves a thread of the PR", () => {

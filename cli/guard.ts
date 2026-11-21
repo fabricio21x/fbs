@@ -44,6 +44,7 @@ export function campMarkers(commonDir: string): string[] {
 export interface OpenPr {
   slug: string;
   branch: string | null;
+  pr: number;
 }
 
 /** The records with an open PR, read leniently: a broken record is skipped, never fatal to the guard. */
@@ -55,7 +56,7 @@ export function openPrRecords(commonDir: string): OpenPr[] {
     if (!name.endsWith(".json")) continue;
     try {
       const rec = JSON.parse(readFileSync(join(dir, name), "utf8"));
-      if (typeof rec?.slug === "string" && typeof rec.pr === "number" && rec.landed === undefined) open.push({ slug: rec.slug, branch: typeof rec.branch?.name === "string" ? rec.branch.name : null });
+      if (typeof rec?.slug === "string" && typeof rec.pr === "number" && rec.landed === undefined) open.push({ slug: rec.slug, branch: typeof rec.branch?.name === "string" ? rec.branch.name : null, pr: rec.pr });
     } catch {}
   }
   return open;
@@ -440,6 +441,86 @@ function fbsLand(tokens: string[], ctx: GuardContext): string[] {
   return [`fbs land${slug === undefined ? "" : ` ${slug}`} needs a fresh land token, written when the user asks you to merge or land it (or answers your land request, or types /fbs:land)`];
 }
 
+// ---- While a camp runs.
+
+/** GitHub MCP tools that post a review, a review comment or a reply on a PR. */
+export const MCP_REVIEW_TOOLS = [
+  "add_comment_to_pending_review",
+  "add_pull_request_review_comment",
+  "add_pull_request_review_comment_to_pending_review",
+  "add_reply_to_pull_request_comment",
+  "create_and_submit_pull_request_review",
+  "create_pending_pull_request_review",
+  "create_pull_request_review",
+  "pull_request_review_write",
+  "submit_pending_pull_request_review",
+];
+// The whole path, so a reaction on a comment (`comments/<id>/reactions`) isn't a comment.
+const PR_POST_PATH = /(?:^|[\s/])pulls\/([^/\s?]+)\/(?:comments(?:\/[^/\s?]+\/replies)?|reviews(?:\/[^/\s?]+\/events)?)(?=$|[\s?])/;
+const ISSUE_COMMENTS_PATH = /(?:^|[\s/])issues\/([^/\s?]+)\/comments(?=$|[\s?])/;
+const POST_WRITE = /(-X\s*|--method[\s=]+|--request[\s=]+)(PATCH|DELETE|POST|PUT)\b|(^|\s)(-f|-F|-d|--field|--raw-field|--input|--data(-[a-z]+)?|--json)(\s|=|$)|(^|\s)(-[fF][A-Za-z_][\w.[\]]*=|-d\S)/i;
+const READ_METHOD = /(-X\s*|--method[\s=]+|--request[\s=]+)GET\b/i;
+const GRAPHQL_CALL = /\bapi(\s+|\.github\.com\/|\/)graphql\b/i;
+const POSTING_MUTATION = /\b(addPullRequestReviewThreadReply|addPullRequestReviewThread|addPullRequestReviewComment|addPullRequestReview|submitPullRequestReview|addComment|resolveReviewThread)\b/;
+const GH_COMMENT_VALUES = ["-b", "--body", "-F", "--body-file", "-R", "--repo"];
+const POST_THROUGH_FBS =
+  "during a camp, post on the PR through fbs: reply to a comment with fbs pr reply <slug> --comment <key> --body-file <file>, post a new top-level comment with fbs pr comment <slug> --body-file <file>, resolve a thread with fbs pr resolve <slug> --thread <id>; fbs records what it posts, so its own posts don't wake the watcher. fbs never approves a PR or requests changes: when that is wanted, ask the user to do it on GitHub";
+
+/**
+ * Why the guard denies this call while a camp runs: a raw way to comment on, reply to, review or resolve a thread on an
+ * open fbs PR. `prs` are their numbers; a number not among them (a tracker issue, someone else's PR) passes, and one the
+ * command doesn't spell out is taken to be one of them.
+ */
+export function campDenials(toolName: string, toolInput: Record<string, unknown>, prs: number[]): string[] {
+  const ours = (target: unknown) => !/^\d+$/.test(String(target ?? "")) || prs.includes(Number(target));
+  const mcp = MCP_TOOL.exec(toolName)?.[1];
+  if (mcp !== undefined && MCP_REVIEW_TOOLS.includes(mcp)) return [`${toolName} posts on the PR; ${POST_THROUGH_FBS}`];
+  if (mcp === "add_issue_comment" && ours(toolInput.issue_number)) return [`${toolName} comments on the PR; ${POST_THROUGH_FBS}`];
+  if (!COMMAND_TOOLS.includes(toolName) || typeof toolInput.command !== "string") return [];
+  const reasons = new Set<string>();
+  for (const segment of shellCommands(toolInput.command)) {
+    const tokens = segment.split(/\s+/).filter((t) => t !== "");
+    const at = tokens.findIndex((t) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) && t !== "command" && t !== "env" && t !== "{");
+    const cli = at === -1 ? "" : basename(tokens[at]);
+    if (cli !== "gh" && cli !== "curl") continue;
+    if (GRAPHQL_CALL.test(segment) && POSTING_MUTATION.test(segment)) reasons.add(`a GraphQL mutation that posts on the PR or resolves a thread; ${POST_THROUGH_FBS}`);
+    const target = PR_POST_PATH.exec(segment)?.[1] ?? ISSUE_COMMENTS_PATH.exec(segment)?.[1];
+    if (target !== undefined && ours(target) && POST_WRITE.test(segment) && !READ_METHOD.test(segment)) reasons.add(`a REST write that posts on the PR; ${POST_THROUGH_FBS}`);
+    const [group, sub, ...args] = tokens.slice(at + 1);
+    const posts = (group === "pr" && (sub === "comment" || sub === "review")) || (group === "issue" && sub === "comment");
+    if (cli === "gh" && posts && ours(numberIn(args))) reasons.add(`gh ${group} ${sub} posts on the PR; ${POST_THROUGH_FBS}`);
+  }
+  return [...reasons];
+}
+
+/** The PR or issue number a gh comment or review command names, from a number or a URL; undefined when it doesn't spell one out. */
+function numberIn(args: string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    if (GH_COMMENT_VALUES.includes(args[i])) i++;
+    else if (!args[i].startsWith("-")) return /^#?(\d+)$/.exec(args[i])?.[1] ?? /\/(?:pull|issues)\/(\d+)\b/.exec(args[i])?.[1];
+  }
+  return undefined;
+}
+
+/** The simple commands in a shell line, split outside quotes at `;`, `&`, `|`, newlines, parentheses and backticks, quotes removed. */
+function shellCommands(command: string): string[] {
+  const commands: string[] = [];
+  let current = "";
+  let quote: string | null = null;
+  const text = command.replace(/\\\r?\n/g, " ");
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote === null && c === "\\") current += text[++i] ?? "";
+    else if (quote !== null && c === quote) quote = null;
+    else if (quote === null && (c === "'" || c === '"')) quote = c;
+    else if (quote === null && /[;&|\n()`]/.test(c)) {
+      commands.push(current.trim());
+      current = "";
+    } else current += c;
+  }
+  return [...commands, current.trim()].filter((c) => c !== "");
+}
+
 // ---- While an afk run is running.
 
 /** What the afk rules need of a running run. */
@@ -773,7 +854,8 @@ export function guardToolUse(raw: string, fallbackCwd: string, now: number): Gua
     if (campRules && /mcp__\S*__merge_pull_request/.test(raw)) deny.push(`a merge_pull_request MCP tool merges a PR; ${ASK_TO_LAND}`);
     return { deny };
   }
-  const deny = [...new Set([...(campRules ? denials(toolName, toolInput, cwd, ctx) : []), ...afkDenials(toolName, toolInput, cwd, commonDir, runs, ctx)])];
+  const camping = camps.length > 0 ? campDenials(toolName, toolInput, prs.map((pr) => pr.pr)) : [];
+  const deny = [...new Set([...(campRules ? denials(toolName, toolInput, cwd, ctx) : []), ...camping, ...afkDenials(toolName, toolInput, cwd, commonDir, runs, ctx)])];
   // The rewrite token is one push: spent on the call it alone let through.
   if (deny.length === 0 && campRules && ctx.hasRewriteToken() && denials(toolName, toolInput, cwd, { ...ctx, hasRewriteToken: () => false }).length > 0) {
     rmSync(rewriteTokenPath(commonDir), { force: true });

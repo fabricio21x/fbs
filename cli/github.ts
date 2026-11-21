@@ -396,6 +396,11 @@ export function replyToComment(gh: GhRunner, cwd: string, repo: string, pr: numb
   return posted("issue", post(gh, cwd, `repos/${repo}/issues/${pr}/comments`, quoting(original, body)));
 }
 
+/** Post a new top-level comment on `pr`. */
+export function commentOnPr(gh: GhRunner, cwd: string, repo: string, pr: number, body: string): Posted {
+  return posted("issue", post(gh, cwd, `repos/${repo}/issues/${pr}/comments`, body));
+}
+
 function quoting(original: Record<string, unknown>, body: string): string {
   const lines = String(original.body ?? "").trim().split("\n");
   const quoted = lines.slice(0, QUOTED_LINES).map((line) => `> ${line}`.trimEnd());

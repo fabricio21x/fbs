@@ -12,7 +12,7 @@ import { ConfigError, projectConfig } from "./config";
 import { checkContext } from "./context";
 import { isValidDate, localDate } from "./date";
 import { GitError, NotAGitRepoError, rootFor, setGitBinary } from "./git";
-import { COMMENT_KEY_FORMS, type CommentKey, GhError, type GhRunner, ghReader, NotOnPrError, parseCommentKey, replyToComment, repoName, resolveThread, runGh, setGhBinary } from "./github";
+import { COMMENT_KEY_FORMS, commentOnPr, GhError, type GhRunner, ghReader, NotOnPrError, parseCommentKey, replyToComment, repoName, resolveThread, runGh, setGhBinary } from "./github";
 import { guardPrompt, guardReply, guardToolUse } from "./guard";
 import { LandRefusedError, land, requestLand, requestRewrite } from "./land";
 import { checkPolish, type PolishDeps, REAL_POLISH_DEPS, setClaudeBinary } from "./polish";
@@ -168,6 +168,8 @@ const USAGE = [
   "  pr reply <slug> --comment <thread|issue|review>:<id> --body-file <path>",
   "                            a review thread's key may also be its GraphQL node id, or one of its comments' (thread:PRRT_…,",
   "                            thread:PRRC_…); the reply goes into that thread",
+  "  pr comment <slug> --body-file <path>",
+  "                            a new top-level comment on the PR, marked seen so the watcher doesn't wake on it",
   "  pr resolve <slug> --thread <id>",
   "                            the review thread's node id (PRRT_…)",
   "  camp start <slug> [--auto-fix-rounds <n>]",
@@ -269,7 +271,8 @@ const USAGE = [
   "                            writes the session's one-time rewrite token when it may ask to amend, rebase, squash or",
   "                            force-push while an fbs PR is open, or says yes to a pending rewrite request; a lease push",
   "                            to an open PR's branch passes with that token, or as the whole command when only commit",
-  "                            messages changed (the same base and the same tree for every commit)",
+  "                            messages changed (the same base and the same tree for every commit); during a camp it",
+  "                            also denies raw PR comments, replies, reviews and resolves: pr reply, pr comment and pr resolve",
   "  ask-check                 hook entry on AskUserQuestion: deny an Assuming, Confirm or Approve question, or one that",
   "                            says \"above\", when its message wrote no text in the chat before the call",
   "  afk start <slug> --spec <file> [--session <id>] [--restart]",
@@ -715,16 +718,17 @@ function watchStack(feature: string, units: UnitRecord[], options: WatchOptions,
   return EXIT_CODES[result.report.verdict];
 }
 
+const PR_OPTIONS: Record<string, string[]> = { reply: ["--comment", "--body-file"], comment: ["--body-file"], resolve: ["--thread"] };
+
 function runPr(args: string[], io: Io, deps: PrDeps): number {
   const [subcommand, ...rest] = args;
-  const parsed = parseOptions(rest, subcommand === "reply" ? ["--comment", "--body-file"] : subcommand === "resolve" ? ["--thread"] : [], []);
-  const comment = parsed?.values["--comment"];
-  const bodyFile = parsed?.values["--body-file"];
-  const thread = parsed?.values["--thread"];
-  if (!parsed || parsed.positionals.length !== 1 || (subcommand === "reply" ? comment === undefined || bodyFile === undefined : subcommand !== "resolve" || thread === undefined)) {
+  const options = Object.hasOwn(PR_OPTIONS, subcommand) ? PR_OPTIONS[subcommand] : null;
+  const parsed = options === null ? null : parseOptions(rest, options, []);
+  if (options === null || !parsed || parsed.positionals.length !== 1 || options.some((option) => parsed.values[option] === undefined)) {
     io.err(`unknown command: pr ${args.join(" ")}`.trimEnd());
     return 2;
   }
+  const { "--comment": comment, "--body-file": bodyFile, "--thread": thread } = parsed.values;
   const key = comment === undefined ? null : parseCommentKey(comment);
   if (comment !== undefined && key === null) {
     io.err(`pr reply: --comment takes ${COMMENT_KEY_FORMS}, not ${comment}`);
@@ -745,7 +749,7 @@ function runPr(args: string[], io: Io, deps: PrDeps): number {
     const path = resolve(io.cwd, bodyFile as string);
     const body = readFileSync(path, "utf8");
     if (body.trim() === "") throw new StatusError("bad-body", `${path} is empty`);
-    const posted = replyToComment(deps.gh, io.cwd, repo, pr, key as CommentKey, body);
+    const posted = key === null ? commentOnPr(deps.gh, io.cwd, repo, pr, body) : replyToComment(deps.gh, io.cwd, repo, pr, key, body);
     saveCursor(io.cwd, slug, markSeen(readCursor(io.cwd, slug, pr), posted));
     io.out(JSON.stringify(posted, null, 2));
     return 0;

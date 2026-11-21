@@ -1,5 +1,5 @@
 {
-  "description": "fbs guard: while an fbs PR flow (a camp, or any feature with an open PR) or afk run runs in a repo, deny merges (gh stack merge included), default-branch pushes, force pushes and scheduled prompts that ask to merge or rewrite, and during an afk run also edits to its protected files and state, deploys and history rewrites; /fbs:land typed by the user, the user's own message asking to merge or land an open fbs PR, or their yes to a pending fbs land request in the asking session, writes the one-time land token; the user's own message asking to amend, rebase, squash or force-push writes a one-time rewrite token for one lease push to an open PR's branch, or their yes to an fbs rewrite request, and a lease push that changes only commit messages passes on its own; the Stop hook keeps the session's running afk run going; and an Assuming, Confirm or Approve question (or one that says \"above\") is denied when its message wrote nothing in the chat before it.",
+  "description": "fbs guard: while an fbs PR flow (a camp, or any feature with an open PR) or afk run runs in a repo, deny merges (gh stack merge included), default-branch pushes, force pushes and scheduled prompts that ask to merge or rewrite, during a camp also raw PR comments, replies, reviews and thread resolves (fbs pr reply and fbs pr resolve post them), and during an afk run also edits to its protected files and state, deploys and history rewrites; /fbs:land typed by the user, the user's own message asking to merge or land an open fbs PR, or their yes to a pending fbs land request in the asking session, writes the one-time land token; the user's own message asking to amend, rebase, squash or force-push writes a one-time rewrite token for one lease push to an open PR's branch, or their yes to an fbs rewrite request, and a lease push that changes only commit messages passes on its own; the Stop hook keeps the session's running afk run going; and an Assuming, Confirm or Approve question (or one that says \"above\") is denied when its message wrote nothing in the chat before it.",
   "hooks": {
     "PreToolUse": [
       {
@@ -15,7 +15,7 @@
         ]
       },
       {
-        "matcher": "^mcp__.*__(push_files|create_or_update_file|delete_file|merge_pull_request|write_file|edit_file|create_file|create_directory|move_file|delete_directory)$",
+        "matcher": "^mcp__.*__(push_files|create_or_update_file|delete_file|merge_pull_request|write_file|edit_file|create_file|create_directory|move_file|delete_directory|add_issue_comment|add_comment_to_pending_review|add_pull_request_review_comment|add_pull_request_review_comment_to_pending_review|add_reply_to_pull_request_comment|create_and_submit_pull_request_review|create_pending_pull_request_review|create_pull_request_review|pull_request_review_write|submit_pending_pull_request_review)$",
         "hooks": [
           {
             "type": "command",
