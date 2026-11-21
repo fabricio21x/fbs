@@ -10,6 +10,17 @@ export interface FbsConfig {
   camp?: { autoFixRounds?: number };
   /** `types` is the only branch types `fbs branch` creates here. */
   branches?: { types?: string[] };
+  verify?: VerifyConfig;
+}
+
+/**
+ * The command verify and implement run as the suite, and whether green CI runs of `ciWorkflows` (required with it) on
+ * the exact head count as its evidence.
+ */
+export interface VerifyConfig {
+  suite?: string;
+  ciEvidence: boolean;
+  ciWorkflows?: string[];
 }
 
 /** The project's issue tracker; `none` says it has none, which differs from unset. */
@@ -102,6 +113,16 @@ function parseConfig(text: string, path: string): FbsConfig {
     const valid = Array.isArray(types) && types.length > 0 && types.every((type) => BRANCH_TYPES.includes(type)) && new Set(types).size === types.length;
     if (types !== undefined && !valid) throw invalid(`branches.types must be a non-empty array of distinct types from ${BRANCH_TYPES.join(", ")}`);
     config.branches = types === undefined ? {} : { types: types as string[] };
+  }
+  if (raw.verify !== undefined) {
+    if (!isObject(raw.verify)) throw invalid("verify must be an object");
+    const { suite, ciEvidence, ciWorkflows } = raw.verify;
+    if (suite !== undefined && (typeof suite !== "string" || suite.trim() === "")) throw invalid("verify.suite must be a non-empty command");
+    if (ciEvidence !== undefined && typeof ciEvidence !== "boolean") throw invalid("verify.ciEvidence must be true or false");
+    const names = Array.isArray(ciWorkflows) && ciWorkflows.length > 0 && ciWorkflows.every((name) => typeof name === "string" && name.trim() !== "") && new Set(ciWorkflows).size === ciWorkflows.length;
+    if (ciWorkflows !== undefined && !names) throw invalid("verify.ciWorkflows must be a non-empty array of distinct workflow names");
+    if (ciEvidence === true && ciWorkflows === undefined) throw invalid("verify.ciWorkflows must name the workflows whose green runs count when verify.ciEvidence is true");
+    config.verify = { ...(suite !== undefined && { suite: suite as string }), ciEvidence: ciEvidence === true, ...(ciWorkflows !== undefined && { ciWorkflows: ciWorkflows as string[] }) };
   }
   return config;
 }

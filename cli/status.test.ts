@@ -22,6 +22,7 @@ import {
   listFeatures,
   plannedUnit,
   readFeature,
+  recordRollout,
   RecordError,
   setTicket,
   unitAbove,
@@ -399,6 +400,17 @@ test.each([
   ["a string unit", { ...VALID, unitOf: "f", unit: "1" }],
   ["a unitOf that isn't a slug", { ...VALID, unitOf: "../f", unit: 1 }],
   ["a unit of itself", { ...VALID, unitOf: "x", unit: 1 }],
+  ["a stamp with rollout criteria, which live on the record", { ...VALID, stamp: { ...STAMP, rollout: [2] } }],
+  ["a rollout that isn't a list", { ...VALID, rollout: { ac: 2 } }],
+  ["a rollout criterion without its text", { ...VALID, rollout: [{ ac: 2 }] }],
+  ["a rollout criterion with a blank text", { ...VALID, rollout: [{ ac: 2, text: " " }] }],
+  ["a rollout criterion 0", { ...VALID, rollout: [{ ac: 0, text: "A copy works" }] }],
+  ["a rollout outcome without its date", { ...VALID, rollout: [{ ac: 2, text: "A copy works", outcome: "pass" }] }],
+  ["a rollout outcome that is unknown", { ...VALID, rollout: [{ ac: 2, text: "A copy works", outcome: "maybe", at: "2026-10-25" }] }],
+  ["a rollout outcome with an invalid date", { ...VALID, rollout: [{ ac: 2, text: "A copy works", outcome: "pass", at: "2026-02-30" }] }],
+  ["a rollout outcome with a blank note", { ...VALID, rollout: [{ ac: 2, text: "A copy works", outcome: "pass", at: "2026-10-25", note: " " }] }],
+  ["a rollout note without an outcome", { ...VALID, rollout: [{ ac: 2, text: "A copy works", note: "later" }] }],
+  ["a rollout criterion with an extra field", { ...VALID, rollout: [{ ac: 2, text: "A copy works", by: "alex" }] }],
 ])("readFeature rejects a record with %s", (_, content) => {
   writeRecordFile("x.json", content);
   expect(() => readFeature(repo, "x")).toThrow(RecordError);
@@ -475,6 +487,49 @@ test.each([
   const rec = { ...VALID, stamp: { ...STAMP, ...extra } };
   writeRecordFile("x.json", rec);
   expect(readFeature(repo, "x")).toEqual(rec as FeatureRecord);
+});
+
+const ROLLOUT = [
+  { ac: 2, text: "A copy works between environments" },
+  { ac: 4, text: "A client deploys through it" },
+];
+
+test("readFeature keeps the rollout criteria, waiting or with their outcomes", () => {
+  const rollout = [ROLLOUT[0], { ...ROLLOUT[1], outcome: "fail", at: "2026-10-26", note: "the copy timed out" }];
+  writeRecordFile("x.json", { ...VALID, rollout });
+  expect(readFeature(repo, "x").rollout).toEqual(rollout as FeatureRecord["rollout"]);
+});
+
+test("recordRollout records a rollout criterion's outcome beside its text, and a later one replaces it", () => {
+  writeRecordFile("x.json", { ...VALID, rollout: ROLLOUT });
+  expect(recordRollout(repo, "x", "AC4", "fail", "2026-10-25", "the copy timed out").rollout).toEqual([ROLLOUT[0], { ...ROLLOUT[1], outcome: "fail", at: "2026-10-25", note: "the copy timed out" }]);
+  recordRollout(repo, "x", "ac2", "pass", "2026-10-25");
+  expect(recordRollout(repo, "x", "AC4", "pass", "2026-10-26").rollout).toEqual([
+    { ...ROLLOUT[0], outcome: "pass", at: "2026-10-25" },
+    { ...ROLLOUT[1], outcome: "pass", at: "2026-10-26" },
+  ]);
+});
+
+test("recordRollout works after the stamp is gone, since the rollout list outlives it", () => {
+  writeRecordFile("x.json", { ...VALID, rollout: ROLLOUT });
+  expect(readFeature(repo, "x").stamp).toBeUndefined();
+  expect(recordRollout(repo, "x", "AC2", "pass", "2026-10-25").rollout?.[0]).toEqual({ ...ROLLOUT[0], outcome: "pass", at: "2026-10-25" });
+});
+
+test.each([
+  ["AC3", "pass", undefined, "AC3 isn't a rollout criterion of x: AC2, AC4"],
+  ["2", "pass", undefined, '"2" must be AC<n>'],
+  ["AC2", "ok", undefined, '"ok" must be pass or fail'],
+  ["AC2", "pass", " ", "the note must not be blank"],
+])("recordRollout refuses %p %p with note %p and records nothing", (criterion, outcome, note, message) => {
+  writeRecordFile("x.json", { ...VALID, rollout: ROLLOUT });
+  expect(() => recordRollout(repo, "x", criterion, outcome, "2026-10-25", note)).toThrow(message);
+  expect(readFeature(repo, "x").rollout).toEqual(ROLLOUT);
+});
+
+test("recordRollout refuses a record with no rollout criteria", () => {
+  writeRecordFile("x.json", { ...VALID, stamp: STAMP });
+  expect(() => recordRollout(repo, "x", "AC1", "pass", "2026-10-25")).toThrow("bad-rollout: AC1 isn't a rollout criterion of x (it has none)");
 });
 
 test("readFeature accepts a dir under .github", () => {

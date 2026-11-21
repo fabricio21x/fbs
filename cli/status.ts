@@ -27,6 +27,18 @@ export interface Stamp {
   verifiedTree?: string;
 }
 
+/**
+ * A spec criterion marked `(rollout)`: verify passed without its evidence, so it is checked after the deploy. `outcome`,
+ * `at` and `note` are what the user reported then; unset while it waits.
+ */
+export interface RolloutCriterion {
+  ac: number;
+  text: string;
+  outcome?: "pass" | "fail";
+  at?: string;
+  note?: string;
+}
+
 export interface FeatureRecord {
   slug: string;
   dir: string;
@@ -45,6 +57,8 @@ export interface FeatureRecord {
   unitOf?: string;
   /** The unit's place in its feature's stack, from 1; set with `unitOf`. */
   unit?: number;
+  /** The rollout criteria the last stamp passed without evidence, lowest first; kept when an approval clears the stamp. */
+  rollout?: RolloutCriterion[];
 }
 
 /** A work unit: one PR of a Big feature's stack. */
@@ -126,7 +140,8 @@ export type StatusErrorCode =
   | "not-big"
   | "design-not-approved"
   | "unit-taken"
-  | "bad-unit";
+  | "bad-unit"
+  | "bad-rollout";
 
 export class StatusError extends Error {
   readonly code: StatusErrorCode;
@@ -265,7 +280,7 @@ export function readFeature(cwd: string, slug: string): FeatureRecord {
     throw invalid((e as Error).message.split("\n")[0]);
   }
   if (!isObject(raw)) throw invalid("expected a JSON object");
-  const unknownKey = Object.keys(raw).find((key) => !["slug", "dir", "size", "approvals", "pr", "unitOf", "unit", "repo", "stamp", "landed", "branch", "ticket"].includes(key));
+  const unknownKey = Object.keys(raw).find((key) => !["slug", "dir", "size", "approvals", "pr", "unitOf", "unit", "repo", "stamp", "landed", "branch", "ticket", "rollout"].includes(key));
   if (unknownKey !== undefined) throw invalid(`unknown field ${unknownKey}`);
   if (raw.slug !== slug) throw invalid(`slug ${JSON.stringify(raw.slug)} does not match the file name`);
   if (typeof raw.size !== "string" || !SIZES.includes(raw.size)) throw invalid(`unknown size ${JSON.stringify(raw.size)}`);
@@ -293,6 +308,7 @@ export function readFeature(cwd: string, slug: string): FeatureRecord {
     ...(raw.landed !== undefined && { landed: readLanded(raw.landed, invalid) }),
     ...(raw.branch !== undefined && { branch: readBranch(raw.branch, invalid) }),
     ...(raw.ticket !== undefined && { ticket: readTicket(raw.ticket, invalid) }),
+    ...(raw.rollout !== undefined && { rollout: readRollout(raw.rollout, invalid) }),
   };
   if (raw.stamp === undefined) return rec;
 
@@ -311,6 +327,21 @@ export function readFeature(cwd: string, slug: string): FeatureRecord {
   const verdictSha256 = typeof stamp.verdictSha256 === "string" && { verdictSha256: stamp.verdictSha256 };
   const verifiedTree = typeof stamp.verifiedTree === "string" && { verifiedTree: stamp.verifiedTree };
   return { ...rec, stamp: { tree: stamp.tree, at: stamp.at, verdict: "pass", criteria: stamp.criteria as number, evidence: stamp.evidence, ...verdictSha256, ...verifiedTree } };
+}
+
+function readRollout(criteria: unknown, invalid: (reason: string) => RecordError): RolloutCriterion[] {
+  const shape = "rollout must be a list of { ac, text, outcome?, at?, note? }, outcome and at together, note only with them";
+  if (!Array.isArray(criteria)) throw invalid(shape);
+  return criteria.map((item) => {
+    if (!isObject(item) || !["ac,text", "ac,at,outcome,text", "ac,at,note,outcome,text"].includes(Object.keys(item).sort().join())) throw invalid(shape);
+    if (!Number.isInteger(item.ac) || (item.ac as number) < 1) throw invalid("rollout ac must be a positive integer");
+    if (typeof item.text !== "string" || item.text.trim() === "") throw invalid("rollout text must be a non-empty string");
+    if (item.outcome === undefined) return { ac: item.ac as number, text: item.text };
+    if (item.outcome !== "pass" && item.outcome !== "fail") throw invalid('rollout outcome must be "pass" or "fail"');
+    if (typeof item.at !== "string" || !isValidDate(item.at)) throw invalid("rollout at must be a valid date");
+    if (item.note !== undefined && (typeof item.note !== "string" || item.note.trim() === "")) throw invalid("rollout note must be a non-empty string");
+    return { ac: item.ac as number, text: item.text, outcome: item.outcome, at: item.at, ...(typeof item.note === "string" && { note: item.note }) };
+  });
 }
 
 function readLanded(landed: unknown, invalid: (reason: string) => RecordError): Landed {
@@ -575,6 +606,25 @@ export function setTicket(cwd: string, slug: string, id: string, url?: string): 
 
 export function clearTicket(cwd: string, slug: string): FeatureRecord {
   return updateFeature(cwd, slug, ({ ticket: _, ...rec }) => rec);
+}
+
+/** Record how a rollout criterion (`AC<n>`) turned out after the deploy; a later outcome replaces an earlier one. */
+export function recordRollout(cwd: string, slug: string, criterion: string, outcome: string, today: string, note?: string): FeatureRecord {
+  assertToday(today);
+  const ac = Number(/^AC([1-9][0-9]*)$/i.exec(criterion)?.[1] ?? Number.NaN);
+  if (Number.isNaN(ac)) throw new StatusError("bad-rollout", `${JSON.stringify(criterion)} must be AC<n>, the criterion's position in the spec`);
+  if (outcome !== "pass" && outcome !== "fail") throw new StatusError("bad-rollout", `${JSON.stringify(outcome)} must be pass or fail`);
+  if (note !== undefined && note.trim() === "") throw new StatusError("bad-rollout", "the note must not be blank");
+  const result: "pass" | "fail" = outcome;
+  return updateFeature(cwd, slug, (rec) => {
+    const listed = rec.rollout ?? [];
+    if (!listed.some((item) => item.ac === ac)) {
+      const known = listed.length > 0 ? `: ${listed.map((item) => `AC${item.ac}`).join(", ")}` : " (it has none)";
+      throw new StatusError("bad-rollout", `AC${ac} isn't a rollout criterion of ${slug}${known}`);
+    }
+    const rollout = listed.map((item): RolloutCriterion => (item.ac === ac ? { ac, text: item.text, outcome: result, at: today, ...(note !== undefined && { note }) } : item));
+    return { ...rec, rollout };
+  });
 }
 
 /** The feature's PR and repo; a feature without a PR is refused. */

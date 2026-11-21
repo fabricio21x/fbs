@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, wr
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { carryStamp, checkStamp, countCriteria, setStamp, StampRefusedError } from "./stamp";
-import { approve, approveAsAgent, initFeature, initUnit, readFeature, type Stamp, updateFeature } from "./status";
+import { approve, approveAsAgent, initFeature, initUnit, readFeature, recordRollout, type Stamp, updateFeature } from "./status";
 import { isolatedGitEnv } from "./test-env";
 
 const PASSING_SPEC = "## Facts\n- Two beta clients (.fbs/context.md)\n## Assumptions\nNone\n## Open questions\nNone\n";
@@ -715,4 +715,192 @@ test("a replace ref can't make the stamped tree or commit pass for HEAD's", () =
   expect(refusal(() => carryStamp(repo, "x"))).toEqual([`src/app.ts changed: outside the feature's documents (${DIR}/)`]);
   git(repo, "replace", "HEAD", stampedCommit);
   expect(checkStamp(repo, "x")).toEqual(["stale: tree changed"]);
+});
+
+test("a feature whose branch isn't checked out is judged on its branch's tip, as a unit is", () => {
+  approvedFeature("big");
+  const home = git(repo, "symbolic-ref", "--short", "HEAD");
+  git(repo, "switch", "-q", "-c", "feature/x");
+  setStamp(repo, "x", VERDICT_PATH, "2026-10-23");
+  updateFeature(repo, "x", (rec) => ({ ...rec, branch: { name: "feature/x", parent: home, base: git(repo, "rev-parse", "HEAD") } }));
+  git(repo, "switch", "-q", home);
+  commitFiles({ "other.txt": "elsewhere\n" });
+  write("untracked.txt", "dirty\n");
+  expect(checkStamp(repo, "x")).toEqual([]);
+  git(repo, "branch", "-q", "-D", "feature/x");
+  expect(checkStamp(repo, "x")).toEqual(["stale: branch feature/x is gone"]);
+});
+
+test("a feature's carry refuses while its branch isn't checked out, naming it", () => {
+  approvedFeature("big");
+  const home = git(repo, "symbolic-ref", "--short", "HEAD");
+  git(repo, "switch", "-q", "-c", "feature/x");
+  setStamp(repo, "x", VERDICT_PATH, "2026-10-23");
+  updateFeature(repo, "x", (rec) => ({ ...rec, branch: { name: "feature/x", parent: home, base: git(repo, "rev-parse", "HEAD") } }));
+  commitFiles({ [`${DIR}/changes.md`]: "one\n" });
+  git(repo, "switch", "-q", home);
+  expect(refusal(() => carryStamp(repo, "x"))).toEqual(["x's branch feature/x is not checked out; check it out first"]);
+});
+
+test.each(["CLAUDE.md", "AGENTS.md", "src/CLAUDE.md", "packages/api/AGENTS.md"])("carry moves the stamp over a change to %s, the agent's instructions", (path) => {
+  approvedFeature("big");
+  setStamp(repo, "x", VERDICT_PATH, "2026-10-23");
+  commitFiles({ [path]: "a note for the agent\n" });
+  expect(carryStamp(repo, "x")?.paths).toEqual([path]);
+  expect(checkStamp(repo, "x")).toEqual([]);
+});
+
+test.each(["CLAUDE.mdx", "src/claude.md", "docs/AGENTS.md.bak", "src/.claudeignore", ".claude/settings.json", ".claude/rules/testing.md"])("carry refuses %s, which isn't an agent instructions file", (path) => {
+  approvedFeature("big");
+  setStamp(repo, "x", VERDICT_PATH, "2026-10-23");
+  commitFiles({ [path]: "x\n" });
+  expect(refusal(() => carryStamp(repo, "x"))).toEqual([`${path} changed: outside the feature's documents (${DIR}/)`]);
+});
+
+test("carry refuses an executable or a symlink named CLAUDE.md or AGENTS.md", () => {
+  approvedFeature("big");
+  setStamp(repo, "x", VERDICT_PATH, "2026-10-23");
+  write("AGENTS.md", "#!/bin/sh\n");
+  chmodSync(join(repo, "AGENTS.md"), 0o755);
+  symlinkSync("README.md", join(repo, "CLAUDE.md"));
+  commitAll("odd instructions");
+  expect(refusal(() => carryStamp(repo, "x"))).toEqual(["AGENTS.md changed: an executable", "CLAUDE.md changed: a symlink"]);
+});
+
+test("carry refuses an instructions change that a symlink elsewhere makes product content, but not CLAUDE.md linked to AGENTS.md", () => {
+  approvedFeature("big");
+  commitFiles({ "AGENTS.md": "one\n" });
+  symlinkSync("AGENTS.md", join(repo, "CLAUDE.md"));
+  commitAll("link the instructions");
+  setStamp(repo, "x", VERDICT_PATH, "2026-10-23");
+  commitFiles({ "AGENTS.md": "two\n" });
+  expect(carryStamp(repo, "x")?.paths).toEqual(["AGENTS.md"]);
+  mkdirSync(join(repo, "src"));
+  symlinkSync("../AGENTS.md", join(repo, "src/prompt.md"));
+  commitAll("the product reads the instructions");
+  setStamp(repo, "x", VERDICT_PATH, "2026-10-24");
+  commitFiles({ "AGENTS.md": "three\n" });
+  expect(refusal(() => carryStamp(repo, "x"))).toEqual(["src/prompt.md is a symlink to AGENTS.md, which changed: content outside the agent's instructions can depend on it"]);
+});
+
+test("a detached HEAD, such as a stopped rebase, is judged on itself, not on the record's branch", () => {
+  approvedFeature("big");
+  git(repo, "switch", "-q", "-c", "feature/x");
+  setStamp(repo, "x", VERDICT_PATH, "2026-10-23");
+  updateFeature(repo, "x", (rec) => ({ ...rec, branch: { name: "feature/x", parent: "main", base: git(repo, "rev-parse", "HEAD") } }));
+  git(repo, "switch", "-q", "--detach");
+  expect(checkStamp(repo, "x")).toEqual([]);
+  commitFiles({ "src.txt": "half a rebase\n" });
+  expect(checkStamp(repo, "x")).toEqual(["stale: tree changed"]);
+});
+
+const STACK_SPEC = `${PASSING_SPEC}## Acceptance criteria\n- [ ] A member sees the booking time\n- [ ] (rollout) The host gets a reminder from production\n`;
+const U1 = "### U1: Booking time\n- Covers: AC1\n- Depends on: none\n";
+const U2 = "### U2: Reminders\n- Covers: AC2\n- Depends on: U1\n";
+const stackDesign = (u1 = U1, u2 = U2) => `${PASSING_SPEC}## Work units\n${u1}\n${u2}\n## Risks\nNone\n`;
+
+/** Units x-api (U1) and x-ui (U2) of the approved big feature x, whose spec has two criteria, the second for after the deploy; x-api stamped. */
+function stampedStackUnit(): void {
+  initFeature(repo, "x", "big", "2026-10-21");
+  write(`${DIR}/spec.md`, STACK_SPEC);
+  write(`${DIR}/design.md`, stackDesign());
+  approve(repo, "x", "spec", "spec ok", "2026-10-21");
+  approve(repo, "x", "design", "design ok", "2026-10-21");
+  initUnit(repo, "x-api", "x");
+  initUnit(repo, "x-ui", "x");
+  write(UNIT_VERDICT_PATH, VERDICT);
+  write(`${DIR}/units/x-ui/verdict.md`, VERDICT);
+  commitAll("unit work");
+  setStamp(repo, "x-api", UNIT_VERDICT_PATH, "2026-10-23");
+}
+
+/** Amend the feature's documents, approve them again and commit. */
+function amend(files: { spec?: string; design?: string }): void {
+  if (files.spec !== undefined) write(`${DIR}/spec.md`, files.spec);
+  if (files.design !== undefined) write(`${DIR}/design.md`, files.design);
+  if (files.spec !== undefined) approve(repo, "x", "spec", "spec ok", "2026-10-24");
+  approve(repo, "x", "design", "design ok", "2026-10-24");
+  commitAll("amend");
+}
+
+test("a unit's stamp carries over a design amendment outside its own unit's section", () => {
+  stampedStackUnit();
+  amend({ design: stackDesign(U1, `${U2}- Ships: reminders by email too\n`).replace("## Risks\nNone", "## Risks\n- Email can bounce") });
+  expect(checkStamp(repo, "x-api")).toEqual(["stale: tree changed"]);
+  expect(carryStamp(repo, "x-api")?.paths).toEqual([`${DIR}/design.md`]);
+  expect(checkStamp(repo, "x-api")).toEqual([]);
+});
+
+test("a unit's carry refuses a design amendment to its own unit's section", () => {
+  stampedStackUnit();
+  amend({ design: stackDesign(`${U1}- Ships: the time in the member's zone\n`) });
+  expect(refusal(() => carryStamp(repo, "x-api"))).toEqual([`${DIR}/design.md changed: it changes U1's section of the design, which verify reads`]);
+});
+
+test("a unit's stamp carries over a spec amendment to criteria it doesn't cover, but not to one it covers", () => {
+  stampedStackUnit();
+  amend({ spec: STACK_SPEC.replace("a reminder from production", "a reminder from production a day before") });
+  expect(carryStamp(repo, "x-api")?.paths).toEqual([`${DIR}/spec.md`]);
+  amend({ spec: STACK_SPEC.replace("A member sees the booking time", "A member sees the booking time and place") });
+  expect(refusal(() => carryStamp(repo, "x-api"))).toEqual([`${DIR}/spec.md changed: it changes AC1, which U1 covers`]);
+});
+
+test("a unit's carry refuses a spec amendment that inserts a criterion before the ones it covers", () => {
+  stampedStackUnit();
+  amend({ spec: STACK_SPEC.replace("- [ ] A member", "- [ ] The owner can turn reminders off\n- [ ] A member"), design: stackDesign(U1, U2.replace("AC2", "AC2, AC3")) });
+  expect(refusal(() => carryStamp(repo, "x-api"))).toEqual([`${DIR}/spec.md changed: it changes AC1, which U1 covers`]);
+});
+
+test("a unit's carry refuses a change inside a fence or a comment in its own section", () => {
+  stampedStackUnit();
+  const fenced = (field: string) => stackDesign(`${U1}\n\`\`\`ts\ninterface Booking { ${field}: string }\n\`\`\`\n`);
+  amend({ design: fenced("at") });
+  setStamp(repo, "x-api", UNIT_VERDICT_PATH, "2026-10-24");
+  amend({ design: fenced("startsAt") });
+  expect(refusal(() => carryStamp(repo, "x-api"))).toEqual([`${DIR}/design.md changed: it changes U1's section of the design, which verify reads`]);
+});
+
+test("a unit's carry refuses a renamed or renumbered unit heading", () => {
+  stampedStackUnit();
+  amend({ design: stackDesign(U1.replace("Booking time", "Booking times")) });
+  expect(refusal(() => carryStamp(repo, "x-api"))).toEqual([`${DIR}/design.md changed: it changes U1's section of the design, which verify reads`]);
+});
+
+test("a unit's carry refuses a change to a line under a criterion it covers", () => {
+  stampedStackUnit();
+  amend({ spec: STACK_SPEC.replace("booking time\n", "booking time\n  - in their own zone\n") });
+  expect(refusal(() => carryStamp(repo, "x-api"))).toEqual([`${DIR}/spec.md changed: it changes AC1, which U1 covers`]);
+});
+
+test("set records the rollout criteria a feature's spec marks, with their text, on the record", () => {
+  initFeature(repo, "x", "mid", "2026-10-21");
+  write(`${DIR}/spec.md`, STACK_SPEC);
+  approve(repo, "x", "spec", "spec ok", "2026-10-21");
+  write(VERDICT_PATH, VERDICT);
+  commitAll();
+  expect(setStamp(repo, "x", VERDICT_PATH, "2026-10-23").rollout).toEqual([{ ac: 2, text: "The host gets a reminder from production" }]);
+});
+
+test("set records only the rollout criteria a unit covers, and none when it covers none", () => {
+  stampedStackUnit();
+  expect(readFeature(repo, "x-api").rollout).toBeUndefined();
+  expect(setStamp(repo, "x-ui", `${DIR}/units/x-ui/verdict.md`, "2026-10-23").rollout).toEqual([{ ac: 2, text: "The host gets a reminder from production" }]);
+});
+
+test("the rollout list outlives a later approval, and a new stamp keeps the outcomes of criteria whose text held", () => {
+  initFeature(repo, "x", "mid", "2026-10-21");
+  write(`${DIR}/spec.md`, STACK_SPEC);
+  approve(repo, "x", "spec", "spec ok", "2026-10-21");
+  write(VERDICT_PATH, VERDICT);
+  commitAll();
+  setStamp(repo, "x", VERDICT_PATH, "2026-10-23");
+  recordRollout(repo, "x", "AC2", "pass", "2026-10-25");
+  approve(repo, "x", "spec", "again", "2026-10-26");
+  expect(readFeature(repo, "x").stamp).toBeUndefined();
+  expect(recordRollout(repo, "x", "AC2", "fail", "2026-10-27", "late").rollout).toEqual([{ ac: 2, text: "The host gets a reminder from production", outcome: "fail", at: "2026-10-27", note: "late" }]);
+  expect(setStamp(repo, "x", VERDICT_PATH, "2026-10-28").rollout).toEqual([{ ac: 2, text: "The host gets a reminder from production", outcome: "fail", at: "2026-10-27", note: "late" }]);
+  write(`${DIR}/spec.md`, STACK_SPEC.replace("from production", "from production, in every region"));
+  approve(repo, "x", "spec", "reworded", "2026-10-29");
+  commitAll("reword");
+  expect(setStamp(repo, "x", VERDICT_PATH, "2026-10-29").rollout).toEqual([{ ac: 2, text: "The host gets a reminder from production, in every region" }]);
 });

@@ -86,10 +86,12 @@ Every feature lives on its own branch from the moment it has a record, so no sta
 
 Verify writes `verdict.md` and, on a pass, `fbs stamp set` binds it to `HEAD^{tree}`.
 
-- A commit reorder keeps the stamp, since the tree is the same. Any code edit, or any uncommitted file, makes it stale.
-- A change to documents verify doesn't read (a change-log entry, a walkthrough note, another unit's verdict) is carried over with `fbs stamp carry`, without running anything again. The spec, design, plan, bug report, afk files and the verdict itself are never carried.
+- A commit reorder keeps the stamp, since the tree is the same. Any code edit, or any uncommitted file, makes it stale. When another branch is checked out, `fbs stamp check` judges the feature branch's tip, not the checkout; a detached HEAD (a stopped rebase) is judged as it is.
+- A change to documents verify doesn't read (a change-log entry, a walkthrough note, another unit's verdict) or to the agent's instructions (a plain file named `CLAUDE.md` or `AGENTS.md`, unless a symlink elsewhere makes it product content) is carried over with `fbs stamp carry`, without running anything again. The spec, design, plan, bug report, afk files and the verdict itself are never carried, with one exception for work units (below).
 - `open-pr` refuses without a current stamp. `fbs land` refuses unless the PR's head carries exactly the stamped tree.
 - Evidence counts only when it comes from the stamped tree: a green test whose assertions check the criterion, or validate's browser evidence recorded against that tree.
+- **The suite** is the project's test and type-check commands, or `verify.suite` in `.fbs/config.json` when a full local run is too heavy (a scoped or worker-capped command). With `verify.ciEvidence` on and the PR open, green runs of the `verify.ciWorkflows` workflows on the exact head commit stand in for the local run: `fbs ci evidence` checks them, and the verdict cites the commit and each run's URL. Before the PR exists, or when CI runs only on pull requests, the suite runs locally. Otherwise a CI run is never the suite's evidence.
+- **Rollout criteria.** Some criteria can only be shown after a deploy (a copy between environments working, a client deploying through it). Marked `- [ ] (rollout) <criterion>` in the spec, such a criterion needs no evidence to pass: the verdict lists it under `## Rollout` as checked after the deploy, `fbs stamp set` records it on the feature's record (where a later approval doesn't erase it), and the PR description lists it. A criterion becomes one only through an approved change that says why only a deploy can show it, never because evidence is missing. After the merge, the agent asks you to check each one and records your answer with `fbs status rollout <slug> AC<n> pass|fail`; a failed one is offered as a follow-up fix.
 
 ## Changes after approval
 
@@ -111,6 +113,8 @@ A big feature can ship as several PRs, so each review stays small. Architect spl
 - After the design approval, each unit gets its own record (`fbs status init <unit> --unit-of <feature>`), so it gets its own branch, plan, stamp and PR. It goes by the feature's spec, design and approvals.
 
 Units are built bottom-up, each branch on top of the one below. `fbs stack sync` keeps the stack whole: it merges each unit's latest work forward into the units above, records a PR merged outside fbs, and stops at the first conflict. A fix found in review goes to the unit that owns the code, then is merged up the stack.
+
+Units share the feature's spec and design, so an amendment aimed at one unit doesn't make the others verify again: a unit's stamp carries over a design change outside its own `### U<n>` section, and a spec change that leaves the criteria it covers as they were. The amendment still needs its approval.
 
 Only the lowest unit can land, since only it is based on the default branch. After it lands, `fbs land` rebases the unit above onto the default branch, force-pushes it once with a lease from inside the CLI, and retargets its PR, so the next PR lists only its own commits. When replaying a unit's commits conflicts across the merges that brought the unit below in, the restack folds the unit's own change into one commit on its new base instead, and says so; only when that conflicts too does it stop. When a rebase changes a unit's tree, its stamp no longer holds and it is verified again. A feature cut from a branch made outside fbs is restacked the same way once `fbs stack sync` finds that branch's PR merged and the branch deleted on origin; while the branch still exists, as a long-lived `develop` does, sync only says so.
 
@@ -170,6 +174,9 @@ When git ignores the features folder, the documents stay local: fbs reads them f
 | `tracker` | unset | `{"kind": "linear", "team": "<key>"}`, `{"kind": "github"}` or `{"kind": "none"}` |
 | `camp.autoFixRounds` | `2` | Review rounds camp-pr fixes on its own before it checks in with you |
 | `branches.types` | any type | The only branch types `fbs branch` creates, such as `["feat", "fix", "chore"]` when CI requires branch names to start with a Conventional Commit type |
+| `verify.suite` | unset | The one command implement and verify run as the suite, in place of the test and type-check commands: a scoped or worker-capped run for a repo too large to run in full locally |
+| `verify.ciEvidence` | `false` | When `true`, once the PR exists, green runs of `verify.ciWorkflows` on the exact head commit count as verify's suite evidence instead of a local run |
+| `verify.ciWorkflows` | unset | The workflow names whose runs count; required when `verify.ciEvidence` is `true` |
 | `afk.migrations`, `afk.infra`, `afk.checkConfig` | built-in globs | Extra globs for autopilot's migration, infra and check-config flags |
 | `afk.deny` | none | Extra commands the guard denies during an autopilot run (deploy CLIs, say) |
 

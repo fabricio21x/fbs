@@ -9,6 +9,9 @@
 ## Evidence
 <!-- From verdict.md: each acceptance criterion and what proves it (a test, or validate evidence). The suite's summary line. -->
 
+## After the deploy
+<!-- Only when `fbs status show` lists rollout criteria: each one (`AC<n>` and its text), which can only be shown once this is deployed and is checked after the merge. Otherwise remove this section. -->
+
 ## Risks and rollout
 <!-- The design's main risks in one line each, and how it reaches users. Say whether it's a one-way door (a migration, data written, an outside system changed) or a two-way door (revertable by reverting this PR). -->
 

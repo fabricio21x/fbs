@@ -95,3 +95,28 @@ test.each(['{"camp":[]}', '{"camp":{"autoFixRounds":0}}', '{"camp":{"autoFixRoun
     expect(() => loadConfig(repoWithConfig(content))).toThrow("camp");
   },
 );
+
+test("verify.suite and verify.ciEvidence are kept, and ciEvidence defaults to off", () => {
+  expect(loadConfig(repoWithConfig('{"verify":{"suite":"pnpm test --filter api","ciEvidence":true,"ciWorkflows":["CI"]}}')).verify).toEqual({ suite: "pnpm test --filter api", ciEvidence: true, ciWorkflows: ["CI"] });
+  expect(loadConfig(repoWithConfig('{"verify":{"suite":"bun test --max-concurrency 2"}}')).verify).toEqual({ suite: "bun test --max-concurrency 2", ciEvidence: false });
+  expect(loadConfig(repoWithConfig("{}")).verify).toBeUndefined();
+});
+
+test.each([
+  '{"verify":[]}',
+  '{"verify":{"suite":""}}',
+  '{"verify":{"suite":"  "}}',
+  '{"verify":{"suite":3}}',
+  '{"verify":{"ciEvidence":"true"}}',
+  '{"verify":{"ciEvidence":1}}',
+  '{"verify":{"ciEvidence":true}}',
+  '{"verify":{"ciEvidence":true,"ciWorkflows":[]}}',
+  '{"verify":{"ciEvidence":true,"ciWorkflows":"CI"}}',
+  '{"verify":{"ciEvidence":true,"ciWorkflows":["CI"," "]}}',
+  '{"verify":{"ciEvidence":true,"ciWorkflows":["CI","CI"]}}',
+])(
+  "verify config %s is a ConfigError",
+  (content) => {
+    expect(() => loadConfig(repoWithConfig(content))).toThrow("verify");
+  },
+);

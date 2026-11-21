@@ -19,18 +19,20 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 |---|---|
 | `status init <slug> --size tiny\|bug\|mid\|big` | Creates the feature's record and its documents folder |
 | `status init <unit> --unit-of <feature> [--unit <n>]` | Records a work unit of a big feature whose design approval is current; its folder is `<feature dir>/units/<unit>` |
-| `status show <slug>` | The record as JSON: size, folder, documents mode, branch, approvals and stamp (each with `current`), PR, ticket; a feature lists its units, a unit its `covers` and `dependsOn` |
+| `status show <slug>` | The record as JSON: size, folder, documents mode, branch, approvals and stamp (each with `current`), PR, ticket, rollout criteria with their outcomes, and `pendingRollout` for the ones still waiting (a feature's own and its units'); a feature lists its units, a unit its `covers` and `dependsOn` |
 | `status list` | One line per feature: slug, size, stage |
 | `status gate <slug> spec\|design` | The gate: facts sourced, assumptions accepted, no open questions, every section present; a design's work units checked against the spec |
 | `status approve <slug> spec\|design --quote '<words>'` | Records your approval verbatim, bound to the document's sha256; runs the gate first |
 | `status approve <slug> design --auto '<reason>'` | Records the agent's approval of a simple design amendment; refused for a spec |
 | `status pr <slug> <number\|url\|none>` | Records the feature's PR, or clears it |
 | `status ticket <slug> <id\|none> [--url <url>]` | Records the tracker issue the feature works on |
+| `status rollout <slug> AC<n> pass\|fail [--note <text>]` | Records how a rollout criterion the record lists turned out after the deploy, beside its text; a later outcome replaces an earlier one, and a later approval doesn't erase the list |
 
-### Project context and tracker
+### Project context, settings and tracker
 
 | Command | What it does |
 |---|---|
+| `config show` | `.fbs/config.json` as one JSON line, validated, with the defaults filled in |
 | `context check [--json]` | Checks `.fbs/context.md`: the size limit, that every fact is dated, which facts are stale |
 | `tracker show` | The tracker from `.fbs/config.json` as one JSON line, or `unset` |
 | `tracker detect` | Evidence for setting it: ticket prefixes in branch names, tracker links in recent merged PR bodies, issue count. Reads only |
@@ -52,9 +54,10 @@ For `branch --types`, `test/`, `docs/`, `build/` and `style/` branches count as 
 
 | Command | What it does |
 |---|---|
-| `stamp set <slug> --verdict <path>` | Binds a passing verdict to `HEAD^{tree}` |
-| `stamp check <slug>` | `ok`, or why not: stale, dirty, missing |
-| `stamp carry <slug>` | Moves the stamp onto the current tree when only plain documents verify doesn't read changed since it was set; keeps the tree verify ran on |
+| `stamp set <slug> --verdict <path>` | Binds a passing verdict to `HEAD^{tree}`, and records the spec's rollout criteria on the record, with their text (a unit: the ones it covers) |
+| `stamp check <slug>` | `ok`, or why not: stale, dirty, missing. A record whose branch isn't the one checked out is judged on its branch's tip; a detached HEAD on itself |
+| `ci evidence <slug> [--wait]` | Whether CI stands in for the local suite: the newest run of each `verify.ciWorkflows` workflow on HEAD's exact commit, once the PR exists. Prints the commit, the tree and each run's URL; exit 0 only when every one succeeded. `--wait` polls until none is running |
+| `stamp carry <slug>` | Moves the stamp onto the current tree when only plain documents verify doesn't read, or a plain file named exactly `CLAUDE.md` or `AGENTS.md` that no other symlink reaches, changed since it was set; for a unit, also a feature spec or design change outside what the unit is verified on. Keeps the tree verify ran on |
 
 ### Pull requests
 

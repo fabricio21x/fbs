@@ -46,3 +46,5 @@ When they say it's merged (or their `!` command's output shows it), run `fbs sta
 ## 3. After
 
 When the feature's last (or only) PR merged, the camp is over: the watcher, if one is still running, exits on its own. Say so in one line. A unit with more above it: camp keeps working the stack.
+
+**Rollout criteria.** When `fbs status show <feature slug>` lists `pendingRollout` (its own, or its units', each with its `slug`), ask the user once, in plain text, to check each one when the deploy is out: its `AC<n>` and text. Record each answer with `fbs status rollout <its slug> AC<n> pass`, or `fail --note '<what they saw>'`. Offer a failed one as a follow-up fix (a bug, through tdd); never start it unasked.

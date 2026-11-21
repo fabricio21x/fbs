@@ -545,7 +545,7 @@ test("stamp carry prints ok when nothing changed, then carried with the trees an
   git(repo, "commit", "-q", "-m", "docs");
   expect(stamp(repo, "check", "x")).toEqual({ code: 1, out: ["stale: tree changed"], err: [] });
   const paths = "docs/features/2026-10-21-x/changes.md, docs/features/2026-10-21-x/notes.md";
-  expect(stamp(repo, "carry", "x")).toEqual({ code: 0, out: [`carried: ${stamped.slice(0, 12)} -> ${headTreeOf(repo).slice(0, 12)}; only documents changed: ${paths}`], err: [] });
+  expect(stamp(repo, "carry", "x")).toEqual({ code: 0, out: [`carried: ${stamped.slice(0, 12)} -> ${headTreeOf(repo).slice(0, 12)}; nothing verify reads changed: ${paths}`], err: [] });
   expect(stamp(repo, "check", "x")).toEqual({ code: 0, out: ["ok"], err: [] });
   expect(JSON.parse(readFileSync(join(repo, RECORDS, "x.json"), "utf8")).stamp.verifiedTree).toBe(stamped);
 });
@@ -708,6 +708,84 @@ test("the help lists the stamp commands", () => {
   expect(out.join("\n")).toContain("stamp set <slug> --verdict <repo-relative path>");
   expect(out.join("\n")).toContain("stamp check <slug>");
   expect(out.join("\n")).toContain("stamp carry <slug>");
+});
+
+test("status rollout records a rollout criterion's outcome after the deploy, and show prints the criteria, their outcomes and what still waits", () => {
+  const repo = featureRepo(`${PASSING_SPEC}## Acceptance criteria\n- [ ] A member subscribes\n- [ ] (rollout) The plan shows in production\n- [ ] (rollout) Clients deploy through it\n`);
+  expect(status(repo, "approve", "x", "spec", "--quote", "ship it").code).toBe(0);
+  writeFileSync(join(repo, VERDICT_PATH), "## Criteria\n- [x] A member subscribes\n## Rollout\n- [ ] The plan shows in production — checked after the deploy\nVerdict: pass\n");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-q", "-m", "work");
+  expect(stamp(repo, "set", "x", "--verdict", VERDICT_PATH).code).toBe(0);
+  const r = status(repo, "rollout", "x", "AC2", "fail", "--note", "the plan is missing for EU clients");
+  expect(r.code).toBe(0);
+  const failed = { ac: 2, text: "The plan shows in production", outcome: "fail", at: "2026-10-21", note: "the plan is missing for EU clients" };
+  expect(JSON.parse(r.out.join("\n")).rollout).toEqual([failed, { ac: 3, text: "Clients deploy through it" }]);
+  const shown = JSON.parse(status(repo, "show", "x").out.join("\n"));
+  expect(shown.rollout).toEqual([failed, { ac: 3, text: "Clients deploy through it" }]);
+  expect(shown.pendingRollout).toEqual([{ slug: "x", ac: 3, text: "Clients deploy through it" }]);
+  expect(status(repo, "rollout", "x", "AC1", "pass")).toEqual({ code: 1, out: ["error: bad-rollout: AC1 isn't a rollout criterion of x: AC2, AC3"], err: [] });
+  expect(status(repo, "rollout", "x", "AC2").code).toBe(2);
+  expect(status(repo, "rollout", "x", "AC2", "pass", "--quote", "q").code).toBe(2);
+});
+
+test("status show on a stacked feature gathers its units' rollout criteria that still wait", () => {
+  const repo = gitRepo();
+  git(repo, "commit", "-q", "--allow-empty", "-m", "init");
+  expect(status(repo, "init", "f", "--size", "big").code).toBe(0);
+  const unit = (slug: string, n: number, rollout: object[]) => ({ slug, dir: `docs/features/2026-10-21-f/units/${slug}`, size: "big", approvals: {}, pr: null, unitOf: "f", unit: n, rollout });
+  writeRecordFile(repo, "f-api.json", JSON.stringify(unit("f-api", 1, [{ ac: 2, text: "A copy works between environments" }])));
+  writeRecordFile(repo, "f-ui.json", JSON.stringify(unit("f-ui", 2, [{ ac: 3, text: "Clients deploy through it", outcome: "pass", at: "2026-10-25" }])));
+  const shown = JSON.parse(status(repo, "show", "f").out.join("\n"));
+  expect(shown.pendingRollout).toEqual([{ slug: "f-api", ac: 2, text: "A copy works between environments" }]);
+  expect("pendingRollout" in JSON.parse(status(repo, "show", "f-ui").out.join("\n"))).toBe(false);
+});
+
+function ci(cwd: string, deps: PrDeps, ...args: string[]) {
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = run(["ci", ...args], io(out, err, cwd), deps);
+  return { code, out, err };
+}
+
+test("ci evidence prints the runs as one JSON line, exit 0 only for evidence, and a refusal as a refused line", () => {
+  const repo = gitRepo({ ".fbs/config.json": '{"verify": {"ciEvidence": true, "ciWorkflows": ["CI"]}}', ".gitignore": ".fbs/\n" });
+  git(repo, "add", ".gitignore");
+  git(repo, "commit", "-q", "-m", "init");
+  git(repo, "switch", "-q", "-c", "feature/x");
+  expect(status(repo, "init", "x", "--size", "mid").code).toBe(0);
+  const sha = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repo, env: isolatedGitEnv() }).stdout.toString().trim();
+  const record = JSON.parse(readFileSync(join(repo, RECORDS, "x.json"), "utf8"));
+  writeRecordFile(repo, "x.json", JSON.stringify({ ...record, pr: 7, repo: "acme/app", branch: { name: "feature/x", parent: "main", base: sha } }));
+  const runs = (conclusion: string) => ({ "repos/acme/app/actions/runs": { stdout: JSON.stringify({ workflow_runs: [{ id: 1, name: "CI", head_sha: sha, status: "completed", conclusion, html_url: "https://github.com/acme/app/actions/runs/1", created_at: "2026-10-21T10:00:00Z" }] }) } });
+  const green = ci(repo, prDeps(runs("success")).deps, "evidence", "x");
+  expect(green.code).toBe(0);
+  expect(green.out).toHaveLength(1);
+  expect(JSON.parse(green.out[0])).toEqual({ sha, tree: headTreeOf(repo), verdict: "evidence", runs: [{ workflow: "CI", state: "success", url: "https://github.com/acme/app/actions/runs/1" }] });
+  const red = ci(repo, prDeps(runs("failure")).deps, "evidence", "x");
+  expect(red.code).toBe(1);
+  expect(JSON.parse(red.out[0]).verdict).toBe("refused");
+  git(repo, "switch", "-q", "-");
+  expect(ci(repo, prDeps(runs("success")).deps, "evidence", "x")).toEqual({ code: 1, out: ["refused: x's branch feature/x is not checked out; check it out first"], err: [] });
+  expect(ci(repo, prDeps({}).deps, "evidence").code).toBe(2);
+  expect(ci(repo, prDeps({}).deps, "evidence", "x", "--now").code).toBe(2);
+});
+
+function config(cwd: string, ...args: string[]) {
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = run(["config", ...args], io(out, err, cwd));
+  return { code, out, err };
+}
+
+test("config show prints the validated config as one JSON line, defaults filled in", () => {
+  const repo = gitRepo({ ".fbs/config.json": '{"verify": {"suite": "pnpm test --filter api -- --maxWorkers=2", "ciEvidence": true, "ciWorkflows": ["CI"]}}' });
+  const r = config(repo, "show");
+  expect(r.code).toBe(0);
+  expect(r.out).toHaveLength(1);
+  expect(JSON.parse(r.out[0])).toEqual({ featuresDir: "docs/features", context: { maxFacts: 25, staleDays: 30 }, verify: { suite: "pnpm test --filter api -- --maxWorkers=2", ciEvidence: true, ciWorkflows: ["CI"] } });
+  expect(config(repo, "show", "x").code).toBe(2);
+  expectEnvironmentError(config(gitRepo({ ".fbs/config.json": '{"verify": {"ciEvidence": "yes"}}' }), "show"), "verify.ciEvidence must be true or false");
 });
 
 test("the help lists the branch types", () => {

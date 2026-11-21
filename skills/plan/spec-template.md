@@ -19,7 +19,7 @@
 <!-- What this feature deliberately leaves out, each with a one-line reason. -->
 
 ## Acceptance criteria
-<!-- One `- [ ] <criterion>` line each; every criterion is checkable by a test or a person. -->
+<!-- One `- [ ] <criterion>` line each; every criterion is checkable by a test or a person. One that can only be shown after a deploy starts with `(rollout)`: `- [ ] (rollout) <criterion>`; verify passes without its evidence and it is checked after the merge. -->
 
 ## Facts
 <!-- One line per confirmed fact: `- <fact> (<source>)`, the source being `CLAUDE.md`, `.fbs/context.md`, another file path (optionally `:line`), a URL, or `user, <YYYY-MM-DD>`, with nothing after the closing parenthesis and no parentheses inside it; no checkbox, no nesting; `None` when there are none. -->

@@ -6,6 +6,7 @@ import { preflight } from "./afk-preflight";
 import { askCheck } from "./ask-check";
 import { BranchRefusedError, branchTypes, enterFeatureBranch, pushFeatureBranch } from "./branch";
 import { addFollowup, CampError, COUNTS, type Counts, closeFollowup, recordCheckpoint, recordRound, showCamp, startCamp, stopCamp } from "./camp";
+import { CiRefusedError, ciEvidence } from "./ci";
 import { CommitsRefusedError, commitProblems, isConventionalSubject } from "./commits";
 import { ConfigError, projectConfig } from "./config";
 import { checkContext } from "./context";
@@ -43,6 +44,7 @@ import {
   plannedUnit,
   readFeature,
   RecordError,
+  recordRollout,
   setPr,
   setTicket,
   StatusError,
@@ -88,8 +90,21 @@ const USAGE = [
   "  status approve <slug> <spec|design> --quote <the user's words>",
   "  status approve <slug> design --auto <why the agent may approve it>",
   "  status pr <slug> <number|url|none>",
+  "  status rollout <slug> AC<n> <pass|fail> [--note <text>]",
+  "                            record how a rollout criterion turned out after the deploy: one the record lists in rollout",
+  "                            (a spec criterion marked (rollout), which verify passes without evidence), kept beside its",
+  "                            text; a later outcome replaces an earlier one; status show prints rollout, and pendingRollout",
+  "                            for the ones still waiting (a feature's own and its units', each with its slug)",
   "  status ticket <slug> <id|none> [--url <https url>]",
   "                            record the tracker issue the feature works on (ACM-123, or an issue number), or clear it",
+  "  config show               print .fbs/config.json as one JSON line, validated and with the defaults filled in",
+  "  ci evidence <slug> [--wait]",
+  "                            whether CI stands in for verify's local suite: needs verify.ciEvidence, the feature's branch",
+  "                            checked out and its PR open; reads the runs on HEAD's exact commit through gh and takes the",
+  "                            newest of each workflow verify.ciWorkflows names: success, running, skipped, failed or missing;",
+  "                            prints {sha,tree,verdict,runs:[{workflow,state,url?,conclusion?}]}, verdict evidence (exit 0)",
+  "                            when every one succeeded, wait (exit 1) while one runs, else refused (exit 1); --wait polls",
+  "                            every 30s until none runs or is missing, for up to an hour; refused: <reason> otherwise",
   "  tracker show              print .fbs/config.json's tracker as one JSON line, or unset",
   "  tracker detect            print the evidence for a tracker setting as one JSON line: the config, ticket-id prefixes",
   "                            in branch names, tracker links in the last 30 merged PR bodies and the issue count (each",
@@ -119,14 +134,22 @@ const USAGE = [
   "                            before a PR it overwrites only what fbs pushed last, after one it only adds commits;",
   "                            never main, master or origin's default branch; skipped without an origin remote",
   "  stamp set <slug> --verdict <repo-relative path>",
-  "  stamp check <slug>        a unit whose branch isn't checked out is judged on its branch's tip, local else origin's",
+  "                            records on the record's rollout the spec's criteria marked (rollout) (a unit: the ones it",
+  "                            covers) with their text, which verify passes without evidence, to be checked after the",
+  "                            deploy; an outcome already recorded for a criterion whose text held is kept",
+  "  stamp check <slug>        a record whose branch isn't the one checked out is judged on its branch's tip, local else",
+  "                            origin's; a detached HEAD (a stopped rebase) is judged on itself",
   "  stamp carry <slug>        move the stamp onto HEAD's tree without verifying again, when every path changed since the",
   "                            stamped tree is a plain, non-executable .md or .html file in the feature's documents",
   "                            folder, none named afk*, spec.md, design.md, bug.md or plan.md (any case) or the stamp's",
-  "                            verdict, and no symlink in the tree points into that folder; keeps verifiedTree, the tree",
-  "                            verify ran on; refused on uncommitted changes, an approval that isn't current, a changed",
-  "                            local verdict, and for a unit whose branch isn't checked out; prints ok when the stamp",
-  "                            already covers HEAD, else carried: <old tree> -> <new tree>; only documents changed: <paths>",
+  "                            verdict, and no symlink in the tree points into that folder; or a plain file named exactly",
+  "                            CLAUDE.md or AGENTS.md at any depth, no other symlink reaching it; for a unit, also the",
+  "                            feature's design.md when the unit's own ### U<n> section is unchanged as written, and its",
+  "                            spec.md when the criteria that section covers are unchanged, the lines under each included;",
+  "                            keeps verifiedTree, the tree verify ran on; refused on",
+  "                            uncommitted changes, an approval that isn't current, a changed local verdict, and while the",
+  "                            record's branch isn't checked out; prints ok when the stamp already covers HEAD, else",
+  "                            carried: <old tree> -> <new tree>; nothing verify reads changed: <paths>",
   "  commits check <slug>      list each non-merge commit on the feature's branch since its base, leaving out the parent",
   "                            branch's, whose subject isn't a conventional commit or whose message breaks commitlint",
   "                            config-conventional's rules (header and lines of 100 characters at most, no spaces around",
@@ -295,6 +318,8 @@ export function run(argv: string[], io: Io, deps: PrDeps = REAL_PR_DEPS, afkDeps
     if (command === "context") return runContext(rest, io);
     if (command === "status") return runStatus(rest, io, deps);
     if (command === "tracker") return runTracker(rest, io, deps);
+    if (command === "config") return runConfig(rest, io);
+    if (command === "ci") return runCi(rest, io, deps);
     if (command === "stamp") return runStamp(rest, io);
     if (command === "branch") return runBranch(rest, io);
     if (command === "push") return runPush(rest, io);
@@ -409,7 +434,8 @@ function dispatchStatus(args: string[], io: Io, deps: PrDeps): number {
     } else return usage();
     return 0;
   }
-  const parsed = parseFlags(rest, subcommand === "approve" ? ["--quote", "--auto"] : subcommand === "ticket" ? ["--url"] : []);
+  const valued: Record<string, string[]> = { approve: ["--quote", "--auto"], ticket: ["--url"], rollout: ["--note"] };
+  const parsed = parseFlags(rest, valued[subcommand] ?? []);
   if (!parsed) return usage();
   const { positionals, name, flag } = parsed;
 
@@ -445,6 +471,12 @@ function dispatchStatus(args: string[], io: Io, deps: PrDeps): number {
       printRecord(id === "none" ? clearTicket(io.cwd, slug) : setTicket(io.cwd, slug, id, flag));
       return 0;
     }
+    case "rollout": {
+      const [slug, criterion, outcome] = positionals;
+      if (positionals.length !== 3) return usage();
+      printRecord(recordRollout(io.cwd, slug, criterion, outcome, io.today, flag));
+      return 0;
+    }
     case "approve": {
       const [slug, kind] = positionals;
       if (positionals.length !== 2 || !DOC_KINDS.includes(kind) || flag === undefined) return usage();
@@ -466,9 +498,10 @@ function shown(cwd: string, rec: FeatureRecord): object {
   const docsRoot = docsDir(cwd, rec);
   if (isUnit(rec)) {
     const planned = plannedUnit(cwd, rec);
-    return { ...rec, docs, docsRoot, approvals, stamp, covers: planned?.covers ?? null, dependsOn: planned?.dependsOn ?? null };
+    return { ...rec, docs, docsRoot, approvals, stamp, covers: planned?.covers ?? null, dependsOn: planned?.dependsOn ?? null, ...waiting([rec]) };
   }
-  const units = featureUnits(cwd, rec.slug).map((unit) => ({
+  const unitRecords = featureUnits(cwd, rec.slug);
+  const units = unitRecords.map((unit) => ({
     slug: unit.slug,
     unit: unit.unit,
     branch: unit.branch?.name ?? null,
@@ -476,7 +509,13 @@ function shown(cwd: string, rec: FeatureRecord): object {
     stamp: unit.stamp ? { current: stampProblems(cwd, unit).length === 0 } : null,
     landed: unit.landed !== undefined,
   }));
-  return { ...rec, docs, docsRoot, approvals, stamp, ...(units.length > 0 && { units }) };
+  return { ...rec, docs, docsRoot, approvals, stamp, ...(units.length > 0 && { units }), ...waiting([rec, ...unitRecords]) };
+}
+
+/** The rollout criteria of `records` still waiting for the user's check after the deploy, as `pendingRollout` when any. */
+function waiting(records: FeatureRecord[]): { pendingRollout?: { slug: string; ac: number; text: string }[] } {
+  const pendingRollout = records.flatMap(({ slug, rollout }) => (rollout ?? []).filter((item) => item.outcome === undefined).map(({ ac, text }) => ({ slug, ac, text })));
+  return pendingRollout.length > 0 ? { pendingRollout } : {};
 }
 
 function runTracker(args: string[], io: Io, deps: PrDeps): number {
@@ -490,6 +529,34 @@ function runTracker(args: string[], io: Io, deps: PrDeps): number {
   }
   const { tracker } = projectConfig(io.cwd);
   io.out(tracker === undefined ? "unset" : JSON.stringify(tracker));
+  return 0;
+}
+
+function runCi(args: string[], io: Io, deps: PrDeps): number {
+  const parsed = parseOptions(args.slice(1), [], ["--wait"]);
+  if (args[0] !== "evidence" || !parsed || parsed.positionals.length !== 1) {
+    io.err(`unknown command: ci ${args.join(" ")}`.trimEnd());
+    return 2;
+  }
+  return refusingOnStdout(io, () => {
+    try {
+      const evidence = ciEvidence(io.cwd, parsed.positionals[0], deps.gh, deps, { wait: parsed.flags.includes("--wait") });
+      io.out(JSON.stringify(evidence));
+      return evidence.verdict === "evidence" ? 0 : 1;
+    } catch (e) {
+      if (!(e instanceof CiRefusedError)) throw e;
+      io.out(`refused: ${e.reason}`);
+      return 1;
+    }
+  });
+}
+
+function runConfig(args: string[], io: Io): number {
+  if (args.length !== 1 || args[0] !== "show") {
+    io.err(`unknown command: config ${args.join(" ")}`.trimEnd());
+    return 2;
+  }
+  io.out(JSON.stringify(projectConfig(io.cwd)));
   return 0;
 }
 
@@ -516,7 +583,7 @@ function runStamp(args: string[], io: Io): number {
     }
     if (subcommand === "carry") {
       const carried = carryStamp(io.cwd, slug);
-      io.out(carried === null ? "ok" : `carried: ${carried.from.slice(0, 12)} -> ${carried.to.slice(0, 12)}; only documents changed: ${carried.paths.join(", ")}`);
+      io.out(carried === null ? "ok" : `carried: ${carried.from.slice(0, 12)} -> ${carried.to.slice(0, 12)}; nothing verify reads changed: ${carried.paths.join(", ")}`);
       return 0;
     }
   } catch (e) {

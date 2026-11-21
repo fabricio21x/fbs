@@ -134,7 +134,7 @@ A guided review in the running app, in a browser you watch. One feature per turn
 
 ### verify
 
-The shipping gate, before any PR. On a clean tree it takes the criteria (the spec's, the bug's, a unit's, or for tiny work the outcome you name), runs the suite and type check, and finds evidence for each criterion: a green test whose assertions check it, or validate evidence recorded on this tree. A criterion with neither is unverified; it never runs ad-hoc code to stand in. It writes `verdict.md`, and only on a pass runs `fbs stamp set`. When only documents changed since the last stamp, it carries the stamp instead. On a fail it closes the gaps through validate or the change path. Hands to open-pr, after offering polish once when it is installed.
+The shipping gate, before any PR. On a clean tree it takes the criteria (the spec's, the bug's, a unit's, or for tiny work the outcome you name), runs the suite and type check, and finds evidence for each criterion: a green test whose assertions check it, or validate evidence recorded on this tree. A criterion with neither is unverified; it never runs ad-hoc code to stand in. It writes `verdict.md`, and only on a pass runs `fbs stamp set`. When nothing it reads changed since the last stamp (documents, `CLAUDE.md` or `AGENTS.md`), it carries the stamp instead. A criterion marked `(rollout)` passes without evidence and is checked with you after the merge; with `verify.ciEvidence`, green CI runs on the PR's head stand in for the local suite. On a fail it closes the gaps through validate or the change path. Hands to open-pr, after offering polish once when it is installed.
 
 ### organize-commits
 
