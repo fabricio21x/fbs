@@ -69,7 +69,7 @@ test("unknown subcommand is a usage error", () => {
 });
 
 describe("per-command help", () => {
-  const COMMANDS = ["context", "status", "tracker", "branch", "push", "stamp", "commits", "watch-pr", "pr", "camp", "land", "stack", "guard", "ask-check", "afk", "afk-guard", "polish"];
+  const COMMANDS = ["context", "status", "tracker", "branch", "push", "stamp", "commits", "watch-pr", "pr", "camp", "land", "stack", "guard", "ask-check", "afk", "afk-guard", "polish", "rewrite"];
   const CONTINUATION = " ".repeat(28);
 
   test.each(COMMANDS.flatMap((command) => [[command, "--help"], [command, "-h"]]))("%s %s prints only that command's usage and exits 0", (command, flag) => {
@@ -96,6 +96,29 @@ describe("per-command help", () => {
     expect(camp.join("\n")).toContain("  camp followup <slug> --filed <n> --link <url>");
   });
 
+  test("fbs help <command> prints that command's part, and an unknown one is a usage error", () => {
+    const viaHelp: string[] = [];
+    const viaFlag: string[] = [];
+    expect(run(["help", "push"], io(viaHelp, []))).toBe(0);
+    run(["push", "--help"], io(viaFlag, []));
+    expect(viaHelp).toEqual(viaFlag);
+    const err: string[] = [];
+    expect(run(["help", "nope"], io([], err))).toBe(2);
+    expect(err).toEqual(["unknown command: nope"]);
+    const full: string[] = [];
+    expect(run(["help", "--help"], io(full, []))).toBe(0);
+    expect(full[0]).toStartWith("usage: fbs <command>");
+  });
+
+  test("-h or --help given as an option's value is the value, not a request for help; after a bare flag it is help", () => {
+    const out: string[] = [];
+    expect(run(["status", "approve", "x", "spec", "--quote", "-h"], io(out, [], featureRepo(PASSING_SPEC)))).toBe(0);
+    expect(JSON.parse(out.join("\n")).approvals.spec.quote).toBe("-h");
+    const help: string[] = [];
+    expect(run(["branch", "x", "--existing", "--help"], io(help, [], tempDir()))).toBe(0);
+    expect(help[0]).toStartWith("usage:\n  branch <slug>");
+  });
+
   test("afk's help leaves out afk-guard, and an unknown command with --help is still a usage error", () => {
     const out: string[] = [];
     run(["afk", "--help"], io(out, []));
@@ -112,14 +135,14 @@ describe("an option without its value", () => {
     [["branch", "x", "--use"], "branch: --use needs a value"],
     [["branch", "x", "--use", " "], "branch: --use needs a value"],
     [["branch", "x", "--use", "--existing"], "branch: --use needs a value"],
-    [["status", "init", "x", "--size"], "status: --size needs a value"],
-    [["status", "approve", "x", "spec", "--quote"], "status: --quote needs a value"],
-    [["stamp", "set", "x", "--verdict"], "stamp: --verdict needs a value"],
-    [["stamp", "set", "x", "--verdict", ""], "stamp: --verdict needs a value"],
+    [["status", "init", "x", "--size"], "status init: --size needs a value"],
+    [["status", "approve", "x", "spec", "--quote"], "status approve: --quote needs a value"],
+    [["stamp", "set", "x", "--verdict"], "stamp set: --verdict needs a value"],
+    [["stamp", "set", "x", "--verdict", ""], "stamp set: --verdict needs a value"],
     [["watch-pr", "x", "--interval"], "watch-pr: --interval needs a value"],
-    [["pr", "reply", "x", "--comment", "issue:1", "--body-file"], "pr: --body-file needs a value"],
-    [["camp", "followup", "x", "--summary", "s", "--thread"], "camp: --thread needs a value"],
-    [["afk", "stop", "x", "--reason"], "afk: --reason needs a value"],
+    [["pr", "reply", "x", "--comment", "issue:1", "--body-file"], "pr reply: --body-file needs a value"],
+    [["camp", "followup", "x", "--summary", "s", "--thread"], "camp followup: --thread needs a value"],
+    [["afk", "stop", "x", "--reason"], "afk stop: --reason needs a value"],
   ])("%p says so", (args, message) => {
     const out: string[] = [];
     const err: string[] = [];

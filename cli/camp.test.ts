@@ -214,6 +214,8 @@ test("a failing CI check can be a follow-up's source, named check:<its name>, wh
   expect(r.code).toBe(0);
   expect(JSON.parse(r.out[0])).toMatchObject({ number: 1, thread: "check:CI / test (ubuntu)", status: "open" });
   expect(show(repo).openFollowups).toHaveLength(1);
+  const padded = fbs(repo, "camp", "followup", "x", "--thread", "check:  CI / test (ubuntu) ", "--summary", "Same check");
+  expect(JSON.parse(padded.out[0]).thread).toBe("check:CI / test (ubuntu)");
   const reply = fbs(repo, "pr", "reply", "x", "--comment", "check:CI / test (ubuntu)", "--body-file", "reply.md");
   expect(reply.code).toBe(2);
   expect(reply.err[0]).toStartWith("pr reply: --comment takes thread:<id>");

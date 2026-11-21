@@ -73,7 +73,7 @@ const USAGE = [
   "",
   "commands:",
   "  --version                 print the fbs version",
-  "  help                      show this help; fbs <command> --help (or -h) shows that command's part",
+  "  help [<command>]          show this help, or that command's part; so does fbs <command> --help (or -h)",
   "  context check [--json]    validate .fbs/context.md",
   "  status init <slug> --size <tiny|bug|mid|big>",
   "  status init <unit slug> --unit-of <feature> [--unit <n>]",
@@ -133,7 +133,9 @@ const USAGE = [
   "                            use more, by the types only it has), else default (feature, bugfix, hotfix, chore; also on",
   "                            a tie); seen counts each type prefix among those 50; reads only",
   "  push <slug>               push the tip of the feature's recorded branch to origin's branch of that name and track it,",
-  "                            from any worktree and whatever is checked out; prints one JSON line",
+  "                            from any worktree and whatever is checked out; prints one JSON line, with headNotPushed",
+  "                            {head,on} and a note when this checkout is off the branch and its HEAD isn't in what was",
+  "                            pushed; refused while any worktree is rebasing the branch",
   "                            before a PR it overwrites only what fbs pushed last, after one it only adds commits;",
   "                            never main, master or origin's default branch; skipped without an origin remote",
   "  stamp set <slug> --verdict <repo-relative path>",
@@ -305,17 +307,33 @@ const USAGE = [
   "                            in the run's diff since its start; prints one JSON line, exit 1 when flagged, 2 on an error",
 ].join("\n");
 
+const USAGE_LINES = USAGE.split("\n");
+
+// Read off the usage's "--name <value>" forms, so a value of -h (a quote, say) is never taken for a help request.
+const VALUED_OPTIONS = new Set(USAGE.match(/--[a-z-]+(?= <)/g));
+
+function asksForHelp(args: string[]): boolean {
+  return args.some((arg, i) => (arg === "--help" || arg === "-h") && !VALUED_OPTIONS.has(args[i - 1]));
+}
+
 /** The usage entries of one top-level command: each starts with the command's name, its continuation lines indented. */
 function commandUsage(command: string): string | null {
   const section: string[] = [];
   let inside = false;
-  for (const line of USAGE.split("\n")) {
+  for (const line of USAGE_LINES) {
     const entry = /^ {2}(\S+)/.exec(line);
     if (entry !== null) inside = entry[1] === command;
     else if (!line.startsWith("   ")) inside = false;
     if (inside) section.push(line);
   }
   return section.length > 0 ? ["usage:", ...section].join("\n") : null;
+}
+
+/** The command a usage error names: with its subcommand when the usage lists one, as in camp followup. */
+function usageName(command: string, rest: string[]): string {
+  const sub = rest[0];
+  const listed = sub !== undefined && USAGE_LINES.some((line) => line === `  ${command} ${sub}` || line.startsWith(`  ${command} ${sub} `));
+  return listed ? `${command} ${sub}` : command;
 }
 
 class UsageError extends Error {}
@@ -326,6 +344,15 @@ export function run(argv: string[], io: Io, deps: PrDeps = REAL_PR_DEPS, afkDeps
     io.out(`fbs ${plugin.version}`);
     return 0;
   }
+  if (command === "help" && rest.length === 1 && !rest[0].startsWith("-")) {
+    const section = commandUsage(rest[0]);
+    if (section === null) {
+      io.err(`unknown command: ${rest[0]}`);
+      return 2;
+    }
+    io.out(section);
+    return 0;
+  }
   if (command === "help" || command === "--help" || command === "-h") {
     io.out(USAGE);
     return 0;
@@ -334,7 +361,7 @@ export function run(argv: string[], io: Io, deps: PrDeps = REAL_PR_DEPS, afkDeps
     io.err(USAGE);
     return 2;
   }
-  const help = rest.some((arg) => arg === "--help" || arg === "-h") ? commandUsage(command) : null;
+  const help = asksForHelp(rest) ? commandUsage(command) : null;
   if (help !== null) {
     io.out(help);
     return 0;
@@ -362,7 +389,7 @@ export function run(argv: string[], io: Io, deps: PrDeps = REAL_PR_DEPS, afkDeps
     if (command === "polish") return runPolish(rest, io, polishDeps);
   } catch (e) {
     if (e instanceof UsageError) {
-      io.err(`${command}: ${e.message}`);
+      io.err(`${usageName(command, rest)}: ${e.message}`);
       return 2;
     }
     if (e instanceof ConfigError || e instanceof NotAGitRepoError || e instanceof GitError || e instanceof RecordError || e instanceof GhError) {
@@ -786,6 +813,11 @@ function runPr(args: string[], io: Io, deps: PrDeps): number {
 
 const COUNT_FLAGS = COUNTS.map((name) => `--${name}`);
 
+/** A check: key with its name trimmed, so check:  CI and check:CI are one key. */
+function followupKey(thread: string): string {
+  return thread.startsWith("check:") ? `check:${thread.slice("check:".length).trim()}` : thread;
+}
+
 function runCamp(args: string[], io: Io): number {
   const [subcommand, ...rest] = args;
   const valued = { start: ["--auto-fix-rounds"], round: [...COUNT_FLAGS, "--note", "--unit"], checkpoint: ["--unit"], show: ["--unit"], stop: [], followup: ["--thread", "--summary", "--why", "--unit", "--filed", "--link", "--declined"] }[subcommand] ?? null;
@@ -841,7 +873,7 @@ function runCamp(args: string[], io: Io): number {
         const followup =
           closing !== undefined
             ? closeFollowup(io.cwd, slug, Number(closing), link ?? null)
-            : addFollowup(io.cwd, slug, unit, { thread: thread as string, summary: summary as string, why }, io.today, io.err);
+            : addFollowup(io.cwd, slug, unit, { thread: followupKey(thread as string), summary: summary as string, why }, io.today, io.err);
         io.out(JSON.stringify(followup));
       }
       else {

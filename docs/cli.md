@@ -9,7 +9,7 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 - **Exit codes:** `0` ok; `1` refused, or a record error such as `error: missing` or `error: exists` (reasons on stdout); `2` a usage or environment error (on stderr), such as `--use needs a value` for an option given without one. `watch-pr` has its own codes, below.
 - **Output:** most commands print one JSON line, or `ok`, or one line per problem.
 - **One command per call.** Skills pre-approve `Bash(fbs *)`, which matches only a bare `fbs …` command, so they never chain, pipe or redirect it.
-- `fbs help` prints the full usage; `fbs <command> --help` (or `-h`) prints that command's part of it; `fbs --version` the version.
+- `fbs help` prints the full usage; `fbs help <command>` or `fbs <command> --help` (or `-h`) prints that command's part of it; `fbs --version` the version.
 
 ## Commands
 
@@ -44,7 +44,7 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 | `branch <slug> [--type <type>] [--ticket <id>] [--existing] [--parent <branch>]` | Puts the checkout on the feature's branch and records it. Creates `<type>/<ticket>-<slug>` from origin's default branch (or `--parent`, for a stack) when none is recorded; `--existing` never creates; `--ticket` renames a branch fbs cut that has no PR yet, into an allowed type when `branches.types` leaves out its own (`feature` to `feat`, `bugfix` or `hotfix` to `fix`, and back; else the first listed). `<type>` is `feature`, `bugfix`, `hotfix`, `chore` or another Conventional Commit type (`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `revert`); only those in `branches.types` in `.fbs/config.json` when it's set |
 | `branch --types` | The types to pick `--type` from, as one JSON line: `{types, from, seen}`. `from` is `config` (`branches.types`), `branches` (the family, conventional branch or Conventional Commit, that the 50 most recently committed local and remote branches with a type prefix use more; a tie is `default`) or `default` (`feature`, `bugfix`, `hotfix`, `chore`); `seen` counts each type prefix found. Reads only |
 | `branch <slug> --use <branch>` | Adopts a branch you named instead |
-| `push <slug>` | Pushes the tip of the feature's recorded branch, from any worktree and whatever is checked out; never the default branch. Before the PR it overwrites only what fbs pushed last; after, it only adds commits. Skipped without an origin |
+| `push <slug>` | Pushes the tip of the feature's recorded branch, from any worktree and whatever is checked out; never the default branch. Before the PR it overwrites only what fbs pushed last; after, it only adds commits. When this checkout is off that branch and its HEAD isn't in what was pushed, the JSON adds `headNotPushed` (`{head, on}`) with a `note:`, since commits made here didn't go. Refused while any worktree is rebasing the branch. Skipped without an origin |
 | `commits check <slug>` | Lists the branch's commits whose subject isn't a Conventional Commit or whose message breaks commitlint config-conventional's rules: header and lines of 100 characters at most, no spaces around the header, a subject that doesn't start with a capital or end with a full stop. A missing blank line after the header is listed as a warning that doesn't fail the check. `fixup!`, `squash!` and `amend!` commits and the parent branch's are left out |
 | `commits title <text>` | Checks a PR title the same way |
 

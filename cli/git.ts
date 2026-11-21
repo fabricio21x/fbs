@@ -1,6 +1,6 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export class NotAGitRepoError extends Error {}
 
@@ -59,6 +59,19 @@ export function repoRoot(cwd: string): string {
 
 export function gitCommonDir(cwd: string): string {
   return revParse(cwd, ["--path-format=absolute", "--git-common-dir"]);
+}
+
+/** The worktree where a rebase (either backend) of `branch` is in progress, or null; read from every worktree's git dir. */
+export function worktreeRebasing(cwd: string, branch: string): string | null {
+  const common = gitCommonDir(cwd);
+  const linked = join(common, "worktrees");
+  const gitDirs = [common, ...(existsSync(linked) ? readdirSync(linked).map((name) => join(linked, name)) : [])];
+  const readText = (path: string) => (existsSync(path) ? readFileSync(path, "utf8").trim() : null);
+  for (const dir of gitDirs) {
+    if (!["rebase-merge", "rebase-apply"].some((state) => readText(join(dir, state, "head-name")) === `refs/heads/${branch}`)) continue;
+    return dir === common ? dirname(common) : dirname(readText(join(dir, "gitdir")) ?? join(dir, ".git"));
+  }
+  return null;
 }
 
 /** True when git ignores `path`, relative to the repo root; a tracked path never is. A trailing `/` asks about a directory, which needn't exist. */

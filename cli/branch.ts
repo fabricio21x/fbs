@@ -16,6 +16,7 @@ import {
   renameBranch,
   switchBranch,
   uncommittedFiles,
+  worktreeRebasing,
 } from "./git";
 import { BRANCH_FAMILY, BRANCH_TYPES, COMMIT_FAMILY, CONFIG_PATH, projectConfig } from "./config";
 import { protectedBranches } from "./guard";
@@ -45,6 +46,8 @@ export interface PushResult {
   branch: string;
   pushed: string;
   forced: boolean;
+  /** Set when the push ran from a checkout off the branch whose HEAD isn't in what was pushed; on is null for a detached HEAD. */
+  headNotPushed?: { head: string; on: string | null };
   /** The name pushed before a rename; deleted is false when origin moved it since or the delete failed. */
   previous?: { name: string; deleted: boolean };
 }
@@ -336,6 +339,9 @@ export function pushFeatureBranch(cwd: string, slug: string, note: (line: string
   if (protectedBranches(cwd).includes(name)) throw new BranchRefusedError(`${name} is the default branch; pushing it is the user's call`);
   const tip = commitOf(cwd, `refs/heads/${name}`);
   if (tip === null) throw new BranchRefusedError(`no commit on ${name} here to push; commit on it, or run fbs branch ${slug} to restore it from origin`);
+  // Mid-rebase the branch ref still holds the old tip, so pushing it would publish what the rebase is replacing.
+  const rebasing = worktreeRebasing(cwd, name);
+  if (rebasing !== null) throw new BranchRefusedError(`${name} is being rebased in ${rebasing}; finish it there (git rebase --continue) or abort it (git rebase --abort), then run fbs push ${slug}`);
   // The push runs before the lock, so a slow or failing network never holds it.
   // After a rename `pushed` is on the old name, so the new one gets a plain push.
   const lease = rec.pr === null && previous === undefined ? (pushed ?? null) : null;
@@ -348,9 +354,18 @@ export function pushFeatureBranch(cwd: string, slug: string, note: (line: string
     const { previous: _, ...branch } = latest.branch;
     return { ...latest, branch: { ...branch, pushed: tip } };
   });
-  const result = { branch: name, pushed: tip, forced: outcome === "forced" };
+  const result = { branch: name, pushed: tip, forced: outcome === "forced", ...unpushedHead(cwd, name, tip, note) };
   if (previous === undefined || pushed === undefined) return result;
   return { ...result, previous: { name: previous, deleted: deleteOldName(cwd, previous, pushed, note) } };
+}
+
+/** This checkout's HEAD when it is off the pushed branch and not in what was pushed, so commits made here didn't go; noted too. */
+function unpushedHead(cwd: string, name: string, tip: string, note: (line: string) => void): Pick<PushResult, "headNotPushed"> {
+  const on = currentBranch(cwd);
+  const head = commitOf(cwd, "HEAD");
+  if (on === name || head === null || isAncestor(cwd, head, tip)) return {};
+  note(`note: pushed ${name} at ${tip.slice(0, 12)}; this checkout's HEAD ${head.slice(0, 12)} (${on === null ? "a detached HEAD" : `on ${on}`}) is not on it`);
+  return { headNotPushed: { head, on } };
 }
 
 /** Delete a renamed branch's old name on origin while it is still what fbs pushed; a failure only leaves it there. */

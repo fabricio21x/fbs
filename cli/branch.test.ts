@@ -1285,6 +1285,35 @@ describe("fbs push", () => {
     expect(readFeature(work, "x").branch?.pushed).toBe(last);
   });
 
+  test("a checkout whose HEAD isn't on the pushed branch gets a note, and the JSON says so", () => {
+    const { work, tip } = onFeature();
+    git(work, "switch", "-q", "--detach");
+    const detached = commitFile(work, "detached.txt", "d\n");
+    const short = (sha: string) => sha.slice(0, 12);
+    expect(push(work)).toEqual({
+      code: 0,
+      out: [JSON.stringify({ branch: "feature/x", pushed: tip, forced: false, headNotPushed: { head: detached, on: null } })],
+      err: [`note: pushed feature/x at ${short(tip)}; this checkout's HEAD ${short(detached)} (a detached HEAD) is not on it`],
+    });
+    git(work, "switch", "-q", "-c", "worktree-agent-1");
+    const isolated = commitFile(work, "isolated.txt", "i\n");
+    const r = push(work);
+    expect(JSON.parse(r.out[0]).headNotPushed).toEqual({ head: isolated, on: "worktree-agent-1" });
+    expect(r.err).toEqual([`note: pushed feature/x at ${short(tip)}; this checkout's HEAD ${short(isolated)} (on worktree-agent-1) is not on it`]);
+  });
+
+  test("a branch being rebased in any worktree is refused, naming where", () => {
+    const { origin, work } = onFeature();
+    const wt = join(tempDir(), "wt");
+    git(work, "worktree", "add", "-q", "-b", "elsewhere", wt, "main");
+    Bun.spawnSync(["git", "rebase", "-q", "--exec", "false", "HEAD~1"], { cwd: work, env: isolatedGitEnv(), stdout: "pipe", stderr: "pipe" });
+    expect(existsSync(join(work, ".git/rebase-merge/head-name"))).toBe(true);
+    const refusal = `refused: feature/x is being rebased in ${work}; finish it there (git rebase --continue) or abort it (git rebase --abort), then run fbs push x`;
+    expect(push(wt)).toEqual({ code: 1, out: [refusal], err: [] });
+    expect(push(work)).toEqual({ code: 1, out: [refusal], err: [] });
+    expect(() => git(origin, "rev-parse", "--verify", "feature/x")).toThrow();
+  });
+
   test("from another branch, commits someone else pushed are still never overwritten", () => {
     const { origin, work, tip } = onFeature();
     push(work);
