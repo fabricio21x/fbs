@@ -2,7 +2,7 @@ import { cpSync, existsSync, rmSync } from "node:fs";
 import { join, posix } from "node:path";
 import { projectConfig } from "./config";
 import { gitCommonDir, NotAGitRepoError, repoRoot } from "./git";
-import { createRecord, type DocKind, docPath, docsDir, docsMode, type FeatureRecord, featureUnits, isUnit, readFeature, recordPath, StatusError, withLock } from "./status";
+import { createRecord, type DocKind, docPath, docsDir, docsMode, excludeLocalDocs, type FeatureRecord, featureUnits, isUnit, readFeature, recordPath, StatusError, withLock } from "./status";
 
 /** What `fbs status move` did: where the feature's records and documents now live. */
 export interface MovedFeature {
@@ -39,6 +39,7 @@ export function moveFeature(cwd: string, slug: string, target: string, removeSou
     const taken = all.find((rec) => existsSync(recordPath(to, rec.slug)));
     if (taken !== undefined) throw new StatusError("exists", `${taken.slug} already has a record in ${to}`);
 
+    excludeLocalDocs(to);
     const dir = posix.join(projectConfig(to).featuresDir, posix.basename(feature.dir));
     const moved = all.map((rec) => withoutRepo(rec, rec === feature ? dir : posix.join(dir, posix.relative(feature.dir, rec.dir))));
     const source = docsDir(cwd, feature);

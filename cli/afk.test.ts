@@ -836,6 +836,52 @@ describe("afk-guard in the run", () => {
     expect(runJson(cwd).config).toBeUndefined();
   });
 
+  test("docs.store from the user's config file is copied into the run at the start, so its local documents stay clean", () => {
+    const xdg = tempDir();
+    mkdirSync(join(xdg, "fbs"));
+    writeFileSync(join(xdg, "fbs", "config.json"), JSON.stringify({ defaults: { docs: { store: "local" } } }));
+    const before = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = xdg;
+    try {
+      const cwd = repo({ ".fbs/config.json": "{}" });
+      expect(run(["status", "init", "x", "--size", "mid"], { cwd, today: "2026-10-28", out: () => {}, err: () => {} })).toBe(0);
+      writeFileSync(join(cwd, "docs", "features", "2026-10-28-x", "afk.json"), "{}");
+      const { judge } = fakeJudge();
+      expect(start(cwd, judge, spec([PASS_FILE])).code).toBe(0);
+      expect(runJson(cwd).config?.docs).toEqual({ store: "local" });
+      writeFileSync(join(xdg, "fbs", "config.json"), "{}");
+      commit(cwd, { "pass.txt": "ok" });
+      expect(check(cwd, judge).json()).toMatchObject({ decision: "kept" });
+    } finally {
+      if (before === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = before;
+    }
+  });
+
+  test("a config changed during the run doesn't hide what the check commands write", () => {
+    const xdg = tempDir();
+    const before = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = xdg;
+    try {
+      const cwd = repo({ ".fbs/config.json": JSON.stringify({ featuresDir: "src" }) });
+      const { judge } = fakeJudge();
+      start(cwd, judge, spec([{ id: "build", kind: "command", run: "if test -f go; then mkdir -p src && touch src/made.txt; fi" }, PASS_FILE]));
+      expect(run(["config", "set", "docs.store", '"local"', "--user"], { cwd, today: "2026-10-28", out: () => {}, err: () => {} })).toBe(0);
+      commit(cwd, { go: "", "pass.txt": "ok" });
+      expect(check(cwd, judge).json()).toMatchObject({ warning: "the check commands wrote src/; ignore them in .gitignore or write outside the repo" });
+    } finally {
+      if (before === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = before;
+    }
+  });
+
+  test("with docs.store local, the features folder fbs excluded counts as clean", () => {
+    const cwd = repo({ ".fbs/config.json": JSON.stringify({ docs: { store: "local" } }) });
+    expect(run(["status", "init", "x", "--size", "mid"], { cwd, today: "2026-10-28", out: () => {}, err: () => {} })).toBe(0);
+    writeFileSync(join(cwd, "docs", "features", "2026-10-28-x", "afk.json"), "{}");
+    expect(start(cwd, fakeJudge().judge, spec([PASS_FILE])).code).toBe(0);
+  });
+
   test("checkScripts finds the package.json scripts the command checks call", () => {
     const checks = parseSpec(
       spec([

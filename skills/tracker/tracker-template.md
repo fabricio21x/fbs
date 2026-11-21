@@ -2,7 +2,7 @@
 
 - Tracker: <linear (team <key>) | github>
 - Status: <proposed | created | partly created: <what is missing> | Skipped by the user (<YYYY-MM-DD>)>
-- Design: <link to design.md (Mid: spec.md) at the pushed commit's sha>
+- Design: <the published design page (Mid: spec page) from published.md, else design.md (Mid: spec.md) at the pushed commit's sha, else none>
 
 <!-- Every item the tracker should hold, in creation order. Fill `Id` and `URL` the moment an item exists; an item with an id is never created again. -->
 

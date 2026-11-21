@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join, posix } from "node:path";
-import { hasGitSegment, projectConfig } from "./config";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, posix } from "node:path";
+import { type FbsConfig, hasGitSegment, projectConfig } from "./config";
 import { isValidDate } from "./date";
 import { gitCommonDir, isIgnored, rootFor } from "./git";
 import { isRepoName } from "./github";
@@ -219,6 +219,7 @@ export function initFeature(cwd: string, slug: string, size: string, today: stri
   if (!SIZES.includes(size)) throw new StatusError("bad-size", `${JSON.stringify(size)} must be one of ${SIZES.join(", ")}`);
   assertToday(today);
 
+  excludeLocalDocs(cwd);
   const dir = posix.join(projectConfig(cwd).featuresDir, `${today}-${slug}`);
   return createRecord(cwd, { slug, dir, size: size as Size, approvals: {}, pr: null });
 }
@@ -619,6 +620,35 @@ export function docPath(cwd: string, rec: FeatureRecord, kind: DocKind): string 
 /** `local` when git ignores the feature's dir, whose documents then live only in the main worktree; else `tracked`. */
 export function docsMode(cwd: string, rec: FeatureRecord): "local" | "tracked" {
   return isIgnored(cwd, `${documentsRecord(cwd, rec).dir}/`) ? "local" : "tracked";
+}
+
+/** The exclude pattern for the features folder when `docs.store` is `local`; null otherwise. */
+export function localDocsPattern(config: FbsConfig): string | null {
+  if (config.docs?.store !== "local") return null;
+  return `/${config.featuresDir.replace(/[*?[\\]/g, "\\$&")}/`;
+}
+
+/**
+ * With `docs.store` `local`, add the features folder to the shared `info/exclude` when git doesn't ignore it yet, so
+ * the documents mode reads `local` in every worktree; returns the line added, else null.
+ */
+export function excludeLocalDocs(cwd: string): string | null {
+  const config = projectConfig(cwd);
+  const pattern = localDocsPattern(config);
+  if (pattern === null || isIgnored(cwd, `${config.featuresDir}/`)) return null;
+  const path = join(gitCommonDir(cwd), "info", "exclude");
+  mkdirSync(dirname(path), { recursive: true });
+  const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
+  if (existing.split("\n").includes(pattern)) return null;
+  appendFileSync(path, `${existing === "" || existing.endsWith("\n") ? "" : "\n"}${pattern}\n`);
+  return pattern;
+}
+
+/** A warning when `docs.store` says tracked but git ignores the features folder, so the documents stay local; else null. */
+export function docsStoreWarning(cwd: string): string | null {
+  const config = projectConfig(cwd);
+  if (config.docs?.store !== "tracked" || !isIgnored(cwd, `${config.featuresDir}/`)) return null;
+  return `warning: docs.store is tracked, but git ignores ${config.featuresDir}/, so the documents stay local: git's ignore wins`;
 }
 
 /** The absolute dir the feature's documents are read from: the main worktree's when local, else this worktree's. */

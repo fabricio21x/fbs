@@ -2,7 +2,7 @@
 
 fbs splits building a feature into stages: plan, architect, implement, validate, verify, open-pr, camp-pr, land. Each stage is a skill that reads the feature's documents, does one job, writes its result to a file, and continues into the next stage. A small TypeScript CLI (`fbs`) holds the records and makes the yes-or-no calls: is the spec complete, is it approved, is this tree verified, may this PR merge.
 
-**Contents:** [The flow](#the-flow) · [Sizes and routes](#sizes-and-routes) · [One conversation](#one-conversation) · [Facts, assumptions and decisions](#facts-assumptions-and-decisions) · [Approvals and gates](#approvals-and-gates) · [The feature's branch](#the-features-branch) · [The verify stamp](#the-verify-stamp) · [Changes after approval](#changes-after-approval) · [Work units and stacks](#work-units-and-stacks) · [The issue tracker](#the-issue-tracker) · [What a feature leaves behind](#what-a-feature-leaves-behind) · [Project settings](#project-settings)
+**Contents:** [The flow](#the-flow) · [Sizes and routes](#sizes-and-routes) · [One conversation](#one-conversation) · [Facts, assumptions and decisions](#facts-assumptions-and-decisions) · [Approvals and gates](#approvals-and-gates) · [The feature's branch](#the-features-branch) · [The verify stamp](#the-verify-stamp) · [Changes after approval](#changes-after-approval) · [Work units and stacks](#work-units-and-stacks) · [The issue tracker](#the-issue-tracker) · [Documentation tools](#documentation-tools) · [What a feature leaves behind](#what-a-feature-leaves-behind) · [Project settings](#project-settings)
 
 ## The flow
 
@@ -136,6 +136,17 @@ When a project uses Linear or GitHub Issues, the `tracker` building block plans 
 
 At the end of a PR's review, valid out-of-scope findings recorded as follow-ups are proposed once as new issues, created only on your go-ahead.
 
+## Documentation tools
+
+When a team reads feature documentation in a tool such as Notion, Confluence or Google Docs, the `docs` building block mirrors it there.
+
+- **The setting.** On the first plan, it asks once whether the feature's documents are shared in the repo or kept local, and whether they also go to a documentation tool this session can reach, and under which page, space or folder. You can say it holds for every repo of the remote's owner, so a company policy is set once for all its repos. The answers go in `docs.store` and `docs.publish` (see [Project settings](#project-settings)).
+- **Mirror, never move.** After the spec approval, the design approval and each approved change, it publishes one page per feature under the parent (titled with the ticket id when there is one), with child pages for the spec and the design, and a section listing each approved change in one line. Diagrams stay mermaid; mockups are uploaded when the tool takes files, and listed by path otherwise. Every page says it is a mirror: the repo's files stay the source, since the gates, approvals and stamps read them, and edits made in the tool are replaced on the next publish.
+- **No extra questions.** The setting is your standing go-ahead: publishing asks nothing, says where it went with a link, and never blocks the flow when it fails.
+- **Links.** The page ids go in `published.md`, and the tracker's issues link to the published design.
+
+Notion has an adapter; another tool works through its own MCP server by the same operations. Without one, nothing is mirrored.
+
 ## What a feature leaves behind
 
 **In the project**, under `docs/features/<YYYY-MM-DD>-<slug>/` (set by `featuresDir` in `.fbs/config.json`):
@@ -148,6 +159,7 @@ At the end of a PR's review, valid out-of-scope findings recorded as follow-ups 
 | `overview.html` | architect | The one page you review for a big design, with diagrams and mockups embedded |
 | `mockups/<screen>.html` | architect | Static, clickable mockups of each screen in every state |
 | `tracker.md` | tracker | The proposed tracker structure, then the created ids |
+| `published.md` | docs | The pages the documents are mirrored to in your documentation tool, with their ids |
 | `changes.md` | changes | Every change after approval, verbatim, with level, status and outcome |
 | `plan.md` | implement | The task graph, statuses, reviews and escalations; resumable |
 | `bug.md` | tdd | Report, reproduction, root cause, fix, baseline |
@@ -156,7 +168,7 @@ At the end of a PR's review, valid out-of-scope findings recorded as follow-ups 
 | `afk.json`, `afk-*.sh` | afk | An autopilot run's finish line and its check scripts |
 | `units/<unit>/` | implement, verify | A work unit's own plan and verdict |
 
-When git ignores the features folder, the documents stay local: fbs reads them from the main worktree, never commits them, and the PR description carries what a reviewer needs from them instead of links.
+When git ignores the features folder, the documents stay local: fbs reads them from the main worktree, never commits them, and the PR description carries what a reviewer needs from them instead of links. With `docs.store` set to `local`, fbs makes that so without touching `.gitignore`: the first time it needs to, it adds the folder to the repo's `.git/info/exclude`, shared by every worktree. Documents committed before stay tracked until someone removes them from git, and going back to `tracked` needs that line removed again.
 
 **Project-level:**
 
@@ -170,7 +182,12 @@ When git ignores the features folder, the documents stay local: fbs reads them f
 
 ## Project settings
 
-`.fbs/config.json` is optional. Every key has a default.
+Settings come from two files, both optional:
+
+- `.fbs/config.json` in the repo;
+- your own `$XDG_CONFIG_HOME/fbs/config.json` (`~/.config/fbs/config.json` by default), with `defaults` for every repo and `owners` for the repos of one owner: `{"defaults": {…}, "owners": {"acme-co": {…}}}`. Each block holds only `context`, `tracker`, `camp`, `branches` and `docs`. `featuresDir`, `afk` and `verify` are repo-only: they decide what counts as verified or allowed, so reviewers see them in the repo. An unknown or repo-only key in the user file is an error that names the file and the block.
+
+Each key comes from the first that sets it: the repo's file, then the block for the owner in `origin`'s URL (`acme-co` in `git@github.com:acme-co/app.git`; the owner name matches on any host, without regard to case), then `defaults`, then the built-in default. A section's fields are taken one by one (`docs.store` from the repo and `docs.publish` from the owner, say); `tracker` and each field are taken whole. `fbs config show` prints the result and where each key came from, and the skills write settings with `fbs config set`. A missing or unreadable user file counts as none.
 
 | Key | Default | What it does |
 |---|---|---|
@@ -183,7 +200,9 @@ When git ignores the features folder, the documents stay local: fbs reads them f
 | `verify.suite` | unset | The one command implement and verify run as the suite, in place of the test and type-check commands: a scoped or worker-capped run for a repo too large to run in full locally |
 | `verify.ciEvidence` | `false` | When `true`, once the PR exists, green runs of `verify.ciWorkflows` on the exact head commit count as verify's suite evidence instead of a local run |
 | `verify.ciWorkflows` | unset | The workflow names whose runs count; required when `verify.ciEvidence` is `true` |
+| `docs.store` | unset | `"tracked"` commits the feature's documents; `"local"` keeps them on this machine, adding the features folder to `.git/info/exclude` when git doesn't ignore it. Unset: local when git ignores the folder, else tracked, and plan asks once. When it says tracked but git ignores the folder, git wins and `fbs config show` warns |
+| `docs.publish` | unset | `{"kind": "none"}`, or `{"kind": "<tool>", "parent": "<page, space or folder link or id>"}` with a tool such as `notion`, `confluence` or `google-docs`: where the documents are mirrored. Unset: nothing is published, and plan asks once a tool is connected |
 | `afk.migrations`, `afk.infra`, `afk.checkConfig` | built-in globs | Extra globs for autopilot's migration, infra and check-config flags |
 | `afk.deny` | none | Extra commands the guard denies during an autopilot run (deploy CLIs, say) |
 
-When git ignores `.fbs/config.json` or `.fbs/context.md`, fbs reads them from the main worktree in every worktree and never commits them.
+When git ignores `.fbs/config.json` or `.fbs/context.md`, fbs reads them from the main worktree in every worktree and never commits them. An autopilot run goes by the config committed at its start, or by a copy taken at the start when no commit holds it (a local config, or `docs.store` from your user file).

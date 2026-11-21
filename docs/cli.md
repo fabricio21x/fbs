@@ -17,10 +17,10 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 
 | Command | What it does |
 |---|---|
-| `status init <slug> --size tiny\|bug\|mid\|big` | Creates the feature's record and its documents folder |
+| `status init <slug> --size tiny\|bug\|mid\|big` | Creates the feature's record and its documents folder; with `docs.store` `local`, first adds the features folder to `.git/info/exclude` when git doesn't ignore it yet |
 | `status init <unit> --unit-of <feature> [--unit <n>]` | Records a work unit of a big feature whose design approval is current; its folder is `<feature dir>/units/<unit>`. A taken `--unit` inserts it there, shifting the units at and above it up one |
 | `status unit <unit> --move <n>` | Renumbers a unit and shifts the units between; prints the units as `[{slug, unit}]`. `<n>` must be in the approved design. Like an insert, refused with `breaks-stack` when an unlanded unit whose branch is cut would get a different unit below it, or an independent unit would land on a design entry that doesn't let it stand apart, or below every unit of the stack |
-| `status move <slug> --to <path> [--remove-source]` | Copies the feature's record and its units' records into another repo, without PR, branch, stamp, landing or independence, and its documents into that repo's features dir, local or tracked as its git ignores them. `--remove-source` then removes them here, and `deletionToCommit` names the tracked folder whose deletion is left to commit. Refused for a unit, an open PR (`open-pr`), any landed unit (`has-landed`: a half-shipped feature stays), an approved document missing from this checkout (`doc-missing`), or a slug the target has (`exists`) |
+| `status move <slug> --to <path> [--remove-source]` | Copies the feature's record and its units' records into another repo, without PR, branch, stamp, landing or independence, and its documents into that repo's features dir, local or tracked as its git ignores them (with its `docs.store` `local`, it first excludes that folder). `--remove-source` then removes them here, and `deletionToCommit` names the tracked folder whose deletion is left to commit. Refused for a unit, an open PR (`open-pr`), any landed unit (`has-landed`: a half-shipped feature stays), an approved document missing from this checkout (`doc-missing`), or a slug the target has (`exists`) |
 | `status show <slug>` | The record as JSON: size, folder, documents mode, branch, approvals and stamp (each with `current`), PR, ticket, rollout criteria with their outcomes, and `pendingRollout` for the ones still waiting (a feature's own and its units'); a feature lists its units (an independent one marked), a unit its `covers` and `dependsOn` |
 | `status list` | One line per feature: slug, size, stage |
 | `status reconcile` | Asks `gh` about every record with an open PR: one merged outside fbs is recorded as landed (`by: outside`), so the guard stops counting it open, and one closed without merging has its link cleared, as `status pr <slug> none` would. Restacks and pushes nothing: `stack sync` moves a feature cut from a landed branch at its next sync. Prints `{outside}`, each PR it found not open |
@@ -35,9 +35,10 @@ The `fbs` CLI holds the parts of the flow that must behave the same every time: 
 
 | Command | What it does |
 |---|---|
-| `config show` | `.fbs/config.json` as one JSON line, validated, with the defaults filled in |
+| `config show` | The resolved config as one JSON line, validated, with the defaults filled in, plus `sources`: where each top-level key came from (`repo`, `owner:<owner>` as the user file writes it, `user` or `default`, joined by `+` when a section's fields came from several). Warns on stderr when `docs.store` is `tracked` but git ignores the features folder. See [Project settings](how-it-works.md#project-settings) |
+| `config set <key> <json> [--owner\|--user]` | Writes one key, validated (`tracker`, `docs.store`, `docs.publish`, `verify.suite`, …; `null` removes it): to `.fbs/config.json`, or with `--owner` to the block for origin's owner (that owner name on any host) in your user file, or with `--user` to its `defaults`; `featuresDir`, `afk` and `verify` are repo-only. Nothing is written when the result wouldn't be valid, and the file is replaced in one rename. Prints `{set, level, path}`, plus `excluded` when this call added the features folder to `.git/info/exclude` for `docs.store` `local` |
 | `context check [--json]` | Checks `.fbs/context.md`: the size limit, that every fact is dated, which facts are stale |
-| `tracker show` | The tracker from `.fbs/config.json` as one JSON line, or `unset` |
+| `tracker show` | The tracker from the resolved config as one JSON line, or `unset` |
 | `tracker detect` | Evidence for setting it: ticket prefixes in branch names, tracker links in recent merged PR bodies, issue count. Reads only |
 
 ### Branches, pushes and commits
@@ -156,4 +157,4 @@ Runtime state lives in `$(git rev-parse --git-common-dir)/fbs/`: shared by every
 | `land/` | The pending land or rewrite request, the one-time land tokens and the rewrite token |
 | `afk/<slug>/` | An autopilot run: `run.json`, its log, its cached judge verdicts |
 
-In the project itself, fbs writes only the feature's documents and `.fbs/`. See [What a feature leaves behind](how-it-works.md#what-a-feature-leaves-behind).
+In the project itself, fbs writes only the feature's documents and `.fbs/`, plus one line in `.git/info/exclude` when `docs.store` is `local`. Your own settings, for every repo or every repo of an owner, live in `$XDG_CONFIG_HOME/fbs/config.json` (`~/.config/fbs/config.json` by default). See [What a feature leaves behind](how-it-works.md#what-a-feature-leaves-behind).

@@ -128,12 +128,23 @@ function userExcludesFile(cwd: string): string | null {
 
 /**
  * Untracked paths that neither a `.gitignore` nor the user's excludes file covers; `.git/info/exclude` hides nothing
- * here, except Claude Code's agent worktrees under `.claude/worktrees/`, which implement excludes there.
+ * here, except Claude Code's agent worktrees under `.claude/worktrees/`, which implement excludes there, and the
+ * `alsoExclude` patterns.
  */
-export function untrackedNotIgnored(cwd: string): string[] {
+export function untrackedNotIgnored(cwd: string, alsoExclude: string[] = []): string[] {
   const excludes = userExcludesFile(cwd);
   // --no-empty-directory, or a `.claude/` holding only excluded worktrees is listed as an untracked directory.
-  const args = ["ls-files", "-z", "--others", "--directory", "--no-empty-directory", "--exclude-per-directory=.gitignore", "--exclude=/.claude/worktrees/", ...(excludes === null ? [] : [`--exclude-from=${excludes}`])];
+  const args = [
+    "ls-files",
+    "-z",
+    "--others",
+    "--directory",
+    "--no-empty-directory",
+    "--exclude-per-directory=.gitignore",
+    "--exclude=/.claude/worktrees/",
+    ...alsoExclude.map((pattern) => `--exclude=${pattern}`),
+    ...(excludes === null ? [] : [`--exclude-from=${excludes}`]),
+  ];
   const result = runGit(cwd, args);
   if (!result.ok) throw new GitError(`cannot list the untracked files of ${cwd}: ${firstLine(result.stderr)}`);
   return result.stdout.split("\0").filter((path) => path !== "");
@@ -232,7 +243,13 @@ export function fetchBranch(cwd: string, branch: string): void {
 }
 
 export function hasRemote(cwd: string, name: string): boolean {
-  return runGit(cwd, ["config", "--get", `remote.${name}.url`]).ok;
+  return remoteUrl(cwd, name) !== null;
+}
+
+/** The URL of remote `name`; null when there is no such remote. */
+export function remoteUrl(cwd: string, name: string): string | null {
+  const result = runGit(cwd, ["config", "--get", `remote.${name}.url`]);
+  return result.ok ? result.stdout.trim() : null;
 }
 
 /** The commit `ref` points at; null when there is none. */

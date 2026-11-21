@@ -4,10 +4,10 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { afkGuard, type Flag } from "./afk-guard";
 import { type CommandOutput, type Criterion, JUDGE_OUTPUT_CHARS, type JudgeRunner, type JudgeVerdict, rubricCriteria, runClaudeJudge } from "./afk-judge";
-import { CONFIG_PATH, configAt, type FbsConfig, loadConfig } from "./config";
-import { commitOf, commitTree, currentBranch, envWithoutRepoOverrides, gitCommonDir, headTree, isIgnored, mainWorktree, mergeBase, repoRoot, resetHard, trackedFiles, uncommittedFiles, untrackedNotIgnored } from "./git";
+import { CONFIG_PATH, configAt, type FbsConfig, resolveConfig } from "./config";
+import { commitOf, commitTree, currentBranch, envWithoutRepoOverrides, gitCommonDir, headTree, isIgnored, mergeBase, repoRoot, resetHard, trackedFiles, uncommittedFiles, untrackedNotIgnored } from "./git";
 import { afkRunsIn, isSlug } from "./guard";
-import { readFeature, recordPath } from "./status";
+import { localDocsPattern, readFeature, recordPath } from "./status";
 
 export type AfkErrorCode = "bad-slug" | "bad-spec" | "missing" | "exists" | "running" | "not-running" | "not-met" | "dirty" | "no-step" | "bad-branch" | "locked" | "state-changed";
 
@@ -78,7 +78,7 @@ export interface Run extends Spec {
   start: { sha: string; at: string; results: CheckResult[] };
   /** sha256 of each tracked file `protect` matched at the start, by repo-relative path: the files the run may not change. */
   protected: Record<string, string>;
-  /** `.fbs/config.json` as it was at the start when git ignores it, so no commit holds it; the guard goes by this copy. */
+  /** The resolved config at the start when no commit holds it (git ignores `.fbs/config.json`, or the user's file sets `docs.store`); the guard and the stray-file check go by this copy. */
   config?: FbsConfig;
   /** The state a discarded step is reset to; `met` when every check passed there, judged ones on both votes. */
   kept: { sha: string; results: CheckResult[]; met: boolean };
@@ -316,9 +316,10 @@ function dirHashes(dir: string): Record<string, string> {
   return hashes;
 }
 
-/** Changed, staged or untracked files, including untracked ones hidden only by `.git/info/exclude`. */
-function strayFiles(worktree: string): string[] {
-  return [...new Set([...uncommittedFiles(worktree), ...untrackedNotIgnored(worktree)])].sort();
+/** Changed, staged or untracked files, including untracked ones hidden only by `.git/info/exclude`, except the local feature documents `config` names. */
+function strayFiles(worktree: string, config: FbsConfig): string[] {
+  const localDocs = localDocsPattern(config);
+  return [...new Set([...uncommittedFiles(worktree), ...untrackedNotIgnored(worktree, localDocs === null ? [] : [localDocs])])].sort();
 }
 
 function listed(paths: string[]): string {
@@ -574,7 +575,8 @@ export function startRun(cwd: string, slug: string, options: StartOptions, deps:
       if (!options.restart) throw new AfkError("exists", `afk run ${slug} finished (${old.status}); pass --restart to archive it and start over`);
       renameSync(dir, join(afkRoot(commonDir), `${slug}.${new Date(now).toISOString().replace(/[:.]/g, "-")}`));
     }
-    const stray = strayFiles(worktree);
+    const resolved = resolveConfig(worktree);
+    const stray = strayFiles(worktree, resolved.config);
     if (stray.length > 0) throw new AfkError("dirty", `${worktree} has uncommitted or untracked files (${listed(stray)}); commit, remove or .gitignore them first`);
     const branch = currentBranch(worktree);
     if (branch === null) throw new AfkError("bad-branch", `${worktree} is on a detached HEAD; an afk run works on a branch`);
@@ -584,7 +586,7 @@ export function startRun(cwd: string, slug: string, options: StartOptions, deps:
     rmSync(dir, { recursive: true, force: true });
     mkdirSync(dir, { recursive: true });
     const commands = runCommands(commonDir, slug, spec, worktree);
-    const wrote = strayFiles(worktree);
+    const wrote = strayFiles(worktree, resolved.config);
     const planted = Object.keys(dirHashes(dir));
     if (wrote.length > 0 || planted.length > 0) {
       rmSync(dir, { recursive: true, force: true });
@@ -604,7 +606,7 @@ export function startRun(cwd: string, slug: string, options: StartOptions, deps:
       baseRef: parentRef(cwd, worktree, slug, branch),
       start: { sha, at, results: baseline.results },
       protected: protectedHashes(worktree, (path) => spec.protect.some((glob) => new Bun.Glob(glob).match(path))),
-      ...(isIgnored(worktree, CONFIG_PATH) && { config: loadConfig(mainWorktree(worktree)) }),
+      ...((isIgnored(worktree, CONFIG_PATH) || resolved.fromUserFile) && { config: resolved.config }),
       kept: { sha, results: baseline.results, met: false },
       lastChecked: null,
       iteration: 0,
@@ -651,7 +653,7 @@ export function checkStep(cwd: string, slug: string, deps: AfkDeps, now: number)
     const worktree = run.worktree;
     const branch = currentBranch(worktree);
     if (branch !== run.branch) throw new AfkError("bad-branch", `${worktree} is on ${branch ?? "a detached HEAD"}, not the run's branch ${run.branch}`);
-    const stray = strayFiles(worktree);
+    const stray = strayFiles(worktree, runConfig(run));
     if (stray.length > 0) throw new AfkError("dirty", `${worktree} has uncommitted or untracked files (${listed(stray)}); commit the step, or remove or .gitignore them`);
     const sha = commitOf(worktree, "HEAD") as string;
     if (sha === run.lastChecked || sha === run.kept.sha) throw new AfkError("no-step", `HEAD ${sha.slice(0, 12)} was checked already; commit the next step first`);
@@ -682,7 +684,7 @@ export function checkStep(cwd: string, slug: string, deps: AfkDeps, now: number)
     const state = JSON.stringify(dirHashes(afkDir(commonDir, slug)));
     const commands = runCommands(commonDir, slug, run, worktree);
     if (JSON.stringify(dirHashes(afkDir(commonDir, slug))) !== state) return stopNow("state-changed", "the check commands changed the afk run's own files");
-    const wrote = strayFiles(worktree);
+    const wrote = strayFiles(worktree, runConfig(run));
     const judged = runJudged(commonDir, slug, run, worktree, tree, commands, recorded, deps, false, wrote);
     const ran = combine(run, commands.results, judged.results, judged.cost, false);
     const warning = wrote.length > 0 ? `the check commands wrote ${listed(wrote)}; ignore them in .gitignore or write outside the repo` : null;
@@ -810,7 +812,7 @@ export function finalRun(cwd: string, slug: string, deps: AfkDeps, now: number):
     const worktree = run.worktree;
     const branch = currentBranch(worktree);
     if (branch !== run.branch) throw new AfkError("bad-branch", `${worktree} is on ${branch ?? "a detached HEAD"}, not the run's branch ${run.branch}`);
-    const stray = strayFiles(worktree);
+    const stray = strayFiles(worktree, runConfig(run));
     if (stray.length > 0) throw new AfkError("dirty", `${worktree} has uncommitted or untracked files (${listed(stray)}); commit the review's fixes, or remove or .gitignore them`);
     // Any HEAD on the branch: the final review's fixes, organize-commits' rewrite, a merged base; all of it is measured.
     const sha = commitOf(worktree, "HEAD") as string;
@@ -823,7 +825,7 @@ export function finalRun(cwd: string, slug: string, deps: AfkDeps, now: number):
     const state = JSON.stringify(dirHashes(afkDir(commonDir, slug)));
     const commands = runCommands(commonDir, slug, run, worktree);
     if (JSON.stringify(dirHashes(afkDir(commonDir, slug))) !== state) throw new AfkError("state-changed", "the check commands changed the afk run's own files");
-    const wrote = strayFiles(worktree);
+    const wrote = strayFiles(worktree, runConfig(run));
     const judged = runJudged(commonDir, slug, run, worktree, tree, commands, recorded, deps, false, wrote);
     const ran = combine(run, commands.results, judged.results, judged.cost, false);
 
@@ -915,7 +917,7 @@ function guardRun(run: Run): { flags: Flag[] } {
   return afkGuard(run.worktree, input, runConfig(run));
 }
 
-/** The config a run's guard goes by: the copy taken at its start when the config is local, else the one committed then. */
+/** The config a run goes by: the copy taken at its start when no commit holds it, else the one committed then. */
 export function runConfig(run: Run): FbsConfig {
   return run.config ?? configAt(run.worktree, run.start.sha);
 }

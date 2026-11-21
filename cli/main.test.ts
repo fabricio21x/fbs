@@ -873,12 +873,17 @@ function config(cwd: string, ...args: string[]) {
   return { code, out, err };
 }
 
-test("config show prints the validated config as one JSON line, defaults filled in", () => {
+test("config show prints the validated config as one JSON line, defaults filled in, with each key's source", () => {
   const repo = gitRepo({ ".fbs/config.json": '{"verify": {"suite": "pnpm test --filter api -- --maxWorkers=2", "ciEvidence": true, "ciWorkflows": ["CI"]}}' });
   const r = config(repo, "show");
   expect(r.code).toBe(0);
   expect(r.out).toHaveLength(1);
-  expect(JSON.parse(r.out[0])).toEqual({ featuresDir: "docs/features", context: { maxFacts: 25, staleDays: 30 }, verify: { suite: "pnpm test --filter api -- --maxWorkers=2", ciEvidence: true, ciWorkflows: ["CI"] } });
+  expect(JSON.parse(r.out[0])).toEqual({
+    featuresDir: "docs/features",
+    context: { maxFacts: 25, staleDays: 30 },
+    verify: { suite: "pnpm test --filter api -- --maxWorkers=2", ciEvidence: true, ciWorkflows: ["CI"] },
+    sources: { featuresDir: "default", context: "default", verify: "repo" },
+  });
   expect(config(repo, "show", "x").code).toBe(2);
   expectEnvironmentError(config(gitRepo({ ".fbs/config.json": '{"verify": {"ciEvidence": "yes"}}' }), "show"), "verify.ciEvidence must be true or false");
 });

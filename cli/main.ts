@@ -8,7 +8,7 @@ import { BranchRefusedError, branchTypes, enterFeatureBranch, pushFeatureBranch 
 import { addFollowup, CampError, COUNTS, type Counts, campOwner, closeFollowup, recordCheckpoint, recordRound, showCamp, startCamp, stopCamp } from "./camp";
 import { CiRefusedError, ciEvidence } from "./ci";
 import { CommitsRefusedError, commitProblems, isConventionalSubject } from "./commits";
-import { ConfigError, projectConfig } from "./config";
+import { ConfigError, projectConfig, resolveConfig, setConfig } from "./config";
 import { checkContext } from "./context";
 import { isValidDate, localDate } from "./date";
 import { GitError, NotAGitRepoError, rootFor, setGitBinary } from "./git";
@@ -32,6 +32,8 @@ import {
   docsDir,
   docsMode,
   documentsRecord,
+  docsStoreWarning,
+  excludeLocalDocs,
   type FeatureRecord,
   featurePr,
   featureUnits,
@@ -123,7 +125,20 @@ const USAGE = [
   "                            for the ones still waiting (a feature's own and its units', each with its slug)",
   "  status ticket <slug> <id|none> [--url <https url>]",
   "                            record the tracker issue the feature works on (ACM-123, or an issue number), or clear it",
-  "  config show               print .fbs/config.json as one JSON line, validated and with the defaults filled in",
+  "  config show               print the resolved config as one JSON line, validated and with the defaults filled in, and",
+  "                            sources: where each top-level key came from (repo, owner:<owner>, user, default, joined by",
+  "                            + when a section's fields came from several); each key is taken from the repo's",
+  "                            .fbs/config.json, else the user file's block for origin's owner (that owner name on any",
+  "                            host), else its defaults ($XDG_CONFIG_HOME/fbs/config.json, default",
+  "                            ~/.config/fbs/config.json), else the built-in; the user file may set only context, tracker,",
+  "                            camp, branches and docs; warns on stderr when docs.store is tracked but git ignores the",
+  "                            features folder",
+  "  config set <key> <json> [--owner|--user]",
+  "                            write one key (featuresDir, tracker, docs.store, docs.publish, verify.suite, …), validated:",
+  "                            to .fbs/config.json, or with --owner to origin's owner block in the user file, or with",
+  "                            --user to its defaults (featuresDir, afk and verify are repo-only); null removes it; prints",
+  "                            {set,level,path}, plus excluded when this call added the features folder to",
+  "                            .git/info/exclude for docs.store local",
   "  ci evidence <slug> [--wait]",
   "                            whether CI stands in for verify's local suite: needs verify.ciEvidence, the feature's branch",
   "                            checked out and its PR open; reads the runs on HEAD's exact commit through gh and takes the",
@@ -131,7 +146,7 @@ const USAGE = [
   "                            prints {sha,tree,verdict,runs:[{workflow,state,url?,conclusion?}]}, verdict evidence (exit 0)",
   "                            when every one succeeded, wait (exit 1) while one runs, else refused (exit 1); --wait polls",
   "                            every 30s until none runs or is missing, for up to an hour; refused: <reason> otherwise",
-  "  tracker show              print .fbs/config.json's tracker as one JSON line, or unset",
+  "  tracker show              print the resolved config's tracker as one JSON line, or unset",
   "  tracker detect            print the evidence for a tracker setting as one JSON line: the config, ticket-id prefixes",
   "                            in branch names, tracker links in the last 30 merged PR bodies and the issue count (each",
   "                            null when gh can't tell); reads only",
@@ -677,11 +692,23 @@ function runCi(args: string[], io: Io, deps: PrDeps): number {
 }
 
 function runConfig(args: string[], io: Io): number {
-  if (args.length !== 1 || args[0] !== "show") {
+  const [subcommand, ...rest] = args;
+  if (subcommand === "show" && rest.length === 0) {
+    const { config, sources } = resolveConfig(io.cwd);
+    io.out(JSON.stringify({ ...config, sources }));
+    const warning = docsStoreWarning(io.cwd);
+    if (warning !== null) io.err(warning);
+    return 0;
+  }
+  const parsed = parseOptions(rest, [], ["--owner", "--user"]);
+  if (subcommand !== "set" || !parsed || parsed.positionals.length !== 2 || parsed.flags.length > 1) {
     io.err(`unknown command: config ${args.join(" ")}`.trimEnd());
     return 2;
   }
-  io.out(JSON.stringify(projectConfig(io.cwd)));
+  const level = parsed.flags[0] === "--owner" ? "owner" : parsed.flags[0] === "--user" ? "user" : "repo";
+  const written = setConfig(io.cwd, parsed.positionals[0], parsed.positionals[1], level);
+  const excluded = excludeLocalDocs(io.cwd);
+  io.out(JSON.stringify({ ...written, ...(excluded !== null && { excluded }) }));
   return 0;
 }
 

@@ -150,7 +150,7 @@ If the document changes after approval, rerun the gate, rewrite the overview (Bi
 
 ## 10. End
 
-Once the design is approved, commit everything this stage wrote (the feature's documents and mockups when `docs` is `tracked`, plus any `PRODUCT.md`, `DESIGN.md` or `CLAUDE.md` change from the UI direction; `docs: design for <slug>`) and push it with `fbs push <slug>`, so the issues can link to it.
+Once the design is approved, commit everything this stage wrote (the feature's documents and mockups when `docs` is `tracked`, plus any `PRODUCT.md`, `DESIGN.md` or `CLAUDE.md` change from the UI direction; `docs: design for <slug>`) and push it with `fbs push <slug>`, so the issues can link to it. Then load `fbs:docs` and run its publish step, before the tracker step so new issues link to the published design: it mirrors the approved documents when `fbs config show` has a `docs.publish`, and does nothing without one.
 
 **The work units** (Big, when `## Work units` isn't `None`). Each unit gets its own record, so it gets its own branch, verify stamp and PR: for each `### U<n>: <name>` in order, pick a unit slug (the unit's name as lowercase words joined by `-`, at most four words, unique among `fbs status list`) and run `fbs status init <unit slug> --unit-of <slug>`, which numbers it next. Skip units the record already lists (`fbs status show <slug>` lists `units`).
 
