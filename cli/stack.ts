@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { defaultBranch as defaultBranchOf } from "./branch";
 import {
   addDetachedWorktree,
+  authorOf,
   commitOf,
+  commitOnto,
   commitsBeyond,
   commitTree,
   fastForward,
@@ -15,7 +17,9 @@ import {
   isAncestor,
   isWorkTreeClean,
   mergeBase,
+  mergedTree,
   mergeInto,
+  nonMergeCommits,
   pushBranch,
   rebaseOnto,
   removeWorktree,
@@ -40,8 +44,13 @@ export interface LandedBelow {
  */
 export type StopKind = "conflict" | "dirty" | "diverged" | "gone" | "missing-below" | "not-merged-yet" | "push-rejected" | "retarget-failed" | "error";
 
-/** What the restack of a branch stacked on a moved one did; it never fails the land. `treeChanged` is against what was verified and reviewed: the stamp, else origin's tip before the restack. */
-export type Restack = { slug: string; pr: number | null; done: true; treeChanged: boolean } | { slug: string; pr: number | null; done: false; kind: StopKind; reason: string };
+/**
+ * What the restack of a branch stacked on a moved one did; it never fails the land. `treeChanged` is against what was
+ * verified and reviewed: the stamp, else origin's tip before the restack. `squashed`: replaying its commits conflicted,
+ * so its own change was folded into one commit and its per-commit history dropped; `squashedFrom` is its old tip.
+ */
+type Folded = { squashed?: true; squashedFrom?: string };
+export type Restack = ({ slug: string; pr: number | null; done: true; treeChanged: boolean } | { slug: string; pr: number | null; done: false; kind: StopKind; reason: string }) & Folded;
 
 type Stop = { kind: StopKind; reason: string };
 
@@ -62,7 +71,7 @@ interface Move {
 type Moved = { from: string; to: string };
 
 /** A restacked branch: `stop` is set when it moved but something after the push failed, which doesn't stop a branch stacked on it. */
-type Restacked = { rebased: string; retargeted: boolean; stop?: Stop };
+type Restacked = { rebased: string; retargeted: boolean; squashed: boolean; stop?: Stop };
 
 /** The move onto origin's default branch for a branch whose parent landed; a stop when the squash isn't there yet. */
 function ontoDefault(cwd: string, landed: LandedBelow, defaultBranch: string, base: string): Move | Stop {
@@ -79,11 +88,32 @@ function ontoMoved(below: Moved, parent: string): Move {
 }
 
 /**
+ * The branch's own change, its commits after `move.upstream`, as one commit on `move.onto`, named after and written by
+ * the first of them, listing them all: for when replaying them one by one conflicts across merges, though the end
+ * result doesn't. Null when that conflicts too, and when the branch took in the new base's history other than through
+ * the branch below.
+ */
+function squashOnto(cwd: string, move: Move, tip: string): string | null {
+  // Merging from where its own work forked off keeps out what the branch below landed and what came of it since.
+  const fork = mergeBase(cwd, move.upstream, tip);
+  const shared = mergeBase(cwd, move.onto, tip);
+  // A base merged in directly counts as the branch's own change against `fork`, bringing back what the base undid since.
+  if (fork === null || shared === null || !isAncestor(cwd, shared, fork)) return null;
+  const tree = mergedTree(cwd, fork, move.onto, tip);
+  const own = nonMergeCommits(cwd, fork, tip, [move.onto]);
+  if (tree === null || own.length === 0) return null;
+  const subject = (commit: { message: string }) => commit.message.split(/\r?\n/)[0];
+  const message = `${subject(own[0])}\n\n${own.map((commit) => `- ${subject(commit)}`).join("\n")}`;
+  return commitOnto(cwd, tree, move.onto, message, authorOf(cwd, own[0].sha));
+}
+
+/**
  * Rebase `rec`'s branch, at `tip`, as `move` says, in a temporary worktree, so merges that brought fixes up from below
- * drop out and its PR lists only its own commits. Then push it with a lease on `remote`, origin's tip read before the
- * rebase, record its new base, retarget its PR and record its new parent. A branch never pushed and without a PR is only
- * recorded; fbs push pushes it later. The local branch follows when it is at or behind `tip`. A conflict or a refused push
- * leaves the branch, here and on origin, as it was.
+ * drop out and its PR lists only its own commits; when the rebase conflicts, fold its own change into one commit
+ * instead. Then push it with a lease on `remote`, origin's tip read before the rebase, record its new base, retarget its
+ * PR and record its new parent. A branch never pushed and without a PR is only recorded; fbs push pushes it later. The
+ * local branch follows when it is at or behind `tip`. A conflict or a refused push leaves the branch, here and on
+ * origin, as it was.
  */
 function restackBranch(cwd: string, gh: GhRunner, rec: FeatureRecord, move: Move, tip: string, remote: string | null, local: string | null): Restacked | Stop {
   const branch = rec.branch as NonNullable<FeatureRecord["branch"]>;
@@ -93,10 +123,13 @@ function restackBranch(cwd: string, gh: GhRunner, rec: FeatureRecord, move: Move
   if (checkout !== null && !isWorkTreeClean(checkout)) return { kind: "dirty", reason: `${name} is checked out at ${checkout} with uncommitted changes; commit or stash them, then sync again` };
 
   let rebased = tip;
+  let squashed = false;
   if (!isAncestor(cwd, move.holds, tip)) {
     const result = inTempWorktree(cwd, tip, (work) => (rebaseOnto(work, move.onto, move.upstream, tip) ? (commitOf(work, "HEAD") as string) : null));
-    if (result === null) return { kind: "conflict", reason: `rebasing ${name} onto ${move.label} conflicts; ${name} is left as it was, rebase it by hand` };
-    rebased = result;
+    squashed = result === null;
+    const next = result ?? squashOnto(cwd, move, tip);
+    if (next === null) return { kind: "conflict", reason: `rebasing ${name} onto ${move.label} conflicts, and so does folding its change into one commit; ${name} is left as it was, rebase it by hand` };
+    rebased = next;
   }
 
   const published = rec.pr !== null || branch.pushed !== undefined;
@@ -121,7 +154,7 @@ function restackBranch(cwd: string, gh: GhRunner, rec: FeatureRecord, move: Move
     updateFeature(cwd, rec.slug, (current) => (current.branch?.name === name ? { ...current, branch: { ...current.branch, parent: move.parent } } : current));
   }
   const stop = problems.length === 0 ? undefined : { kind: problems[0].kind, reason: problems.map((p) => p.reason).join("; ") };
-  return { rebased, retargeted: retarget && !failed, ...(stop && { stop }) };
+  return { rebased, retargeted: retarget && !failed, squashed, ...(stop && { stop }) };
 }
 
 /** GitHub retargets a PR in a GitHub stack itself and refuses gh pr edit on it; what counts is that its base is right. */
@@ -167,8 +200,9 @@ function restackFromOrigin(cwd: string, gh: GhRunner, rec: FeatureRecord, defaul
     const result = restackBranch(cwd, gh, rec, move, tip, remote, local);
     if ("kind" in result) return fail(result);
     const moved = { from: tip, to: result.rebased };
-    if (result.stop !== undefined) return { restack: { slug, pr, done: false, ...result.stop }, moved };
-    return { restack: { slug, pr, done: true, treeChanged: commitTree(cwd, result.rebased) !== (rec.stamp?.tree ?? commitTree(cwd, remote ?? tip)) }, moved };
+    const squashed = result.squashed && { squashed: true as const, squashedFrom: tip };
+    if (result.stop !== undefined) return { restack: { slug, pr, done: false, ...result.stop, ...squashed }, moved };
+    return { restack: { slug, pr, done: true, treeChanged: commitTree(cwd, result.rebased) !== (rec.stamp?.tree ?? commitTree(cwd, remote ?? tip)), ...squashed }, moved };
   } catch (e) {
     return fail({ kind: "error", reason: (e as Error).message.split("\n")[0] });
   }
@@ -210,6 +244,9 @@ export interface SyncedUnit {
   /** Against the unit's stamp, else origin's tip before the sync, else the local one. */
   treeChanged: boolean;
   retargeted: boolean;
+  /** Its restack folded its own change into one commit from the old tip `squashedFrom`, as for Restack. */
+  squashed?: true;
+  squashedFrom?: string;
   /** It has a PR or a recorded push and origin's copy isn't its tip. */
   pushNeeded: boolean;
   done: boolean;
@@ -221,12 +258,14 @@ export interface SyncedUnit {
  * A record whose PR sync found merged or closed without fbs land. `landed`: merged into the default branch, now recorded
  * as landed, with `stacked` what restacking each plain feature cut from its branch did; `closed`: closed unmerged, left
  * as it was; `merged-elsewhere`: merged into another branch, left as it was; `gh-failed`: gh couldn't tell, so nothing
- * was recorded.
+ * was recorded. With `parent`, a branch no fbs record owns that `slug` was cut from, `pr` is that branch's merged PR (null
+ * when gh couldn't tell) and `parent-kept` says it merged while the branch still exists on origin, so `slug` stays on it.
  */
 export interface Outside {
   slug: string;
-  pr: number;
-  kind: "landed" | "closed" | "merged-elsewhere" | "gh-failed";
+  pr: number | null;
+  parent?: string;
+  kind: "landed" | "closed" | "merged-elsewhere" | "gh-failed" | "parent-kept";
   reason: string;
   stacked?: Restack[];
 }
@@ -260,13 +299,16 @@ export function syncStack(cwd: string, slug: string, gh: GhRunner, today: string
   let below: FeatureRecord | null = null;
   let moved: Moved | null = null;
   const landedHeads = units.flatMap((unit) => (unit.landed?.head === undefined ? [] : [unit.landed.head]));
+  const parent = units[0]?.landed === undefined ? unknownParentLanding(cwd, gh, units[0], main) : null;
+  if (parent !== null && "kind" in parent) outside.push(parent);
+  const parentLanded = parent !== null && !("kind" in parent) ? parent : null;
   for (const unit of units) {
     if (unit.landed !== undefined) {
       below = unit;
       continue;
     }
     if (unit.branch === undefined) break;
-    const result = syncUnit(cwd, gh, unit, below, moved, main, landedHeads);
+    const result = syncUnit(cwd, gh, unit, below, moved, below === null ? parentLanded : null, main, landedHeads);
     synced.push(result.unit);
     if (!result.unit.done && result.moved === null) break;
     below = readFeature(cwd, unit.slug);
@@ -278,7 +320,8 @@ export function syncStack(cwd: string, slug: string, gh: GhRunner, today: string
 /**
  * A plain feature: its own PR merged outside fbs land is recorded as landed first, restacking what was cut from it.
  * One cut from another feature's branch is, once that feature landed (by fbs land, or merged outside it and recorded
- * here), restacked onto the default branch as land would have. Otherwise there is nothing to do.
+ * here), restacked onto the default branch as land would have; so is one cut from a branch no fbs record owns, once gh
+ * finds that branch's PR merged. Otherwise there is nothing to do.
  */
 function syncPlain(cwd: string, gh: GhRunner, rec: FeatureRecord, main: string, today: string): SyncResult {
   const own = noticeLanding(cwd, gh, rec, main, today);
@@ -286,13 +329,49 @@ function syncPlain(cwd: string, gh: GhRunner, rec: FeatureRecord, main: string, 
   const parentName = rec.branch?.parent;
   if (rec.landed !== undefined || own?.kind === "landed" || parentName === undefined || parentName === null || parentName === main) return nothing;
   const parent = listFeatures(cwd, () => {}).find((other) => other.slug !== rec.slug && other.branch?.name === parentName);
-  if (parent === undefined) return nothing;
+  if (parent === undefined) {
+    const landed = unknownParentLanding(cwd, gh, rec, main);
+    if (landed === null) return nothing;
+    if ("kind" in landed) return { ...nothing, outside: [...nothing.outside, landed] };
+    return { ...nothing, restack: restackAbove(cwd, gh, rec, main, landed) };
+  }
   const found = parent.landed === undefined ? noticeLanding(cwd, gh, parent, main, today) : null;
   const outside = [...nothing.outside, ...(found === null ? [] : [found])];
   const landed = readFeature(cwd, parent.slug).landed;
   if (landed === undefined) return { ...nothing, outside };
   const restack = found?.stacked?.find((other) => other.slug === rec.slug) ?? restackAbove(cwd, gh, rec, main, { head: landed.head ?? null, squash: landed.commit });
   return { units: [], outside, restack };
+}
+
+/**
+ * How `rec`'s parent landed, when it is a branch no fbs record owns and gh finds a PR from it merged into the default
+ * branch (or onto it, as in a GitHub stack merged whole) holding the commit `rec` was cut at, and the branch is gone from
+ * origin. A note instead when gh can't tell or the branch is still there; null when there's nothing to say.
+ */
+function unknownParentLanding(cwd: string, gh: GhRunner, rec: FeatureRecord, main: string): LandedBelow | Outside | null {
+  const parent = rec.branch?.parent;
+  if (parent === undefined || parent === null || parent === main) return null;
+  if (listFeatures(cwd, () => {}).some((other) => other.branch?.name === parent)) return null;
+  const note = (pr: number | null, kind: Outside["kind"], reason: string): Outside => ({ slug: rec.slug, pr, parent, kind, reason });
+  const repo = rec.repo === undefined ? [] : ["--repo", rec.repo];
+  const result = gh(["pr", "list", "--head", parent, ...repo, "--state", "merged", "--json", "number,headRefOid,mergeCommit,baseRefName"], cwd);
+  let prs: { number?: unknown; headRefOid?: unknown; mergeCommit?: { oid?: unknown } | null; baseRefName?: unknown }[];
+  try {
+    if (result.code !== 0) throw new Error(result.stderr.trim().split("\n")[0] ?? "");
+    prs = JSON.parse(result.stdout);
+    if (!Array.isArray(prs)) throw new Error("not a list of PRs");
+  } catch (e) {
+    return note(null, "gh-failed", `gh pr list could not tell whether ${parent}, which ${rec.slug} was cut from, was merged: ${(e as Error).message}`);
+  }
+  const base = (rec.branch as FeatureBranch).base;
+  // A long-lived branch's older PR merged before this feature was cut from it says nothing about where it stands now.
+  const holdsBase = (head: string) => (commitOf(cwd, head) !== null || fetchCommit(cwd, head)) && isAncestor(cwd, base, head);
+  const pr = prs.find((p) => typeof p.headRefOid === "string" && typeof p.mergeCommit?.oid === "string" && (p.baseRefName === main || onOriginMain(cwd, p.mergeCommit.oid, main)) && holdsBase(p.headRefOid));
+  if (pr === undefined) return null;
+  const number = typeof pr.number === "number" ? pr.number : null;
+  // A long-lived branch, such as git-flow's develop, outlives its release PRs; GitHub deletes a head branch that is done.
+  if (fetchOriginBranch(cwd, parent)) return note(number, "parent-kept", `PR #${number} from ${parent} was merged into ${main}, but ${parent} still exists on origin, so ${rec.slug} stays on it; if ${parent} is done, delete it on origin and sync again`);
+  return { head: pr.headRefOid as string, squash: pr.mergeCommit?.oid as string };
 }
 
 /**
@@ -377,10 +456,11 @@ function branchRef(cwd: string, branch: string, main: string): { ref: string; la
 }
 
 /**
- * `movedBelow` is how this run restacked the unit below, which a unit stacked on it rebases across; `landedHeads` are the
- * pre-squash heads of the feature's landed units.
+ * `movedBelow` is how this run restacked the unit below, which a unit stacked on it rebases across; `parentLanded` is how
+ * the parent branch no fbs record owns landed, for the lowest unit; `landedHeads` are the pre-squash heads of the
+ * feature's landed units.
  */
-function syncUnit(cwd: string, gh: GhRunner, unit: UnitRecord, below: FeatureRecord | null, movedBelow: Moved | null, main: string, landedHeads: string[]): { unit: SyncedUnit; moved: Moved | null } {
+function syncUnit(cwd: string, gh: GhRunner, unit: UnitRecord, below: FeatureRecord | null, movedBelow: Moved | null, parentLanded: LandedBelow | null, main: string, landedHeads: string[]): { unit: SyncedUnit; moved: Moved | null } {
   const name = (unit.branch as NonNullable<UnitRecord["branch"]>).name;
   const result: SyncedUnit = { slug: unit.slug, unit: unit.unit, fastForwarded: false, merged: null, treeChanged: false, retargeted: false, pushNeeded: false, done: false };
   const stop = (kind: StopKind, reason: string) => ({ unit: { ...result, kind, reason }, moved: null });
@@ -412,15 +492,16 @@ function syncUnit(cwd: string, gh: GhRunner, unit: UnitRecord, below: FeatureRec
 
   const parent = unit.branch?.parent ?? main;
   const onBelow = below?.branch !== undefined && parent === below.branch.name;
+  const landedBelow = onBelow && below?.landed !== undefined ? { head: below.landed.head ?? null, squash: below.landed.commit } : parentLanded;
   let move: Move | Stop | null = null;
-  if (onBelow && below?.landed !== undefined) move = ontoDefault(cwd, { head: below.landed.head ?? null, squash: below.landed.commit }, main, (unit.branch as NonNullable<UnitRecord["branch"]>).base);
+  if (landedBelow !== null) move = ontoDefault(cwd, landedBelow, main, (unit.branch as NonNullable<UnitRecord["branch"]>).base);
   else if (onBelow && movedBelow !== null && movedBelow.from !== movedBelow.to) move = ontoMoved(movedBelow, parent);
   if (move !== null) {
     if ("kind" in move) return stop(move.kind, move.reason);
     const restacked = restackBranch(cwd, gh, unit, move, tip, remote, tip);
     if ("kind" in restacked) return stop(restacked.kind, restacked.reason);
     const moved = { from: tip, to: restacked.rebased };
-    const after = { ...result, merged: restacked.rebased === tip ? null : move.label, treeChanged: commitTree(cwd, restacked.rebased) !== startTree, retargeted: restacked.retargeted };
+    const after = { ...result, merged: restacked.rebased === tip ? null : move.label, treeChanged: commitTree(cwd, restacked.rebased) !== startTree, retargeted: restacked.retargeted, ...(restacked.squashed && { squashed: true as const, squashedFrom: tip }) };
     return { unit: restacked.stop === undefined ? { ...after, done: true } : { ...after, ...restacked.stop }, moved };
   }
 

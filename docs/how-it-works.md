@@ -112,7 +112,7 @@ A big feature can ship as several PRs, so each review stays small. Architect spl
 
 Units are built bottom-up, each branch on top of the one below. `fbs stack sync` keeps the stack whole: it merges each unit's latest work forward into the units above, records a PR merged outside fbs, and stops at the first conflict. A fix found in review goes to the unit that owns the code, then is merged up the stack.
 
-Only the lowest unit can land, since only it is based on the default branch. After it lands, `fbs land` rebases the unit above onto the default branch, force-pushes it once with a lease from inside the CLI, and retargets its PR, so the next PR lists only its own commits. When a rebase changes a unit's tree, its stamp no longer holds and it is verified again.
+Only the lowest unit can land, since only it is based on the default branch. After it lands, `fbs land` rebases the unit above onto the default branch, force-pushes it once with a lease from inside the CLI, and retargets its PR, so the next PR lists only its own commits. When replaying a unit's commits conflicts across the merges that brought the unit below in, the restack folds the unit's own change into one commit on its new base instead, and says so; only when that conflicts too does it stop. When a rebase changes a unit's tree, its stamp no longer holds and it is verified again. A feature cut from a branch made outside fbs is restacked the same way once `fbs stack sync` finds that branch's PR merged and the branch deleted on origin; while the branch still exists, as a long-lived `develop` does, sync only says so.
 
 ## The issue tracker
 

@@ -294,6 +294,37 @@ export function rebaseOnto(cwd: string, onto: string, upstream: string, branch: 
   throw new GitError(`cannot rebase ${branch} onto ${onto}: ${firstLine(result.stderr || result.stdout)}`);
 }
 
+/** The tree of merging `theirs` into `ours` with `base` as the merge base, without a work tree; null on a conflict. */
+export function mergedTree(cwd: string, base: string, ours: string, theirs: string): string | null {
+  const result = runGit(cwd, ["merge-tree", "--write-tree", "--merge-base", base, ours, theirs]);
+  // 129: a git before 2.40 has no --merge-base, which only costs the caller its fallback.
+  if (result.exitCode === 1 || result.exitCode === 129) return null;
+  if (!result.ok) throw new GitError(`cannot merge ${theirs} into ${ours}: ${firstLine(result.stderr)}`);
+  return result.stdout.split("\n")[0];
+}
+
+/** Who wrote `commit`, and when. */
+export interface Author {
+  name: string;
+  email: string;
+  date: string;
+}
+
+export function authorOf(cwd: string, commit: string): Author {
+  const result = runGit(cwd, ["log", "-1", "--no-show-signature", "--format=%an%x00%ae%x00%aI", "--end-of-options", commit]);
+  if (!result.ok) throw new GitError(`cannot read the author of ${commit}: ${firstLine(result.stderr)}`);
+  const [name, email, date] = result.stdout.trim().split("\0");
+  return { name, email, date };
+}
+
+/** A new commit of `tree` whose only parent is `parent`, written by `author`. */
+export function commitOnto(cwd: string, tree: string, parent: string, message: string, author: Author): string {
+  const env = { GIT_AUTHOR_NAME: author.name, GIT_AUTHOR_EMAIL: author.email, GIT_AUTHOR_DATE: author.date };
+  const result = runGit(cwd, ["commit-tree", tree, "-p", parent, "-m", message], env);
+  if (!result.ok) throw new GitError(`cannot commit ${tree} onto ${parent}: ${firstLine(result.stderr)}`);
+  return result.stdout.trim();
+}
+
 /** Point the unborn `branch` at a new empty root commit; the index and work tree are left alone. */
 export function makeEmptyRootCommit(cwd: string, branch: string, message: string): string {
   const tree = runGit(cwd, ["hash-object", "-t", "tree", "-w", "/dev/null"]);

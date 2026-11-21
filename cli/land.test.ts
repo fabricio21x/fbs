@@ -787,7 +787,7 @@ describe("landing a stack", () => {
       mergeCommit: squash(),
       slug: "f-api",
       unit: 1,
-      restack: { slug: "f-ui", pr: 22, done: false, kind: "conflict", reason: "rebasing feature/f-ui onto origin/main conflicts; feature/f-ui is left as it was, rebase it by hand" },
+      restack: { slug: "f-ui", pr: 22, done: false, kind: "conflict", reason: "rebasing feature/f-ui onto origin/main conflicts, and so does folding its change into one commit; feature/f-ui is left as it was, rebase it by hand" },
     });
     expect(readFeature(s.work, "f-api").landed?.commit).toBe(squash());
     expect(git(s.origin, "rev-parse", "refs/heads/feature/f-ui")).toBe(before.branch?.pushed as string);
