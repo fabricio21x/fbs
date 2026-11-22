@@ -2,8 +2,10 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { dirname, join } from "node:path";
 import { projectConfig } from "./config";
 import { gitCommonDir } from "./git";
+import type { GhRunner } from "./github";
 import { campMarkerPath } from "./guard";
-import { featureUnits, isUnit, readFeature } from "./status";
+import { noticeLandings, type Outside } from "./stack";
+import { type FeatureRecord, featureUnits, isUnit, readFeature } from "./status";
 
 export const DEFAULT_AUTO_FIX_ROUNDS = 2;
 
@@ -24,6 +26,8 @@ export interface CampState {
   rounds: Round[];
   /** The scopes (a unit's slug, else the camp's) whose checkpoint was held. */
   checkpoints: string[];
+  /** The Claude Code session that holds the camp; a watcher from another session stops. */
+  session?: string;
 }
 
 /** A valid finding left out of scope, kept beside the camp file so it outlives the camp until a ticket is filed. */
@@ -52,23 +56,54 @@ export function campPhase(state: CampState, scope: string, slug: string): Phase 
   return state.checkpoints.includes(scope) ? "blockers-only" : "checkpoint";
 }
 
-/** Create the camp, or on a resume keep its rounds; an explicit budget replaces the recorded one. */
-export function startCamp(cwd: string, slug: string, autoFixRounds: number | undefined, warn: (s: string) => void): object {
+/** The records a camp on `slug` works: a feature's units, else the record itself. */
+function campRecords(cwd: string, slug: string): FeatureRecord[] {
   const rec = readFeature(cwd, slug);
   const units = isUnit(rec) ? [] : featureUnits(cwd, slug);
+  return units.length > 0 ? units : [rec];
+}
+
+/**
+ * Create the camp, or on a resume keep its rounds; an explicit budget replaces the recorded one. A PR merged outside
+ * fbs is recorded as landed first. `session` takes the camp over from another; null leaves its holder as it is.
+ */
+export function startCamp(cwd: string, slug: string, autoFixRounds: number | undefined, session: string | null, gh: GhRunner, today: string, warn: (s: string) => void): object {
+  const outside = noticeLandings(cwd, gh, campRecords(cwd, slug), today);
   // A camp file would switch the never-merge guard back on for work that is already merged.
-  if (rec.landed !== undefined || (units.length > 0 && units.every((unit) => unit.landed !== undefined))) throw new CampError(`${slug} has landed; there is nothing to camp`);
+  if (campRecords(cwd, slug).every((rec) => rec.landed !== undefined)) {
+    const recorded = outside.filter((found) => found.kind === "landed").map((found) => found.reason);
+    throw new CampError(`${slug} has landed; there is nothing to camp${recorded.length > 0 ? ` (${recorded.join("; ")})` : ""}`);
+  }
   const path = campMarkerPath(gitCommonDir(cwd), slug);
   const existing = existsSync(path) ? readState(path, warn) : null;
   const budget = autoFixRounds ?? existing?.autoFixRounds ?? projectConfig(cwd).camp?.autoFixRounds ?? DEFAULT_AUTO_FIX_ROUNDS;
-  const state: CampState = { autoFixRounds: budget, rounds: existing?.rounds ?? [], checkpoints: existing?.checkpoints ?? [] };
+  const holder = session ?? existing?.session;
+  const state: CampState = { autoFixRounds: budget, rounds: existing?.rounds ?? [], checkpoints: existing?.checkpoints ?? [], ...(holder !== undefined && { session: holder }) };
   writeState(path, state);
-  return view(cwd, state, slug, undefined);
+  const takenOverFrom = session !== null && existing?.session !== undefined && existing.session !== session ? existing.session : undefined;
+  return { ...view(cwd, state, slug, undefined), ...(takenOverFrom !== undefined && { takenOverFrom }), ...(outside.length > 0 && { outside }) };
+}
+
+/** The camp on `slug` and the session holding it (null when it names none); null when there is no camp. */
+export function campOwner(cwd: string, slug: string): { session: string | null } | null {
+  const path = campMarkerPath(gitCommonDir(cwd), slug);
+  return existsSync(path) ? { session: readState(path, () => {})?.session ?? null } : null;
+}
+
+/** The other session holding the camp when `session` is a different one; a caller or camp without a session never conflicts. */
+function heldElsewhere(holder: string | undefined, session: string | null): string | null {
+  return holder !== undefined && session !== null && holder !== session ? holder : null;
+}
+
+function refuseIfHeldElsewhere(state: CampState, session: string | null): void {
+  const other = heldElsewhere(state.session, session);
+  if (other !== null) throw new CampError(`camp held by ${other}; camp start takes it over`);
 }
 
 /** Append a round and say what the next one may do: continue, checkpoint (until it is recorded), or blockers-only. */
-export function recordRound(cwd: string, slug: string, unit: string | undefined, counts: Counts, note: string | undefined, today: string, warn: (s: string) => void): "continue" | Exclude<Phase, "auto"> {
+export function recordRound(cwd: string, slug: string, unit: string | undefined, counts: Counts, note: string | undefined, today: string, session: string | null, warn: (s: string) => void): "continue" | Exclude<Phase, "auto"> {
   const { path, state } = openCamp(cwd, slug, unit, warn);
+  refuseIfHeldElsewhere(state, session);
   const scope = unit ?? slug;
   const number = state.rounds.filter((round) => (round.unit ?? slug) === scope).length + 1;
   state.rounds.push({ number, date: today, ...(unit !== undefined && { unit }), ...counts, ...(note !== undefined && { note }) });
@@ -78,8 +113,9 @@ export function recordRound(cwd: string, slug: string, unit: string | undefined,
 }
 
 /** Record that the checkpoint was held, so later rounds (and a resume) are blockers-only. */
-export function recordCheckpoint(cwd: string, slug: string, unit: string | undefined, warn: (s: string) => void): Phase {
+export function recordCheckpoint(cwd: string, slug: string, unit: string | undefined, session: string | null, warn: (s: string) => void): Phase {
   const { path, state } = openCamp(cwd, slug, unit, warn);
+  refuseIfHeldElsewhere(state, session);
   const scope = unit ?? slug;
   const phase = campPhase(state, scope, slug);
   if (phase === "auto") throw new CampError(`no checkpoint is due for ${scope}: the budget is ${state.autoFixRounds} ${state.autoFixRounds === 1 ? "round" : "rounds"} that fixed something`);
@@ -99,6 +135,7 @@ function view(cwd: string, state: CampState, slug: string, unit: string | undefi
   return {
     slug,
     ...(unit !== undefined && { unit }),
+    ...(state.session !== undefined && { session: state.session }),
     autoFixRounds: state.autoFixRounds,
     phase: campPhase(state, unit ?? slug, slug),
     ...(units.length > 0 && { units: Object.fromEntries(units.map((name) => [name, campPhase(state, name, slug)])) }),
@@ -108,10 +145,24 @@ function view(cwd: string, state: CampState, slug: string, unit: string | undefi
   };
 }
 
-/** Remove the camp file, which switches the never-merge guard off; its follow-ups stay. */
-export function stopCamp(cwd: string, slug: string): void {
-  readFeature(cwd, slug);
-  rmSync(campMarkerPath(gitCommonDir(cwd), slug), { force: true });
+/**
+ * Remove the camp file, which switches the never-merge guard off; its follow-ups stay. A PR merged outside fbs is
+ * recorded as landed, one closed unmerged has its link cleared. A camp another session holds is refused while a PR it
+ * camps is still open.
+ */
+export function stopCamp(cwd: string, slug: string, session: string | null, gh: GhRunner, today: string): Outside[] {
+  const records = campRecords(cwd, slug);
+  const path = campMarkerPath(gitCommonDir(cwd), slug);
+  const other = heldElsewhere(existsSync(path) ? readState(path, () => {})?.session : undefined, session);
+  if (other === null) {
+    // Removed first, so a failure asking gh below can't leave the camp switched on.
+    rmSync(path, { force: true });
+    return noticeLandings(cwd, gh, records, today);
+  }
+  const outside = noticeLandings(cwd, gh, records, today);
+  if (campRecords(cwd, slug).some((rec) => rec.pr !== null && rec.landed === undefined)) throw new CampError(`camp held by ${other}; camp start takes it over`);
+  rmSync(path, { force: true });
+  return outside;
 }
 
 export function addFollowup(cwd: string, slug: string, unit: string | undefined, found: Pick<Followup, "thread" | "summary" | "why">, today: string, warn: (s: string) => void): Followup {
@@ -207,7 +258,8 @@ function parseState(raw: unknown): CampState | null {
   if (!isObject(raw) || !isCount(raw.autoFixRounds) || raw.autoFixRounds < 1 || !Array.isArray(raw.rounds) || !Array.isArray(raw.checkpoints)) return null;
   if (!raw.checkpoints.every((scope) => typeof scope === "string")) return null;
   if (!raw.rounds.every(isRound)) return null;
-  return { autoFixRounds: raw.autoFixRounds, rounds: raw.rounds, checkpoints: raw.checkpoints };
+  if (!(raw.session === undefined || (typeof raw.session === "string" && raw.session !== ""))) return null;
+  return { autoFixRounds: raw.autoFixRounds, rounds: raw.rounds, checkpoints: raw.checkpoints, ...(raw.session !== undefined && { session: raw.session }) };
 }
 
 function isRound(value: unknown): value is Round {

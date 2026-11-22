@@ -39,7 +39,7 @@ Then look for earlier work on this stage:
 
 Read `<dir>/spec.md`, and `<dir>/changes.md` when it exists: design to the spec and to its `open` design-level entries, and mark those `planned` once the design holds them. The spec's scope, criteria and decisions are settled input; don't reopen them.
 
-Run `fbs branch <slug> --type feature` before writing anything (the type only names a branch plan didn't create), so the design is committed on the feature's branch; say each `note:` in one line; on `refused:`, show it to the user and do what they choose, never discarding their changes.
+Run `fbs branch --types`, then `fbs branch <slug> --type <type>` before writing anything (the type only names a branch plan didn't create: `feat` or `feature`, whichever its `types` lists, else the closest type it lists), so the design is committed on the feature's branch; say each `note:` in one line; on `refused:`, show it to the user and do what they choose, never discarding their changes.
 
 ## 2. Load the principles
 
@@ -94,7 +94,7 @@ Settle every other point yourself and list it under **Assuming**. When nothing q
 - Replace each guidance comment with the content. A section with nothing to say gets `None`; leave `## Gulag outcome` as `(Filled after the gulag.)`.
 - **Data shapes** come before any flow. **File map** is a tree with a one-line purpose per entry. **UI direction**, when the feature has screens: read `${CLAUDE_SKILL_DIR}/ui-direction.md` (if unexpanded: `<plugin root>/skills/architect/ui-direction.md`) and follow it.
 - **Rollout** fits the project's real stage and cites the sourced fact it rests on.
-- **Work units:** split the feature into the PRs it ships as, so each review is small. A unit is approvable on its own (a reviewer can judge it without the next one) and ships something whole: cut by feature, not by layer (an endpoint and its only screen are one unit), and fold types, constants and helpers into the first unit that uses them. Order units so each one's dependencies come first; when two units touch the same file, say so and make the later one depend on the earlier. Every acceptance criterion is covered by exactly one unit (the gate checks it); a unit covering none is setup that the next unit needs. When the feature came from a ticket that already has sub-issues, start from them and say where your split differs. A feature small enough for one PR gets `None`.
+- **Work units:** split the feature into the PRs it ships as, so each review is small. A unit is approvable on its own (a reviewer can judge it without the next one) and ships something whole: cut by feature, not by layer (an endpoint and its only screen are one unit), and fold types, constants and helpers into the first unit that uses them. Order units so each one's dependencies come first; when two units touch the same file, say so and make the later one depend on the earlier. Every acceptance criterion is covered by exactly one unit (the gate checks it); a unit covering none is setup that the next unit needs. Write `- Depends on:` honestly, never just the unit below: a unit that depends on no unit still to land, and that no later unit depends on, can be built off the default branch and land on its own (assemble's stack rules). When the feature came from a ticket that already has sub-issues, start from them and say where your split differs. A feature small enough for one PR gets `None`.
 
 **Mid:** replace the placeholder under the spec's `## Design` with these `###` subsections, in order: Impact, Constraints, Options and recommendation, Data shapes, UI direction, File map, Test seams, Risks, Rollout, Gulag outcome. Merge this stage's facts, assumptions, open questions and decisions into the spec's top-level `## Facts`, `## Assumptions`, `## Open questions` and `## Decision log`; never repeat them under `## Design`.
 
@@ -150,7 +150,7 @@ If the document changes after approval, rerun the gate, rewrite the overview (Bi
 
 ## 10. End
 
-Once the design is approved, commit everything this stage wrote (the feature's documents and mockups when `docs` is `tracked`, plus any `PRODUCT.md`, `DESIGN.md` or `CLAUDE.md` change from the UI direction; `docs: design for <slug>`) and push it with `fbs push <slug>`, so the issues can link to it.
+Once the design is approved, commit everything this stage wrote (the feature's documents and mockups when `docs` is `tracked`, plus any `PRODUCT.md`, `DESIGN.md` or `CLAUDE.md` change from the UI direction; `docs: design for <slug>`) and push it with `fbs push <slug>`, so the issues can link to it. Then load `fbs:docs` and run its publish step, before the tracker step so new issues link to the published design: it mirrors the approved documents when `fbs config show` has a `docs.publish`, and does nothing without one.
 
 **The work units** (Big, when `## Work units` isn't `None`). Each unit gets its own record, so it gets its own branch, verify stamp and PR: for each `### U<n>: <name>` in order, pick a unit slug (the unit's name as lowercase words joined by `-`, at most four words, unique among `fbs status list`) and run `fbs status init <unit slug> --unit-of <slug>`, which numbers it next. Skip units the record already lists (`fbs status show <slug>` lists `units`).
 

@@ -19,7 +19,7 @@ workflows/panel.js   the review panel as a Claude Code workflow
 
 ## Setup
 
-Requires [Bun](https://bun.sh) 1.3 or newer, git, and Claude Code.
+Requires [Bun](https://bun.sh) 1.3 or newer, git 2.40 or newer (an older git only loses the restack's one-commit fallback), and Claude Code.
 
 ```bash
 git clone https://github.com/fabricio21x/fbs.git

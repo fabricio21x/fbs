@@ -31,8 +31,8 @@ Every expected result you state comes from the spec, the design or the code, nev
 3. **Agenda.** A numbered list of the features to show, each with who is signed in and the expected behaviour from the spec. Sequence it so the data each step needs can already exist by then.
 4. **Sign-in.** The user types every password; never fill a sign-in form. Follow Auth in `.fbs/validation/README.md`, and when a second persona is needed, the user acts in their own private window on your instructions.
 5. **Demo data** through the product's own flows, so its history is real. A shortcut that bypasses them (a seed script, SQL) is used only for setup the review doesn't cover, and each one is named to the user. Never reset or drop a database.
-6. Launch the app as `.fbs/validation/README.md` says, if it isn't running.
-7. Read `${CLAUDE_SKILL_DIR}/notepad-template.md` (if unexpanded: `<plugin root>/skills/walkthrough/notepad-template.md`) and create the notepad at `<dir>/walkthrough-<YYYY-MM-DD>.md`. Show the agenda in your reply and ask the user to say when they're ready.
+6. Launch the app as `.fbs/validation/README.md` says, if it isn't running. **Show the latest work:** the checkout is at the branch's newest commit (pull when the remote is ahead; when `fbs status show` has a `pr`, HEAD equals `gh pr view <pr> --repo <repo> --json headRefOid`), a running app was started or rebuilt after that commit (restart it otherwise), and a preview deployment counts only when it was built from that sha. Say the sha you're showing in one line.
+7. Read `${CLAUDE_SKILL_DIR}/notepad-template.md` (if unexpanded: `<plugin root>/skills/walkthrough/notepad-template.md`) and create the notepad at `<dir>/walkthrough-<YYYY-MM-DD>.md`. Then, as the turn's last text message, show the agenda and ask the user to say when they're ready.
 
 ## 2. Each feature, one per turn
 
@@ -44,7 +44,7 @@ Every expected result you state comes from the spec, the design or the code, nev
    - what the demo can't show (a background job, an outside service), and what covers it instead (a test, saved validation evidence);
    - "Your notes, or 'next' to move on."
 
-   Then stop and wait.
+   This checklist is the last text message of the turn, after every tool call: the user sees only what the chat shows, so writing it into the notepad never replaces showing it. The notepad holds a copy. Then stop and wait.
 3. **When the user replies:**
    - save any pasted image next to the notepad as `f<N>-<what>.png`;
    - copy their notes into the feature's section **verbatim**;

@@ -1,0 +1,16 @@
+# Notion
+
+Notion is reached through its MCP server. Tool names depend on how it's connected (`mcp__claude_ai_Notion__notion-create-pages`, `mcp__notion__notion-create-pages`, …): find them with `ToolSearch` ("notion create pages"). Without them, say Notion can't be reached in this session; publishing is skipped for now.
+
+- **Format first:** page content is Notion-flavored Markdown. Before writing any, read its spec once per session: `notion-fetch` with `id: "notion://docs/notion-flavored-markdown-spec"`. Mermaid goes in a fenced code block tagged `mermaid`; the banner is the page's first paragraph, as a quote or a callout as the spec writes it.
+- **The parent:** `notion-fetch` with `id` set to `docs.publish.parent` (a URL or an id).
+  - A page: `parent: {"page_id": "<its id>"}`, and the title is `properties: {"title": "<title>"}`.
+  - A database: the fetch lists its data sources as `<data-source url="collection://…">`. Use `parent: {"data_source_id": "<that collection id>"}`, never the database id when it has more than one source, and put the title under the data source's title property, by its exact name from the fetched schema. Leave its other properties unset.
+  - A teamspace root: `parent: {"teamspace_id": "<id>"}`.
+- **Create the feature page:** `notion-create-pages` with `parent`, `pages: [{"properties": {"title": "<title>"}, "content": "<banner, problem and goal>"}]` and `allow_async: false`, since its id is needed next. The result carries each page's id and URL.
+- **Create child pages:** `notion-create-pages` with `parent: {"page_id": "<feature page id>"}` and one entry per page in `pages` (`Spec: <title>`, `Design: <title>`), `allow_async: false`.
+- **Find an existing page:** `notion-fetch` with the id from `published.md`. Without one, `notion-fetch` the parent page and look for a child `<page url="…">` with the exact title; under a database, `notion-search` with `query: "<exact title>"` and `data_source_url: "collection://…"`.
+- **Update a page:** `notion-fetch` it, then `notion-update-page` with `page_id`, `command: "replace_content"` and `new_str` holding the whole new content. The feature page has child pages: keep each `<page url="…">` tag exactly as fetched in `new_str`, and never pass `allow_deleting_content`; if the tool says child content would be deleted, stop and report it. A new title: `command: "update_properties"` with `properties: {"title": "<title>"}` (a database page: its title property's name).
+- **Was it edited since?** The fetch shows the page's last edit time; later than `Last published` in `published.md` means someone edited it in Notion.
+- **Mockups:** `notion-create-attachment` with `filename: "<screen>.html"` and `content` set to the file's text (up to 200 KiB). Place the returned `markdown_source` on the design page as `<embed source="<markdown_source>" />`, which Notion renders as a sandboxed preview. A larger file: `notion-create-file-upload` with `filename`, then one multipart POST to its `upload_url` with the file in the `file` field and every header in `upload_headers` (`curl -X POST -H '<header>: <value>' -F 'file=@<path>' '<upload_url>'`), then place its `suggested_markdown`. When an upload fails, list the path instead.
+- **Ids:** the page id and URL the results return go into `published.md`.

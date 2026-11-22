@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { type AfkGuardRun, afkDenials, campMarkerPath, commandDenials, denials, freshToken, type GuardContext, guardPrompt, guardReply, guardToolUse, landRequestPath, landTokenPath, afkRunsIn, REQUEST_TTL_MS, TOKEN_TTL_MS, takeLandToken, writeLandRequest, writeLandToken } from "./guard";
+import { type AfkGuardRun, afkDenials, campDenials, campMarkerPath, commandDenials, denials, freshToken, type GuardContext, guardPrompt, guardReply, guardToolUse, landRequestPath, landTokenPath, afkRunsIn, MCP_REVIEW_TOOLS, REQUEST_TTL_MS, TOKEN_TTL_MS, writePendingRequest, writeLandToken } from "./guard";
+import { REAL_AFK_DEPS } from "./afk";
 import { run } from "./main";
 import { updateFeature } from "./status";
 import { isolatedGitEnv } from "./test-env";
@@ -14,10 +15,19 @@ const ctx = (overrides: Partial<GuardContext> = {}): GuardContext => ({
   hasFreshToken: () => false,
   isCommit: () => false,
   isStepAbove: () => false,
+  onlyMessagesChanged: () => false,
+  hasRewriteToken: () => false,
   ...overrides,
 });
 
 describe("commandDenials", () => {
+  test("gh stack merge and the stack merge endpoint are the user's, like any merge", () => {
+    expect(commandDenials("gh stack merge 22 --squash", ctx())[0]).toContain("only the user merges it");
+    expect(commandDenials("gh stack merge --yes", ctx())[0]).toContain("only the user merges it");
+    expect(commandDenials("gh api -X PUT repos/acme/app/stacks/5/merge", ctx())[0]).toContain("stack merge endpoint");
+    expect(commandDenials("gh stack view --json", ctx())).toEqual([]);
+  });
+
   test.each([
     "npm test",
     "git status && git log --oneline | head",
@@ -100,7 +110,7 @@ describe("commandDenials", () => {
   });
 
   test("a lease push is denied to an open fbs PR's branch only, however the branch is named", () => {
-    const open = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x" }, { slug: "y", branch: null }] });
+    const open = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }, { slug: "y", branch: null, pr: 8 }] });
     for (const command of ["git push --force-with-lease origin feat/x", "git push --force-with-lease", "git push --force-with-lease=feat/x:abc origin HEAD", "git push --force-if-includes --force-with-lease origin HEAD:feat/x"]) {
       expect(commandDenials(command, open).join("\n")).toContain("fbs stack sync x");
     }
@@ -108,6 +118,70 @@ describe("commandDenials", () => {
     expect(commandDenials("git push origin feat/x", open)).toEqual([]);
     expect(commandDenials("fbs push x", open)).toEqual([]);
     expect(commandDenials("git push --force-with-lease origin feat/x", ctx({ openPrs: () => { throw new Error("broken"); } }))).toEqual([]);
+  });
+
+  test("a lease push to an open PR's branch passes when the commit pushed has the tree origin's tip has", () => {
+    const pushed: string[] = [];
+    const sameTree = (source: string) => (src: string, branch: string) => {
+      pushed.push(`${src} -> ${branch}`);
+      return src === source && branch === "feat/x";
+    };
+    const open = (source: string) => ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }], onlyMessagesChanged: sameTree(source) });
+    expect(commandDenials("git push --force-with-lease", open("HEAD"))).toEqual([]);
+    expect(commandDenials("git push --force-with-lease origin feat/x", open("feat/x"))).toEqual([]);
+    expect(commandDenials("git push --force-with-lease origin HEAD:feat/x", open("HEAD"))).toEqual([]);
+    expect(commandDenials("git push --force-with-lease=feat/x origin abc123:refs/heads/feat/x", open("abc123"))).toEqual([]);
+    expect(pushed).toEqual(["HEAD -> feat/x", "feat/x -> feat/x", "HEAD -> feat/x", "abc123 -> feat/x"]);
+    expect(commandDenials("git push --force-with-lease origin HEAD:feat/x", open("feat/x")).join("\n")).toContain("rewrites feat/x");
+  });
+
+  test("with several refspecs, only the one to the PR's branch is checked, against its own source", () => {
+    const seen: string[] = [];
+    const open = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }], onlyMessagesChanged: (src, branch) => (seen.push(`${src} -> ${branch}`), src === "fix" && branch === "feat/x") });
+    expect(commandDenials("git push --force-with-lease origin HEAD:feat/other fix:feat/x", open)).toEqual([]);
+    expect(seen).toEqual(["fix -> feat/x"]);
+    expect(commandDenials("git push --force-with-lease origin fix:feat/other HEAD:feat/x", open).join("\n")).toContain("rewrites feat/x");
+  });
+
+  test("the messages-only pass needs the push alone in the command, on origin's tip, where the refs are read", () => {
+    const same = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }], onlyMessagesChanged: () => true });
+    for (const command of [
+      "git push --force-with-lease=feat/x:abc123 origin feat/x",
+      "git -C ../other push --force-with-lease origin feat/x",
+      "git --git-dir=../other/.git push --force-with-lease origin feat/x",
+      "GIT_DIR=../other/.git git push --force-with-lease origin feat/x",
+      "cd ../other && git push --force-with-lease origin feat/x",
+      "git rebase origin/main && git push --force-with-lease origin feat/x",
+      "git reset --soft origin/main; git commit -m squash; git push --force-with-lease",
+      "(git push --force-with-lease origin feat/x)",
+      "git push --force-with-lease origin $(git rev-parse HEAD):feat/x",
+      "git push --force-with-lease origin HEAD:$BRANCH",
+    ]) {
+      expect(commandDenials(command, same).join("\n")).toContain("rewrites feat/x");
+    }
+  });
+
+  test("push options that take a value don't shift the remote: the lease and default-branch rules still see the target", () => {
+    const open = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }], currentBranch: () => "feat/x" });
+    for (const options of ["-o ci.skip", "--push-option ci.skip", "--repo origin", "--receive-pack git-receive-pack", "--exec git-receive-pack"]) {
+      expect(commandDenials(`git push ${options} --force-with-lease origin`, open).join("\n")).toContain("rewrites feat/x");
+      expect(commandDenials(`git push ${options} origin`, ctx({ currentBranch: () => "main" })).join("\n")).toContain("default branch (main)");
+    }
+    expect(commandDenials("git push -o ci.skip origin feat/y", ctx({ currentBranch: () => "main" }))).toEqual([]);
+  });
+
+  test("a rewrite token lets a lease push through; --force, -f and a + refspec stay denied with it or the same tree", () => {
+    const allowed = ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }], hasRewriteToken: () => true, onlyMessagesChanged: () => true });
+    expect(commandDenials("git push --force-with-lease origin feat/x", allowed)).toEqual([]);
+    for (const command of ["git push --force origin feat/x", "git push -f origin feat/x", "git push origin +feat/x", "git push --force-with-lease --force origin feat/x", "git push --force-with-lease origin +HEAD:feat/x"]) {
+      expect(commandDenials(command, allowed).join("\n")).toContain("use --force-with-lease alone");
+    }
+  });
+
+  test("a lease push's denial names the two ways through: a messages-only amend, or the user's own words", () => {
+    const reason = commandDenials("git push --force-with-lease origin feat/x", ctx({ openPrs: () => [{ slug: "x", branch: "feat/x", pr: 7 }] })).join("\n");
+    expect(reason).toContain("only messages changed");
+    expect(reason).toContain("run fbs rewrite request x and ask the user");
   });
 
   test("a nested claude run can't answer a land request: no resumed or continued session, no land prompt", () => {
@@ -132,7 +206,7 @@ describe("commandDenials", () => {
   });
 
   test("a merge's denial says how to ask the user for a land", () => {
-    expect(commandDenials("gh pr merge 7", ctx()).join("\n")).toContain("run fbs land request <slug> and ask them, or have them type /fbs:land <slug>");
+    expect(commandDenials("gh pr merge 7", ctx()).join("\n")).toContain("when they ask you to merge or land, their message writes a land token and you run fbs land <slug>; to ask them first, run fbs land request <slug>");
   });
 
   test("fbs land request is allowed; it writes a request, never a token", () => {
@@ -190,7 +264,8 @@ describe("denials", () => {
       ["Agent", { prompt: " land " }],
     ];
     for (const [tool, input] of cases) expect(deny(tool, input).join("\n")).toContain("only the user answers a land request");
-    expect(deny("ScheduleWakeup", { delaySeconds: 60, prompt: "check the PR, then land it if green" })).toEqual([]);
+    expect(deny("ScheduleWakeup", { delaySeconds: 60, prompt: "check the PR, then land it if green" }).join("\n")).toContain("only the user asks to land");
+    expect(deny("Agent", { prompt: "camp the PR until it is ready to land" })).toEqual([]);
     expect(deny("Skill", { skill: "loop", args: "5m /fbs:camp-pr x" })).toEqual([]);
     expect(deny("SendMessage", { to: "main", message: "landing page is done" })).toEqual([]);
   });
@@ -204,6 +279,106 @@ describe("denials", () => {
   test("Monitor commands are checked like Bash", () => {
     expect(deny("Monitor", { command: "gh pr merge 7" })).toHaveLength(1);
     expect(deny("Monitor", { command: "gh pr checks 7 --watch" })).toEqual([]);
+  });
+});
+
+describe("campDenials", () => {
+  // PR #7 is the open fbs PR; #45 is a tracker issue or someone else's PR.
+  const deny = (tool: string, input: Record<string, unknown>) => campDenials(tool, input, [7]);
+  const bashDeny = (command: string) => deny("Bash", { command });
+
+  test.each([
+    "gh api -X POST repos/acme/app/pulls/7/comments/123/replies -f body=Fixed",
+    "gh api repos/acme/app/pulls/7/comments/123/replies -f body='Fixed in abc1234'",
+    "gh api repos/{owner}/{repo}/pulls/7/comments/123/replies --input /tmp/r.json",
+    "gh api --method POST repos/acme/app/pulls/7/comments --input c.json",
+    "gh api repos/acme/app/pulls/7/comments/123/replies -fbody=x",
+    "gh api repos/acme/app/issues/7/comments -F body=@r.md",
+    "gh api repos/acme/app/issues/7/comments -Fbody=@r.md",
+    "gh api repos/acme/app/issues/$PR/comments -F body=@r.md",
+    "gh api repos/acme/app/issues/${PR}/comments -F body=@r.md",
+    "gh api repos/acme/app/pulls/${PR}/comments/1/replies -f body=x",
+    "gh api repos/acme/app/pulls/7/reviews -f event=COMMENT -f body=done",
+    "gh api -X POST repos/acme/app/pulls/7/reviews/99/events -f event=COMMENT",
+    `curl -X POST https://api.github.com/repos/acme/app/issues/7/comments -d '{"body":"x"}'`,
+    "curl --data-binary @r.json https://api.github.com/repos/acme/app/issues/7/comments",
+    `curl --json '{"body":"x"}' https://api.github.com/repos/acme/app/pulls/7/comments/1/replies`,
+    "curl -d@r.json https://api.github.com/repos/acme/app/issues/7/comments",
+    `gh api graphql -f query='mutation { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: "PRRT_a", body: "done"}) { comment { id } } }'`,
+    `gh api graphql -f query='mutation($id: ID!) { addPullRequestReviewComment(input: {pullRequestReviewId: $id, body: "x"}) { comment { id } } }'`,
+    `gh api graphql -f query='mutation { addPullRequestReview(input: {pullRequestId: "PR_a", event: COMMENT}) { pullRequestReview { id } } }'`,
+    `gh api graphql -f query='mutation { addComment(input: {subjectId: "PR_a", body: "x"}) { clientMutationId } }'`,
+    `gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { isResolved } } }'`,
+    `gh api graphql -f query='\nmutation {\n  addComment(input: {subjectId: "PR_a", body: "x; y"}) { clientMutationId }\n}'`,
+    "gh pr comment 7 --body done",
+    "gh pr comment --body-file r.md",
+    "gh pr comment https://github.com/acme/app/pull/7 -b done",
+    "gh pr comment $PR -b done",
+    "gh pr review 7 --approve",
+    "gh pr review --comment -b looks good",
+    "gh issue comment 7 --body-file r.md",
+    "gh issue comment https://github.com/acme/app/pull/7 -b done",
+    "gh issue comment $PR -b done",
+    "cd /repo && gh pr comment 7 -b done",
+    "GH_TOKEN=x command gh pr comment 7 -b done",
+    "env GH_HOST=github.com gh pr comment 7 -b done",
+    "echo $(gh pr comment 7 -b done)",
+  ])("a raw comment, reply, review or resolve on the camp's PR is denied, pointing to fbs: %s", (command) => {
+    const reasons = bashDeny(command);
+    expect(reasons).toHaveLength(1);
+    for (const way of ["fbs pr reply <slug>", "fbs pr comment <slug>", "fbs pr resolve <slug>", "ask the user to do it on GitHub"]) expect(reasons[0]).toContain(way);
+  });
+
+  test.each([
+    "gh api repos/acme/app/pulls/7/comments",
+    "gh api repos/acme/app/pulls/7/comments --paginate --jq '.[] | {id, body}'",
+    "gh api -X GET repos/acme/app/pulls/7/comments -f per_page=100",
+    "gh api repos/acme/app/issues/7/comments",
+    "gh api repos/acme/app/pulls/7/reviews",
+    "curl -fsSL https://api.github.com/repos/acme/app/issues/7/comments",
+    `gh api graphql -f query='query { repository(owner: "acme", name: "app") { pullRequest(number: 7) { reviewThreads(first: 50) { nodes { id isResolved } } } } }'`,
+    "gh pr view 7 --comments",
+    "gh pr checks 7 --watch",
+    "gh pr ready 7",
+    "gh issue comment 45 --body-file /repo/.git/fbs/c.md",
+    "gh api repos/acme/app/issues/45/comments -F body=@c.md",
+    "gh api -X POST repos/acme/app/issues/45/sub_issues -F sub_issue_id=99",
+    "gh pr comment 45 -b done",
+    "gh pr review 45 --approve",
+    "gh api -X POST repos/acme/app/pulls/45/comments/1/replies -f body=x",
+    "gh api -X POST repos/acme/app/pulls/7/comments/1/reactions -f content=+1",
+    "gh api -X POST repos/acme/app/issues/comments/9/reactions -f content=+1",
+    "fbs pr reply x --comment thread:123 --body-file /repo/.git/fbs/pr/r.md",
+    "fbs pr comment x --body-file /repo/.git/fbs/pr/c.md",
+    "fbs pr resolve x --thread PRRT_abc",
+    "grep -rn addComment src/graphql",
+    "grep -rn 'gh pr comment' skills/",
+    "git log --grep 'gh pr review'",
+    "git commit -m 'fix: gh api graphql addComment -f body=x for issues/7/comments'",
+    "rg addComment && gh api graphql -f query='query{viewer{login}}'",
+  ])("reads, other numbers, other commands and fbs's own commands stay allowed: %s", (command) => {
+    expect(bashDeny(command)).toEqual([]);
+  });
+
+  test("GitHub MCP tools that post a review, a reply or a comment on the PR are denied; reads and tracker comments are allowed", () => {
+    for (const tool of ["pull_request_review_write", "add_reply_to_pull_request_comment", "create_and_submit_pull_request_review", ...MCP_REVIEW_TOOLS]) {
+      expect(deny(`mcp__github__${tool}`, { owner: "acme", repo: "app", pullNumber: 7 }).join("\n")).toContain("fbs pr reply <slug>");
+    }
+    expect(deny("mcp__github__add_issue_comment", { owner: "acme", repo: "app", issue_number: 7, body: "x" })).toHaveLength(1);
+    expect(deny("mcp__github__add_issue_comment", { owner: "acme", repo: "app", issue_number: "7", body: "x" })).toHaveLength(1);
+    expect(deny("mcp__github__add_issue_comment", { owner: "acme", repo: "app", issue_number: 45, body: "x" })).toEqual([]);
+    expect(deny("mcp__github__get_pull_request_comments", { owner: "acme", repo: "app", pullNumber: 7 })).toEqual([]);
+  });
+
+  test("Monitor commands are checked like Bash", () => {
+    expect(deny("Monitor", { command: "gh pr comment 7 -b x" })).toHaveLength(1);
+  });
+
+  test("the guard's hook sees every MCP tool it denies during a camp", () => {
+    const hooks = JSON.parse(readFileSync(join(import.meta.dir, "..", "hooks", "hooks.json"), "utf8")).hooks.PreToolUse as { matcher: string; hooks: { command: string }[] }[];
+    const guard = hooks.filter((h) => h.hooks.some((hook) => hook.command.endsWith("/bin/fbs-guard")));
+    for (const tool of ["pull_request_review_write", "add_reply_to_pull_request_comment", "add_issue_comment", ...MCP_REVIEW_TOOLS]) expect(guard.some((h) => new RegExp(h.matcher).test(`mcp__github__${tool}`))).toBe(true);
+    expect(guard.some((h) => new RegExp(h.matcher).test("mcp__github__get_pull_request_comments"))).toBe(false);
   });
 });
 
@@ -233,16 +408,16 @@ function record(dir: string, slug: string, stamp = true): void {
 }
 
 /** A record as fbs writes it, with an open PR on `branch`, or landed. */
-function prRecord(dir: string, slug: string, options: { branch?: string; landed?: boolean; tree?: string } = {}): void {
+function prRecord(dir: string, slug: string, options: { branch?: string; landed?: boolean; tree?: string; pr?: number; stamp?: boolean } = {}): void {
   const rec = {
     slug,
     dir: `docs/features/2026-10-21-${slug}`,
     size: "tiny",
     approvals: {},
-    pr: 7,
+    pr: options.pr ?? 7,
     repo: "acme/app",
     branch: { name: options.branch ?? `feat/${slug}`, parent: null, base: "b".repeat(40) },
-    stamp: { tree: options.tree ?? TREE, at: "2026-10-25", verdict: "pass", criteria: 1, evidence: "v.md" },
+    ...(options.stamp !== false && { stamp: { tree: options.tree ?? TREE, at: "2026-10-25", verdict: "pass", criteria: 1, evidence: "v.md" } }),
     ...(options.landed && { landed: { pr: 7, repo: "acme/app", commit: "c".repeat(40), at: "2026-10-25" } }),
   };
   mkdirSync(join(dir, ".git", "fbs", "features"), { recursive: true });
@@ -343,6 +518,21 @@ describe("guardToolUse", () => {
     writeLandToken(join(dir, ".git"), { slug: "x", at: NOW - 60_000, tree: TREE });
     expect(guardToolUse(bash(dir, "fbs land x"), dir, NOW).deny).toEqual([]);
   });
+
+  test("raw PR replies are denied only while a camp runs, against the open fbs PR's number", () => {
+    const dir = repo();
+    prRecord(dir, "x", { pr: 12 });
+    const reply = "gh api repos/acme/app/pulls/12/comments/5/replies -f body=Fixed";
+    const comment = (issue: number) => JSON.stringify({ cwd: dir, tool_name: "mcp__github__add_issue_comment", tool_input: { owner: "acme", repo: "app", issue_number: issue, body: "x" } });
+    expect(guardToolUse(bash(dir, reply), dir, NOW).deny).toEqual([]);
+    mark(dir);
+    expect(guardToolUse(bash(dir, reply), dir, NOW).deny.join("\n")).toContain("fbs pr reply <slug>");
+    expect(guardToolUse(bash(dir, "gh issue comment 12 -b done"), dir, NOW).deny).toHaveLength(1);
+    expect(guardToolUse(bash(dir, "gh issue comment 45 -b done"), dir, NOW).deny).toEqual([]);
+    expect(guardToolUse(comment(12), dir, NOW).deny).toHaveLength(1);
+    expect(guardToolUse(comment(45), dir, NOW).deny).toEqual([]);
+    expect(guardToolUse(bash(dir, "fbs pr reply x --comment thread:5 --body-file .git/fbs/pr/r.md"), dir, NOW).deny).toEqual([]);
+  });
 });
 
 const expansion = (cwd: string, args: string, extra: Record<string, unknown> = {}) =>
@@ -412,17 +602,6 @@ describe("the land token", () => {
     expect(existsSync(join(dir, ".git", "fbs", "land"))).toBe(false);
   });
 
-  test("taking a token deletes it, fresh or not", () => {
-    const dir = repo();
-    const common = join(dir, ".git");
-    writeLandToken(common, { slug: "x", at: NOW, tree: TREE });
-    expect(takeLandToken(common, "x", NOW)).toEqual({ slug: "x", at: NOW, tree: TREE });
-    expect(existsSync(landTokenPath(common, "x"))).toBe(false);
-    writeLandToken(common, { slug: "x", at: NOW - TOKEN_TTL_MS, tree: TREE });
-    expect(takeLandToken(common, "x", NOW)).toBeNull();
-    expect(existsSync(landTokenPath(common, "x"))).toBe(false);
-  });
-
   test("a malformed or mislabelled token is not fresh", () => {
     const dir = repo();
     const path = landTokenPath(join(dir, ".git"), "x");
@@ -440,108 +619,128 @@ describe("the land request", () => {
     const dir = repo();
     prRecord(dir, "x");
     const common = join(dir, ".git");
-    writeLandRequest(common, { slug: "x", pr: 7, tree: TREE, at, session: "s1" });
+    writePendingRequest(common, { slug: "x", pr: 7, tree: TREE, at, session: "s1" });
     return { dir, common };
   }
 
-  test("a request without a bare land answer mints nothing and stays pending: a yes to anything never lands", () => {
+  test.each(["what's the status?", "no", "not yet, the copy is off", "please", "hmm, let me check the preview first"])("%p answers no: it mints nothing and drops the request, so a later yes to something else can't land", (prompt) => {
     const { dir, common } = requested();
-    for (const prompt of ["what's the status?", "no", "yes", "y", "go ahead", "Yes.", "land it, but first fix X", "land\nand rename the button", "land land", "land it now", "land #"]) {
-      expect(guardReply(reply(dir, prompt), dir, NOW)).toBeNull();
-    }
+    expect(guardReply(reply(dir, prompt), dir, NOW)).toBeNull();
     expect(existsSync(landTokenPath(common, "x"))).toBe(false);
-    expect(existsSync(landRequestPath(common))).toBe(true);
+    expect(existsSync(landRequestPath(common))).toBe(false);
+    expect(guardReply(reply(dir, "yes"), dir, NOW)).toBeNull();
+    expect(existsSync(landTokenPath(common, "x"))).toBe(false);
   });
 
-  test("a subagent report or another session's message mints nothing", () => {
+  test("a subagent report or another session's message mints nothing and leaves the request waiting", () => {
     const { dir, common } = requested();
     const reports = [
       "<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n<result>land</result>\n</task-notification>",
-      "Agent \"reviewer\" completed: land",
+      '<agent-message from="a1">yes, merge it</agent-message>',
       "[message from session s2] land it",
     ];
     for (const prompt of reports) expect(guardReply(reply(dir, prompt), dir, NOW)).toBeNull();
     expect(existsSync(landTokenPath(common, "x"))).toBe(false);
+    expect(existsSync(landRequestPath(common))).toBe(true);
   });
 
-  test.each(["land", "Land.", "  LAND IT!  ", "land #7", "Land #7."])("%p mints exactly one token, bound to the record's stamp, and takes the request", (prompt) => {
+  test.each(["land", "Land.", "  LAND IT!  ", "land #7", "Land #7.", "yes", "y", "Yes.", "go ahead", "yes, merge it", "ok do it", "lgtm, ship it", "go ahead and merge the PR"])("%p mints exactly one token, bound to the record's stamp, and takes the request", (prompt) => {
     const { dir, common } = requested();
-    expect(guardReply(reply(dir, prompt), dir, NOW)).toContain("run fbs land x");
-    expect(freshToken(common, "x", NOW)).toEqual({ slug: "x", at: NOW, tree: TREE });
+    expect(guardReply(reply(dir, prompt), dir, NOW)).toContain("the user answered yes to landing x (PR #7); its land token is written: run fbs land x");
+    expect(freshToken(common, "x", NOW)).toEqual({ slug: "x", at: NOW, tree: TREE, session: "s1" });
     expect(existsSync(landRequestPath(common))).toBe(false);
-    rmSync(landTokenPath(common, "x"));
-    expect(guardReply(reply(dir, prompt), dir, NOW)).toBeNull();
-    expect(existsSync(landTokenPath(common, "x"))).toBe(false);
   });
 
   test("a request with over carries the confirmed checks into the token; /fbs:land typed meanwhile never does", () => {
     const { dir, common } = requested();
-    writeLandRequest(common, { slug: "x", pr: 7, tree: TREE, at: NOW, session: "s1", over: [{ name: "e2e", workflow: "CI", state: "cancelled" }, { name: "ci/legacy", state: "failed" }] });
+    writePendingRequest(common, { slug: "x", pr: 7, tree: TREE, at: NOW, session: "s1", over: [{ name: "e2e", workflow: "CI", state: "cancelled" }, { name: "ci/legacy", state: "failed" }] });
     expect(guardPrompt(expansion(dir, "x"), dir, NOW)).toBe("land token written for x");
     expect(freshToken(common, "x", NOW)).toEqual({ slug: "x", at: NOW, tree: TREE });
     expect(guardReply(reply(dir, "land"), dir, NOW)).toContain("over the failing checks CI / e2e (cancelled), ci/legacy (failed)");
-    expect(freshToken(common, "x", NOW)).toEqual({ slug: "x", at: NOW, tree: TREE, over: [{ name: "e2e", workflow: "CI", state: "cancelled" }, { name: "ci/legacy", state: "failed" }] });
+    expect(freshToken(common, "x", NOW)).toEqual({ slug: "x", at: NOW, tree: TREE, session: "s1", over: [{ name: "e2e", workflow: "CI", state: "cancelled" }, { name: "ci/legacy", state: "failed" }] });
   });
 
   test("a request or token whose over isn't a list of confirmed checks counts for nothing", () => {
     for (const over of [[], "e2e", ["e2e"], [{ name: "" , state: "failed" }], [{ name: "e2e", state: "passed" }], [{ name: "e2e", state: "failed", extra: 1 }]]) {
       const { dir, common } = requested();
       writeFileSync(landRequestPath(common), JSON.stringify({ slug: "x", pr: 7, tree: TREE, at: NOW, session: "s1", over }));
-      expect(guardReply(reply(dir, "land"), dir, NOW)).toContain("no land token");
+      expect(guardReply(reply(dir, "yes"), dir, NOW)).toContain("no land token");
       expect(existsSync(landTokenPath(common, "x"))).toBe(false);
       writeFileSync(landTokenPath(common, "x"), JSON.stringify({ slug: "x", at: NOW, tree: TREE, over }));
       expect(freshToken(common, "x", NOW)).toBeNull();
     }
   });
 
-  test("land #<pr> mints only for the requested PR's number", () => {
+  test("a reply naming another PR mints nothing for the request and drops it, so a later yes can't land it", () => {
     const { dir, common } = requested();
-    expect(guardReply(reply(dir, "land #8"), dir, NOW)).toContain("no land token");
-    expect(existsSync(landTokenPath(common, "x"))).toBe(false);
-    expect(existsSync(landRequestPath(common))).toBe(true);
-  });
-
-  test("an answer after the request expired mints nothing and removes it", () => {
-    const { dir, common } = requested(NOW - REQUEST_TTL_MS);
-    expect(guardReply(reply(dir, "land"), dir, NOW)).toContain("no land token");
+    expect(guardReply(reply(dir, "yes #8"), dir, NOW)).toBe("the user named PR #8, but the land request was for PR #7 (x); no land token was written");
     expect(existsSync(landTokenPath(common, "x"))).toBe(false);
     expect(existsSync(landRequestPath(common))).toBe(false);
+    expect(guardReply(reply(dir, "yes"), dir, NOW)).toBeNull();
+    expect(existsSync(landTokenPath(common, "x"))).toBe(false);
+  });
+
+  test("a yes over red checks in the user's own words answers the request and keeps the checks they confirmed", () => {
+    for (const prompt of ["yes, land it anyway", "go for it", "yep, merge it anyway", "ok, merge it despite the e2e"]) {
+      const { dir, common } = requested();
+      writePendingRequest(common, { slug: "x", pr: 7, tree: TREE, at: NOW, session: "s1", over: [{ name: "e2e", workflow: "CI", state: "cancelled" }] });
+      expect(guardReply(reply(dir, prompt), dir, NOW)).toContain("over the failing checks CI / e2e (cancelled)");
+      expect(freshToken(common, "x", NOW)?.over).toEqual([{ name: "e2e", workflow: "CI", state: "cancelled" }]);
+    }
+  });
+
+  test("a yes after the request expired mints nothing and removes it; an ask to land then is a plain-words ask", () => {
+    const { dir, common } = requested(NOW - REQUEST_TTL_MS);
+    expect(guardReply(reply(dir, "yes"), dir, NOW)).toContain("no land token");
+    expect(existsSync(landTokenPath(common, "x"))).toBe(false);
+    expect(existsSync(landRequestPath(common))).toBe(false);
+    const late = requested(NOW - REQUEST_TTL_MS);
+    expect(guardReply(reply(late.dir, "land #7"), late.dir, NOW)).toContain("may ask to land x (PR #7)");
+    expect(freshToken(late.common, "x", NOW)).toEqual({ slug: "x", at: NOW, tree: TREE, session: "s1" });
+  });
+
+  test("a request waits hours for the user's next message, and a token for the verified tree lasts the working day", () => {
+    const { dir, common } = requested(NOW - 3 * 60 * 60 * 1000);
+    expect(guardReply(reply(dir, "go ahead"), dir, NOW)).toContain("its land token is written");
+    expect(freshToken(common, "x", NOW + 8 * 60 * 60 * 1000)).not.toBeNull();
   });
 
   test("an answer after the feature was stamped again, or its PR landed, mints nothing and removes the request", () => {
     const { dir, common } = requested();
     prRecord(dir, "x", { tree: "b".repeat(40) });
-    expect(guardReply(reply(dir, "land"), dir, NOW)).toContain("no land token");
+    expect(guardReply(reply(dir, "yes"), dir, NOW)).toContain("no land token");
     expect(existsSync(landTokenPath(common, "x"))).toBe(false);
     expect(existsSync(landRequestPath(common))).toBe(false);
     prRecord(dir, "x", { landed: true });
-    writeLandRequest(common, { slug: "x", pr: 7, tree: TREE, at: NOW, session: "s1" });
-    expect(guardReply(reply(dir, "land"), dir, NOW)).toContain("no land token");
+    writePendingRequest(common, { slug: "x", pr: 7, tree: TREE, at: NOW, session: "s1" });
+    expect(guardReply(reply(dir, "yes"), dir, NOW)).toContain("no land token");
     expect(existsSync(landTokenPath(common, "x"))).toBe(false);
   });
 
   test("a forged request for another tree, PR or a missing feature mints nothing: the token only ever binds the record's stamp", () => {
     for (const forged of [{ slug: "x", pr: 7, tree: "b".repeat(40) }, { slug: "x", pr: 8, tree: TREE }, { slug: "y", pr: 7, tree: TREE }]) {
       const { dir, common } = requested();
-      writeLandRequest(common, { ...forged, at: NOW, session: "s1" });
-      expect(guardReply(reply(dir, "land"), dir, NOW)).toContain("no land token");
+      writePendingRequest(common, { ...forged, at: NOW, session: "s1" });
+      expect(guardReply(reply(dir, "yes"), dir, NOW)).toContain("no land token");
       expect(existsSync(join(common, "fbs", "land", `${forged.slug}.token`))).toBe(false);
     }
     const { dir, common } = requested();
     writeFileSync(landRequestPath(common), "{");
-    expect(guardReply(reply(dir, "land"), dir, NOW)).toContain("no land token");
+    expect(guardReply(reply(dir, "yes"), dir, NOW)).toContain("no land token");
     expect(existsSync(landRequestPath(common))).toBe(false);
   });
 
   test("only an answer in the asking session counts; a missing session on either side is a mismatch", () => {
     const { dir, common } = requested();
-    for (const session of ["s2", null, ""]) expect(guardReply(reply(dir, "land", session), dir, NOW)).toBeNull();
+    for (const session of [null, ""]) expect(guardReply(reply(dir, "land", session), dir, NOW)).toBeNull();
     expect(guardReply(JSON.stringify({ hook_event_name: "UserPromptSubmit", cwd: dir, prompt: "land" }), dir, NOW)).toBeNull();
+    expect(guardReply(reply(dir, "yes", "s2"), dir, NOW)).toBeNull();
+    expect(existsSync(landTokenPath(common, "x"))).toBe(false);
     expect(existsSync(landRequestPath(common))).toBe(true);
     expect(guardReply(reply(dir, "land", "s1"), dir, NOW)).toContain("run fbs land x");
     const sessionless = requested();
     writeFileSync(landRequestPath(sessionless.common), JSON.stringify({ slug: "x", pr: 7, tree: TREE, at: NOW }));
-    expect(guardReply(reply(sessionless.dir, "land", "s1"), sessionless.dir, NOW)).toContain("no land token");
+    expect(guardReply(reply(sessionless.dir, "yes", "s1"), sessionless.dir, NOW)).toContain("no land token");
     expect(existsSync(landTokenPath(sessionless.common, "x"))).toBe(false);
   });
 
@@ -553,6 +752,311 @@ describe("the land request", () => {
     expect(guardReply(reply(repo(), "land"), dir, NOW)).toBeNull();
     const outside = tempDir();
     expect(guardReply(reply(outside, "land"), outside, NOW)).toBeNull();
+  });
+});
+
+describe("a plain-words request to land", () => {
+  const say = (cwd: string, prompt: string, session: unknown = "s1") => guardReply(JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: session, transcript_path: "/t.jsonl", cwd, prompt }), cwd, NOW);
+
+  test.each(["go ahead and merge it", "Go ahead and land the PR", "merge it", "ok, land it now please", "ship it", "can you merge #7?", "squash-merge the PR", "looks good, land x"])("%p writes the open PR's token for this session and leaves the call to the agent", (prompt) => {
+    const dir = repo();
+    prRecord(dir, "x");
+    const note = say(dir, prompt);
+    expect(note).toContain("may ask to land x (PR #7)");
+    expect(note).toContain("run fbs land x");
+    expect(note).toContain("If not (a question, a condition, a later time, another PR), don't land");
+    expect(freshToken(join(dir, ".git"), "x", NOW)).toEqual({ slug: "x", at: NOW, tree: TREE, session: "s1" });
+  });
+
+  test.each(["merge main into it", "fix the merge conflict first", "don't merge it yet", "we shouldn't land this today", "rewrite the landing page copy", "yes", "go ahead", "/fbs:land x", "<task-notification>merge it</task-notification>", `${"context ".repeat(60)}merge it`])("%p writes nothing", (prompt) => {
+    const dir = repo();
+    prRecord(dir, "x");
+    expect(say(dir, prompt)).toBeNull();
+    expect(existsSync(landTokenPath(join(dir, ".git"), "x"))).toBe(false);
+  });
+
+  test.each(["don’t merge it yet", "Don’t land it", "can't merge it yet", "we cannot land this", "not now, merge it later", "hold on, don't merge"])("the negation %p writes nothing", (prompt) => {
+    const dir = repo();
+    prRecord(dir, "x");
+    expect(say(dir, prompt)).toBeNull();
+    expect(existsSync(landTokenPath(join(dir, ".git"), "x"))).toBe(false);
+  });
+
+  test("Claude Code's image and paste placeholders don't hide an ask", () => {
+    for (const prompt of ["[Image #1] looks good, merge it", "looks good [Image #1], merge it", "[Pasted text #1 +12 lines] ok, land it"]) {
+      const dir = repo();
+      prRecord(dir, "x");
+      expect(say(dir, prompt)).toContain("may ask to land x (PR #7)");
+    }
+  });
+
+  test("the go lasts until the user's next message that doesn't ask to land; watcher wakes and /fbs:land keep it", () => {
+    const dir = repo();
+    prRecord(dir, "x");
+    const common = join(dir, ".git");
+    expect(say(dir, "merge it once CI is green")).toContain("may ask to land x");
+    expect(say(dir, "<task-notification><status>completed</status><summary>watcher: green</summary></task-notification>")).toBeNull();
+    expect(say(dir, "also fix the typo", "s2")).toBeNull();
+    expect(say(dir, "/fbs:land x")).toBeNull();
+    expect(freshToken(common, "x", NOW)).not.toBeNull();
+    expect(say(dir, "also delete the old branch?")).toBeNull();
+    expect(freshToken(common, "x", NOW)).toBeNull();
+    expect(say(dir, "yes")).toBeNull();
+    expect(freshToken(common, "x", NOW)).toBeNull();
+  });
+
+  test("the guard lets fbs land run only from the session whose user gave the go", () => {
+    const dir = repo();
+    prRecord(dir, "x");
+    say(dir, "go ahead and merge it");
+    const landCall = (session: string) => guardToolUse(JSON.stringify({ hook_event_name: "PreToolUse", session_id: session, cwd: dir, tool_name: "Bash", tool_input: { command: "fbs land x" } }), dir, NOW).deny;
+    expect(landCall("s2")).toEqual([expect.stringContaining("needs a fresh land token")]);
+    expect(landCall("s1")).toEqual([]);
+  });
+
+  test("with several open PRs it takes the one named by number or slug, and writes none when the ask names none", () => {
+    const dir = repo();
+    prRecord(dir, "paid-plans", { pr: 7 });
+    prRecord(dir, "search", { pr: 8 });
+    expect(say(dir, "merge #8")).toContain("may ask to land search (PR #8)");
+    expect(say(dir, "go ahead and land paid-plans")).toContain("may ask to land paid-plans (PR #7)");
+    expect(say(dir, "land #9")).toBe("the user's message names PR #9, which isn't an open fbs PR; no land token was written");
+    const common = join(dir, ".git");
+    rmSync(join(common, "fbs", "land"), { recursive: true });
+    expect(say(dir, "go ahead and merge it")).toBe("the user's message may ask to land a PR, but several fbs PRs are open (paid-plans (PR #7), search (PR #8)), so no land token was written. If they're asking to land one, ask which, then run fbs land request <slug>: their yes lands it");
+    expect(existsSync(join(common, "fbs", "land"))).toBe(false);
+  });
+
+  test("a feature with work units lands its lowest open unit, or the unit named by number", () => {
+    const dir = repo();
+    record(dir, "f");
+    const features = join(dir, ".git", "fbs", "features");
+    for (const [slug, unit, pr] of [["f-api", 1, 21], ["f-ui", 2, 22]] as const) {
+      prRecord(dir, slug, { pr });
+      const path = join(features, `${slug}.json`);
+      writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), unitOf: "f", unit }));
+    }
+    expect(say(dir, "merge the stack")).toContain("may ask to land f-api (PR #21)");
+    expect(say(dir, "land #22")).toContain("may ask to land f-ui (PR #22)");
+  });
+
+  test("an unstamped PR, no session, no open PR or another repo writes nothing", () => {
+    const unstamped = repo();
+    prRecord(unstamped, "x", { stamp: false });
+    expect(say(unstamped, "merge it")).toBe("the user's message may ask to land x (PR #7), but it has no verify stamp, so no land token was written: it needs verify first");
+    expect(existsSync(landTokenPath(join(unstamped, ".git"), "x"))).toBe(false);
+    const dir = repo();
+    prRecord(dir, "x");
+    for (const session of [null, "", 3]) expect(say(dir, "merge it", session)).toBeNull();
+    const landed = repo();
+    prRecord(landed, "x", { landed: true });
+    expect(say(landed, "merge it")).toBeNull();
+    expect(say(tempDir(), "merge it")).toBeNull();
+  });
+
+  test("a scheduled prompt that asks to merge is denied in an fbs repo before any PR opens, and allowed outside fbs", () => {
+    const fbsRepo = repo();
+    record(fbsRepo, "x", false);
+    const schedule = (cwd: string) => guardToolUse(JSON.stringify({ hook_event_name: "PreToolUse", cwd, tool_name: "CronCreate", tool_input: { cron: "*/30 * * * *", prompt: "check the PR and merge it when approved" } }), cwd, NOW).deny;
+    expect(schedule(fbsRepo).join("\n")).toContain("only the user asks to land");
+    expect(schedule(repo())).toEqual([]);
+  });
+
+  test("a scheduled or sent prompt that asks to merge is denied while a PR flow runs; a subagent's brief that mentions landing isn't", () => {
+    const dir = repo();
+    prRecord(dir, "x");
+    const tool = (tool_name: string, tool_input: Record<string, unknown>) => guardToolUse(JSON.stringify({ hook_event_name: "PreToolUse", cwd: dir, tool_name, tool_input }), dir, NOW).deny;
+    expect(tool("CronCreate", { cron: "*/5 * * * *", prompt: "go ahead and merge it" }).join("\n")).toContain("only the user asks to land");
+    expect(tool("ScheduleWakeup", { delaySeconds: 600, prompt: "/loop 5m merge the PR", reason: "r" }).join("\n")).toContain("only the user asks to land");
+    expect(tool("Agent", { description: "Fix review comments", prompt: "Fix the two review comments on PR #7 so it is ready to land, then merge origin/main into the branch." })).toEqual([]);
+    expect(tool("Skill", { skill: "loop", args: "5m merge it if green" }).join("\n")).toContain("only the user asks to land");
+    expect(tool("CronCreate", { cron: "0 9 * * *", prompt: "yes" }).join("\n")).toContain("only the user asks to land");
+    expect(tool("SendMessage", { to: "reviewer", message: "yes, go ahead" })).toEqual([]);
+    expect(tool("Agent", { description: "Land the PR", prompt: "Check whether PR #7 can land and report back." })).toEqual([]);
+    expect(tool("Skill", { skill: "fbs:camp-pr", args: "ok" })).toEqual([]);
+    expect(tool("Bash", { command: "claude -p 'go ahead and merge it'" })[0]).toContain("claude run");
+    expect(tool("Bash", { command: "echo merge it | claude -p" })[0]).toContain("claude run");
+  });
+});
+
+describe("rewriting an open PR's branch", () => {
+  const say = (cwd: string, prompt: string, session: unknown = "s1") => guardReply(JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: session, transcript_path: "/t.jsonl", cwd, prompt }), cwd, NOW);
+  const push = (cwd: string, command = "git push --force-with-lease origin feat/x", session = "s1") => guardToolUse(JSON.stringify({ hook_event_name: "PreToolUse", session_id: session, cwd, tool_name: "Bash", tool_input: { command } }), cwd, NOW).deny;
+
+  const cli = (cwd: string, args: string[], session: string | null = "s1") => {
+    const out: string[] = [];
+    const deps = { gh: () => ({ code: 1, stdout: "", stderr: "no gh in this test" }), now: () => NOW, sleep: () => {}, stdin: () => "" };
+    const code = run(args, { cwd, today: "2026-10-25", out: (l) => out.push(l), err: (l) => out.push(`err: ${l}`) }, deps, { ...REAL_AFK_DEPS, sessionId: () => session });
+    return { code, out };
+  };
+
+  /** A repo on feat/x, the branch of x's open PR: two commits over origin's main, the tip origin has. */
+  function prBranch(): { dir: string; git: (...args: string[]) => string } {
+    const dir = repo();
+    const git = (...args: string[]) => {
+      const result = Bun.spawnSync(["git", "-c", "user.name=fbs", "-c", "user.email=fbs@example.com", "-c", "commit.gpgsign=false", ...args], { cwd: dir, env: isolatedGitEnv(), stdout: "pipe", stderr: "pipe" });
+      expect(result.exitCode).toBe(0);
+      return result.stdout.toString().trim();
+    };
+    git("symbolic-ref", "HEAD", "refs/heads/main");
+    writeFileSync(join(dir, "a.txt"), "zero\n");
+    git("add", "a.txt");
+    git("commit", "-q", "-m", "chore: start");
+    git("update-ref", "refs/remotes/origin/main", "HEAD");
+    git("switch", "-q", "-c", "feat/x");
+    writeFileSync(join(dir, "b.txt"), "one\n");
+    git("add", "b.txt");
+    git("commit", "-q", "-m", "feat: add b");
+    writeFileSync(join(dir, "a.txt"), "one\n");
+    git("commit", "-q", "-a", "-m", `fix: a body line that is far too long\n\n${"x".repeat(120)}`);
+    git("update-ref", "refs/remotes/origin/feat/x", "HEAD");
+    prRecord(dir, "x");
+    return { dir, git };
+  }
+
+  test("rewording any commit passes; squashing or re-parenting onto a new base, the tip's tree the same, needs the user's go", () => {
+    const { dir, git } = prBranch();
+    const base = git("rev-parse", "origin/main");
+    const [first, second] = [git("rev-parse", "HEAD~1^{tree}"), git("rev-parse", "HEAD^{tree}")];
+    const reworded = git("commit-tree", first, "-p", base, "-m", "feat: add the b file");
+    git("reset", "-q", "--hard", git("commit-tree", second, "-p", reworded, "-m", "fix: a body line that fits"));
+    expect(push(dir)).toEqual([]);
+    git("reset", "-q", "--hard", git("commit-tree", second, "-p", base, "-m", "feat: add b, squashed"));
+    expect(push(dir).join("\n")).toContain("rewrites feat/x");
+    const moved = git("commit-tree", git("rev-parse", "origin/main^{tree}"), "-p", base, "-m", "chore: main moved");
+    git("update-ref", "refs/remotes/origin/main", moved);
+    const replayed = git("commit-tree", first, "-p", moved, "-m", "feat: add b");
+    git("reset", "-q", "--hard", git("commit-tree", second, "-p", replayed, "-m", "fix: a body line that fits"));
+    expect(push(dir).join("\n")).toContain("rewrites feat/x");
+  });
+
+  test("a rewrite chained before the push in the same command gets no pass, even with the branch in sync when the hook runs", () => {
+    const { dir } = prBranch();
+    expect(push(dir)).toEqual([]);
+    expect(push(dir, "git rebase origin/main && git push --force-with-lease origin feat/x").join("\n")).toContain("rewrites feat/x");
+    expect(push(dir, "git reset --soft origin/main; git commit -m squash; git push --force-with-lease").join("\n")).toContain("rewrites feat/x");
+  });
+
+  test("fbs rewrite request turns the user's yes, as their next message in the asking session, into the rewrite token", () => {
+    const dir = rewritten();
+    expect(cli(dir, ["rewrite", "request", "x"])).toEqual({ code: 0, out: [JSON.stringify({ requested: true, slug: "x", pr: 7, branch: "feat/x" })] });
+    expect(say(dir, "yes", "s2")).toBeNull();
+    expect(push(dir)).toHaveLength(1);
+    expect(say(dir, "yes, go ahead")).toContain("answered yes to rewriting feat/x (PR #7)");
+    expect(existsSync(landRequestPath(join(dir, ".git")))).toBe(false);
+    expect(push(dir)).toEqual([]);
+    expect(push(dir)).toHaveLength(1);
+  });
+
+  test("any other message drops a rewrite request, and a yes naming another PR writes nothing", () => {
+    const dir = rewritten();
+    expect(cli(dir, ["rewrite", "request", "x"]).code).toBe(0);
+    expect(say(dir, "wait, fix the test first")).toBeNull();
+    expect(say(dir, "yes")).toBeNull();
+    expect(push(dir)).toHaveLength(1);
+    expect(cli(dir, ["rewrite", "request", "x"]).code).toBe(0);
+    expect(say(dir, "yes, #9")).toBe("the user named PR #9, but the rewrite request was for PR #7 (x); no rewrite token was written");
+    expect(push(dir)).toHaveLength(1);
+  });
+
+  test("a rewrite request is refused with no open PR or no session, and while another feature's request waits; it holds back a land request too", () => {
+    const dir = rewritten();
+    expect(cli(dir, ["rewrite", "request", "x"], null).out[0]).toStartWith("refused: no Claude Code session");
+    record(dir, "z");
+    expect(cli(dir, ["rewrite", "request", "z"])).toEqual({ code: 1, out: ["refused: no PR recorded for z", "refused: no branch recorded for z"] });
+    prRecord(dir, "y", { pr: 8 });
+    writePendingRequest(join(dir, ".git"), { slug: "y", pr: 8, tree: TREE, at: NOW, session: "s1" });
+    expect(cli(dir, ["rewrite", "request", "x"])).toEqual({ code: 1, out: ["refused: a land request for y (PR #8) is waiting for the user's answer; ask again after they reply"] });
+    rmSync(landRequestPath(join(dir, ".git")));
+    expect(cli(dir, ["rewrite", "request", "x"]).code).toBe(0);
+    expect(cli(dir, ["land", "request", "y"]).out).toContain("refused: a rewrite request for x (PR #7) is waiting for the user's answer; ask again after they reply");
+  });
+
+  test.each(["autosquash the fixups", "fold the fixups in", "push -f", "force-push it", "amend the message, don't touch the code", "squash the fixups, no need to rebase"])("%p writes a rewrite token", (prompt) => {
+    const dir = rewritten();
+    expect(say(dir, prompt)).toContain("may ask to rewrite");
+    expect(push(dir)).toEqual([]);
+  });
+
+  /** prBranch with the tip's tree changed under the same message: a rewrite only the user's go lets through. */
+  function rewritten(): string {
+    const { dir, git } = prBranch();
+    writeFileSync(join(dir, "a.txt"), "two\n");
+    git("commit", "-q", "--amend", "-a", "--no-edit");
+    return dir;
+  }
+
+  test("a messages-only amend passes on its own; a change to the tree is denied", () => {
+    const { dir, git } = prBranch();
+    git("commit", "-q", "--amend", "-m", "fix: a body line that fits");
+    expect(push(dir)).toEqual([]);
+    expect(push(dir, "git push --force-with-lease")).toEqual([]);
+    expect(push(dir, "git push --force origin feat/x").join("\n")).toContain("use --force-with-lease alone");
+    writeFileSync(join(dir, "a.txt"), "two\n");
+    git("commit", "-q", "--amend", "-a", "--no-edit");
+    expect(push(dir).join("\n")).toContain("rewrites feat/x");
+  });
+
+  test.each(["go ahead and amend it", "force push it", "squash those commits", "rebase it onto main", "you can rewrite the history", "please do the amendment on the commit, I give you permission to execute it this time"])("%p lets one lease push through from this session", (prompt) => {
+    const dir = rewritten();
+    expect(push(dir)).toHaveLength(1);
+    const note = say(dir, prompt);
+    expect(note).toContain("may ask to rewrite");
+    expect(note).toContain("--force-with-lease alone");
+    expect(push(dir, "git push --force-with-lease origin feat/x", "s2")).toHaveLength(1);
+    expect(push(dir)).toEqual([]);
+    expect(push(dir)).toHaveLength(1);
+  });
+
+  test("a denied push leaves the token, and a push the tree or another branch lets through doesn't spend it", () => {
+    const { dir, git } = prBranch();
+    say(dir, "go ahead and force push it");
+    expect(push(dir, "git push --force origin feat/x")).toHaveLength(1);
+    expect(push(dir, "git push --force-with-lease origin feat/other")).toEqual([]);
+    git("commit", "-q", "--amend", "-m", "fix: reworded");
+    expect(push(dir)).toEqual([]);
+    writeFileSync(join(dir, "a.txt"), "two\n");
+    git("commit", "-q", "--amend", "-a", "--no-edit");
+    expect(push(dir)).toEqual([]);
+    expect(push(dir)).toHaveLength(1);
+  });
+
+  test("the go lasts until the user's next message that doesn't ask for it; notifications and other sessions keep it", () => {
+    const dir = rewritten();
+    say(dir, "rebase it onto main");
+    expect(say(dir, "<task-notification><summary>watcher: green</summary></task-notification>")).toBeNull();
+    expect(say(dir, "rename the button", "s2")).toBeNull();
+    expect(push(dir)).toEqual([]);
+    say(dir, "and squash it while you're at it");
+    expect(say(dir, "also fix the typo")).toBeNull();
+    expect(push(dir)).toHaveLength(1);
+  });
+
+  test.each(["don't force push", "do not rebase it", "never amend a pushed commit", "squash-merge the PR", "squash and merge it", "rewrite the landing page copy", "/fbs:camp-pr x", "<task-notification>force push it</task-notification>", `${"context ".repeat(60)}force push it`])("%p writes no rewrite token", (prompt) => {
+    const dir = rewritten();
+    expect(say(dir, prompt) ?? "").not.toContain("rewrite");
+    expect(push(dir)).toHaveLength(1);
+  });
+
+  test("no open PR or no session writes nothing", () => {
+    const dir = repo();
+    record(dir, "x");
+    expect(say(dir, "force push it")).toBeNull();
+    expect(existsSync(join(dir, ".git", "fbs", "land"))).toBe(false);
+    const open = rewritten();
+    for (const session of [null, "", 3]) expect(say(open, "force push it", session)).toBeNull();
+    expect(push(open)).toHaveLength(1);
+  });
+
+  test("a scheduled prompt that asks to rewrite is denied like a land ask, in an fbs repo before any PR opens", () => {
+    const dir = repo();
+    record(dir, "x", false);
+    const tool = (tool_name: string, tool_input: Record<string, unknown>) => guardToolUse(JSON.stringify({ hook_event_name: "PreToolUse", cwd: dir, tool_name, tool_input }), dir, NOW).deny;
+    expect(tool("CronCreate", { cron: "0 9 * * *", prompt: "rebase it onto main and force push it" }).join("\n")).toContain("only the user asks");
+    expect(tool("Skill", { skill: "loop", args: "10m squash those commits" }).join("\n")).toContain("only the user asks");
+    expect(tool("CronCreate", { cron: "0 9 * * *", prompt: "run the nightly report" })).toEqual([]);
+    prRecord(dir, "y");
+    expect(tool("Bash", { command: "claude -p 'go ahead and force push it'" })[0]).toContain("claude run");
   });
 });
 
@@ -939,18 +1443,49 @@ describe("guardToolUse during an afk run", () => {
     expect(hook()).toBe(0);
   });
 
-  test("bin/fbs-guard --reply starts the CLI only with a pending request, and never blocks the prompt", () => {
+  test("bin/fbs-guard --reply starts the CLI for a pending request, or a prompt that mentions landing with an fbs PR open, and never blocks the prompt", () => {
     const bin = tempDir();
     copyFileSync(join(import.meta.dir, "..", "bin", "fbs-guard"), join(bin, "fbs-guard"));
     writeFileSync(join(bin, "fbs"), "#!/bin/sh\ncat >/dev/null\necho called\nexit 3\n");
     chmodSync(join(bin, "fbs"), 0o755);
-    const hook = (cwd: string) => Bun.spawnSync([join(bin, "fbs-guard"), "--reply"], { stdin: Buffer.from(JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "s1", cwd, prompt: "land" })), env: isolatedGitEnv(), stdout: "pipe", stderr: "pipe" });
+    const hook = (cwd: string, prompt: string) => Bun.spawnSync([join(bin, "fbs-guard"), "--reply"], { stdin: Buffer.from(JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "s1", cwd, prompt })), env: isolatedGitEnv(), stdout: "pipe", stderr: "pipe" });
+    const outcome = (cwd: string, prompt: string) => {
+      const result = hook(cwd, prompt);
+      return [result.exitCode, result.stdout.toString(), result.stderr.toString()];
+    };
+    const none = repo();
+    record(none, "x");
+    expect(outcome(none, "go ahead and merge it")).toEqual([0, "", ""]);
     const dir = repo();
     prRecord(dir, "x");
-    const idle = hook(dir);
-    expect([idle.exitCode, idle.stdout.toString()]).toEqual([0, ""]);
-    writeLandRequest(join(dir, ".git"), { slug: "x", pr: 7, tree: TREE, at: NOW, session: "s1" });
-    const asked = hook(dir);
-    expect([asked.exitCode, asked.stdout.toString(), asked.stderr.toString()]).toEqual([0, "called\n", ""]);
+    expect(outcome(dir, "yes")).toEqual([0, "", ""]);
+    expect(outcome(dir, "rename the button")).toEqual([0, "", ""]);
+    for (const prompt of ["go ahead and merge it", "Land #7", "ship it"]) expect(outcome(dir, prompt)).toEqual([0, "called\n", ""]);
+    for (const prompt of ["go ahead and amend it", "do the amendment", "Force-push it", "squash those commits", "rebase it onto main", "you can rewrite the history", "autosquash the fixups", "fold the fixups in", "push -f"]) expect(outcome(dir, prompt)).toEqual([0, "called\n", ""]);
+    expect(outcome(none, "force push it")).toEqual([0, "", ""]);
+    writePendingRequest(join(dir, ".git"), { slug: "x", pr: 7, tree: TREE, at: NOW, session: "s1" });
+    expect(outcome(dir, "yes")).toEqual([0, "called\n", ""]);
+    // A token outstanding: any prompt may be the one that drops it.
+    const held = repo();
+    record(held, "x");
+    writeLandToken(join(held, ".git"), { slug: "x", at: NOW, tree: TREE, session: "s1" });
+    expect(outcome(held, "rename the button")).toEqual([0, "called\n", ""]);
+  });
+
+  test("bin/fbs-guard checks a scheduled prompt that may ask to land in an fbs repo with no PR flow, and nothing else there", () => {
+    const bin = tempDir();
+    copyFileSync(join(import.meta.dir, "..", "bin", "fbs-guard"), join(bin, "fbs-guard"));
+    writeFileSync(join(bin, "fbs"), "#!/bin/sh\ncat >/dev/null\nexit 2\n");
+    chmodSync(join(bin, "fbs"), 0o755);
+    const hook = (cwd: string, tool_name: string, tool_input: Record<string, unknown>) => Bun.spawnSync([join(bin, "fbs-guard")], { stdin: Buffer.from(JSON.stringify({ cwd, tool_name, tool_input })), env: isolatedGitEnv(), stderr: "pipe" }).exitCode;
+    const dir = repo();
+    record(dir, "x", false);
+    expect(hook(dir, "CronCreate", { cron: "0 * * * *", prompt: "merge it when approved" })).toBe(2);
+    expect(hook(dir, "Skill", { skill: "loop", args: "5m land it" })).toBe(2);
+    expect(hook(dir, "CronCreate", { cron: "0 * * * *", prompt: "rebasing onto main, then force-push it" })).toBe(2);
+    expect(hook(dir, "Skill", { skill: "loop", args: "10m squash those commits" })).toBe(2);
+    expect(hook(dir, "CronCreate", { cron: "0 * * * *", prompt: "run the nightly report" })).toBe(0);
+    expect(hook(dir, "Bash", { command: "git merge main" })).toBe(0);
+    expect(hook(repo(), "CronCreate", { cron: "0 * * * *", prompt: "merge it when approved" })).toBe(0);
   });
 });

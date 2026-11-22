@@ -2,6 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { REAL_AFK_DEPS } from "./afk";
 import { campMarkers } from "./guard";
 import { run } from "./main";
 import { isolatedGitEnv } from "./test-env";
@@ -22,6 +23,13 @@ function fbs(cwd: string, ...args: string[]) {
   const err: string[] = [];
   const code = run(args, { cwd, today: "2026-11-01", out: (s) => out.push(s), err: (s) => err.push(s) });
   return { code, out, err };
+}
+
+/** fbs run from the Claude Code session `session`, as bin/fbs passes it. */
+function fbsAs(session: string, cwd: string, ...args: string[]) {
+  const out: string[] = [];
+  const code = run(args, { cwd, today: "2026-11-01", out: (s) => out.push(s), err: () => {} }, undefined, { ...REAL_AFK_DEPS, sessionId: () => session });
+  return { code, out };
 }
 
 /** A repo with feature x, and an optional .fbs/config.json. */
@@ -157,6 +165,58 @@ test.each([
   expect(r).toEqual({ code: 2, out: [], err: [message] });
 });
 
+test("camp start records the session that holds the camp, and camp show prints it", () => {
+  const repo = campRepo();
+  const started = JSON.parse(fbsAs("s1", repo, "camp", "start", "x").out.join("\n"));
+  expect(started.session).toBe("s1");
+  expect("takenOverFrom" in started).toBe(false);
+  expect(show(repo).session).toBe("s1");
+});
+
+test("camp start from another session takes the camp over and says so; the same session, or none, keeps it", () => {
+  const repo = campRepo();
+  fbsAs("s1", repo, "camp", "start", "x");
+  round(repo, 1);
+  expect("takenOverFrom" in JSON.parse(fbsAs("s1", repo, "camp", "start", "x").out.join("\n"))).toBe(false);
+  const taken = JSON.parse(fbsAs("s2", repo, "camp", "start", "x").out.join("\n"));
+  expect(taken).toMatchObject({ session: "s2", takenOverFrom: "s1" });
+  expect(taken.rounds).toHaveLength(1);
+  const anonymous = JSON.parse(fbs(repo, "camp", "start", "x").out.join("\n"));
+  expect(anonymous.session).toBe("s2");
+  expect("takenOverFrom" in anonymous).toBe(false);
+});
+
+test("camp round and camp checkpoint from a session that lost the camp are refused; the holder and a session-less caller go on", () => {
+  const repo = campRepo();
+  fbsAs("s1", repo, "camp", "start", "x", "--auto-fix-rounds", "1");
+  fbsAs("s2", repo, "camp", "start", "x");
+  const counts = ["--in", "1", "--fixed", "1", "--declined", "0", "--followups", "0", "--asked", "0"];
+  const refused = { code: 1, out: ["error: camp held by s2; camp start takes it over"] };
+  expect(fbsAs("s1", repo, "camp", "round", "x", ...counts)).toEqual(refused);
+  expect(show(repo).rounds).toEqual([]);
+  expect(fbsAs("s2", repo, "camp", "round", "x", ...counts)).toEqual({ code: 0, out: ["checkpoint"] });
+  expect(fbsAs("s1", repo, "camp", "checkpoint", "x")).toEqual(refused);
+  expect(fbs(repo, "camp", "checkpoint", "x").out).toEqual(["blockers-only"]);
+});
+
+test("camp stop removes the camp file even when checking the PR fails", () => {
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), "fbs-camp-")));
+  tempDirs.push(repo);
+  // No origin, main or master: the default branch can't be told, so asking about the PR throws.
+  git(repo, "init", "-q", "-b", "trunk");
+  git(repo, "commit", "-q", "--allow-empty", "-m", "chore: init");
+  expect(fbs(repo, "status", "init", "x", "--size", "mid").code).toBe(0);
+  fbs(repo, "camp", "start", "x");
+  const rec = JSON.parse(readFileSync(recordFile(repo, "x"), "utf8"));
+  writeFileSync(recordFile(repo, "x"), JSON.stringify({ ...rec, pr: 7, repo: "acme/app" }));
+  const err: string[] = [];
+  const gh = () => ({ code: 0, stdout: JSON.stringify({ state: "OPEN" }), stderr: "" });
+  const code = run(["camp", "stop", "x"], { cwd: repo, today: "2026-11-01", out: () => {}, err: (s) => err.push(s) }, { gh, now: () => 0, sleep: () => {}, stdin: () => "" });
+  expect(code).toBe(2);
+  expect(err[0]).toContain("cannot tell the default branch");
+  expect(existsSync(campFile(repo))).toBe(false);
+});
+
 const LANDED = { pr: 7, repo: "acme/app", commit: "a".repeat(40), at: "2026-11-01" };
 const recordFile = (repo: string, slug: string) => join(repo, ".git", "fbs", "features", `${slug}.json`);
 
@@ -207,6 +267,20 @@ test("follow-ups are numbered with their round, shown by camp show, outlive camp
   expect(fbs(repo, "camp", "followup", "x", "--filed", "3", "--link", "u")).toEqual({ code: 1, out: ["error: x has no follow-up 3; it has 2"], err: [] });
 });
 
+test("a failing CI check can be a follow-up's source, named check:<its name>, which pr reply still refuses", () => {
+  const repo = campRepo();
+  fbs(repo, "camp", "start", "x");
+  const r = fbs(repo, "camp", "followup", "x", "--thread", "check:CI / test (ubuntu)", "--summary", "Flaky upload step");
+  expect(r.code).toBe(0);
+  expect(JSON.parse(r.out[0])).toMatchObject({ number: 1, thread: "check:CI / test (ubuntu)", status: "open" });
+  expect(show(repo).openFollowups).toHaveLength(1);
+  const padded = fbs(repo, "camp", "followup", "x", "--thread", "check:  CI / test (ubuntu) ", "--summary", "Same check");
+  expect(JSON.parse(padded.out[0]).thread).toBe("check:CI / test (ubuntu)");
+  const reply = fbs(repo, "pr", "reply", "x", "--comment", "check:CI / test (ubuntu)", "--body-file", "reply.md");
+  expect(reply.code).toBe(2);
+  expect(reply.err[0]).toStartWith("pr reply: --comment takes thread:<id>");
+});
+
 test("a follow-up with --unit records the unit and that unit's round, and needs a camp", () => {
   const repo = campRepo();
   const add = () => fbs(repo, "camp", "followup", "x", "--thread", "thread:5", "--summary", "s", "--unit", "x-api");
@@ -221,7 +295,8 @@ test.each([
   [["--thread", "thread:5"], "camp followup takes --thread <key> --summary <text> [--why <text>] [--unit <unit slug>], --filed <n> --link <url>, or --declined <n>"],
   [["--filed", "1"], "camp followup takes --thread <key> --summary <text> [--why <text>] [--unit <unit slug>], --filed <n> --link <url>, or --declined <n>"],
   [["--thread", "thread:5", "--summary", "s", "--filed", "1", "--link", "u"], "camp followup takes --thread <key> --summary <text> [--why <text>] [--unit <unit slug>], --filed <n> --link <url>, or --declined <n>"],
-  [["--thread", "PRRT_a", "--summary", "s"], "camp followup: --thread takes thread:<id>, thread:<node id> (PRRT_… or PRRC_…), issue:<id> or review:<id>, not PRRT_a"],
+  [["--thread", "PRRT_a", "--summary", "s"], "camp followup: --thread takes thread:<id>, thread:<node id> (PRRT_… or PRRC_…), issue:<id> or review:<id>, or check:<check name> for a failing CI check, not PRRT_a"],
+  [["--thread", "check: ", "--summary", "s"], "camp followup: --thread takes thread:<id>, thread:<node id> (PRRT_… or PRRC_…), issue:<id> or review:<id>, or check:<check name> for a failing CI check, not check: "],
   [["--filed", "0", "--link", "u"], "camp followup: --filed takes a follow-up's number, not 0"],
 ])("camp followup usage error %p", (args, message) => {
   expect(fbs(campRepo(), "camp", "followup", "x", ...args)).toEqual({ code: 2, out: [], err: [message] });

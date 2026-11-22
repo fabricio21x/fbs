@@ -20,6 +20,8 @@ The brief's open questions go to the design's top-level `## Open questions`, nev
 
 ## 3. Mock up the screens
 
+**Start from what exists.** When a screen extends existing UI (a new panel on a page, a field in a form, a step in a flow), launch the app (`.fbs/validation/README.md` when it exists, otherwise the repo's dev command) and screenshot the screens it changes or sits beside with the browser tools, at both widths below, saved as `<dir>/mockups/<screen>-current.png`. Build its mockup from them: the same layout, components and copy, plus only what the feature adds. Never invent a panel, control or section the product doesn't have. Stop the app afterwards if you launched it. The `-current.png` files are committed with the mockups when `docs` is `tracked`, which is fine: reviewers see the before. When the app can't run, say so and build from the screen's code instead.
+
 For each screen, write `<dir>/mockups/<screen>.html`: a static, self-contained page (inline CSS, or the project's own styles and component look; no backend calls) with realistic sample data from the spec, every state the screen has (a small switcher between empty, loading, error and filled works well), and real copy. Open each in the browser (Chrome DevTools MCP: `new_page`, then `emulate` with the viewport `375x812x2,mobile,touch`, and again at `1280x800`) and refine it against the brief, at most two rounds. The mockups are the visual target: the overview embeds them, and UI tasks are built and reviewed against them.
 
 ## 4. Write the section

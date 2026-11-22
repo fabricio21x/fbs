@@ -21,9 +21,9 @@ Input, optional: a feature slug whose flows to add: $ARGUMENTS
 
 ## 1. What exists
 
-- If `.fbs/validation/README.md` exists and a feature was given, this is an update: add that feature's flows (step 3), run them once (step 4), and keep the rest.
+- If `.fbs/validation/README.md` exists and a feature was given, this is an update: add that feature's flows (step 3), propose any new allow rule they need (step 4), run them once (step 5), and keep the rest.
 - If it exists and nothing was given, say it's set up, show its "Verified end to end" line, and stop.
-- The setup is committed on the feature's branch, never on the default branch unless the user explicitly asked. A calling stage is already on it. Run alone for a feature: `fbs branch <slug> --existing`. Run alone with no feature, it's a tiny change of its own: `fbs status init validation-setup --size tiny`, then `fbs branch validation-setup --type chore`. Say each `note:` in one line; on `refused:`, show it to the user and do what they choose.
+- The setup is committed on the feature's branch, never on the default branch unless the user explicitly asked. A calling stage is already on it. Run alone for a feature: `fbs branch <slug> --existing`. Run alone with no feature, it's a tiny change of its own: `fbs status init validation-setup --size tiny`, then `fbs branch validation-setup --type chore` (`chore` is in every family; with a config that leaves it out, the closest type `fbs branch --types` lists). Say each `note:` in one line; on `refused:`, show it to the user and do what they choose.
 - Load `fbs:principle-prove-it-works` with the Skill tool.
 
 ## 2. Find out from the repo first
@@ -41,7 +41,18 @@ Ask the user only for what the repo can't tell you (a test account's credentials
 
 Read `${CLAUDE_SKILL_DIR}/validation-template.md` (if unexpanded: `<plugin root>/skills/setup-validation/validation-template.md`) and write `.fbs/validation/README.md`, replacing each guidance comment with its content. Put any helper script in `.fbs/validation/` and make it executable. Selectors are stable ones (test ids, roles, labels), read from the code, not guessed.
 
-## 4. Prove it once
+## 4. Permissions and the browser, once
+
+Validate and walkthrough run the helper scripts and the browser tools on every pass, and auto mode's permission check can deny them, which skips checks. You can't change permissions yourself, so before the first run propose the exact allow rules:
+
+- a Bash pattern for each helper (such as `Bash(bun .fbs/validation/*)`), and for Launch and Health when they aren't plain dev commands;
+- each browser tool the flows use, by its exact name from your tool list (such as `mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script`).
+
+Show them as a `permissions.allow` snippet for `.claude/settings.local.json`, say they can also be added with `/permissions`, write them under the README's Permissions, and go on without waiting. When a call is denied in the run below, quote the rule that would allow it and ask the user to add it, instead of skipping the check.
+
+The Chrome DevTools MCP keeps one browser profile, which another session can hold locked. Recommend `--isolated` (a temporary profile per session; sign-in state doesn't persist, which Auth already handles). The plugin's server can't take the flag in place, so the user adds their own at user scope, `claude mcp add --scope user chrome-devtools -- npx -y chrome-devtools-mcp@latest --isolated`, and turns the plugin's copy off in `/mcp`; its tools are then named `mcp__chrome-devtools__*`, which the allow rules above must match. When a browser tool reports the profile locked, give that recommendation instead of skipping the flow.
+
+## 5. Prove it once
 
 1. Launch the app as Launch says, in the background, and wait for the readiness signal with its timeout. If the port is already taken, stop and say so.
 2. Run the health check, and quote its result.
@@ -53,6 +64,6 @@ Sign-in never types credentials into a form: use a helper script or a dev-only b
 
 When a step fails, fix the setup and run it again, at most twice per step; then report what fails and stop without claiming the setup works.
 
-## 5. Commit and end
+## 6. Commit and end
 
 Fill in "Verified end to end" with today's date and what ran. Commit `.fbs/validation/` (`chore: validation setup`, no attribution lines), unless git ignores it (`git check-ignore -q .fbs/validation/` exits 0): then it stays local. Report what ran and the evidence path. When a calling skill (such as `validate`) ran this stage, hand back to it and let it carry on. Otherwise, when a feature is waiting, continue into validate for it.

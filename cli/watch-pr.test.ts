@@ -40,7 +40,7 @@ const failed = (name: string, id = `run:${name}`): Check => ({ id, name, status:
 const pending = (name: string, id = `run:${name}`): Check => ({ id, name, status: "IN_PROGRESS", conclusion: "" , ...ACTIONS});
 const approved = { reviewDecision: "APPROVED" };
 const openThread = { threads: [{ id: "T1", isResolved: false, path: "a.ts", line: 3 }] };
-const failure = (name: string, failedOnPreviousHead = false) => ({ name, status: "COMPLETED", conclusion: "FAILURE", failedOnPreviousHead, ...ACTIONS });
+const failure = (name: string, failedOnPreviousHead = false) => ({ name, status: "COMPLETED", conclusion: "FAILURE", failedOnPreviousHead, ...ACTIONS, runInProgress: false });
 
 describe("classify", () => {
   test("approved and every check passing is approved-green", () => {
@@ -120,7 +120,7 @@ describe("classify", () => {
     expect(classify(snapshot({ checks: [pending("ci")], comments: [comment(1)] }), emptyCursor(PR))).toBe("activity");
   });
 
-  test("a bot comment waits for the round to settle", () => {
+  test("a bot comment on a watch's first poll waits while checks run; once they settle it wakes it", () => {
     expect(classify(snapshot({ checks: [pending("ci")], comments: [botComment(1)] }), emptyCursor(PR))).toBeNull();
     expect(classify(snapshot({ checks: [passed("ci")], comments: [botComment(1)] }), emptyCursor(PR))).toBe("activity");
   });
@@ -151,6 +151,40 @@ describe("classify", () => {
     const seen = advance(emptyCursor(PR), snapshot({ ...openThread, comments: [comment(1), botComment(2)] }));
     expect(classify(snapshot({ ...openThread, comments: [comment(1), botComment(2)] }), seen)).toBeNull();
     expect(classify(snapshot({ ...openThread, comments: [comment(1, { updatedAt: "2026-10-25T11:00:00Z" })] }), seen)).toBe("activity");
+  });
+
+  test("a bot's edit that only changes links doesn't wake it; a new bot comment does", () => {
+    const backLink = (title: string, updatedAt: string) =>
+      botComment(2, { kind: "issue", threadId: null, path: null, line: null, author: "linear[bot]", body: `<p><a href="https://linear.app/acme/issue/ACM-123">ACM-123 ${title}</a></p>\n[ACM-123](https://linear.app/acme/issue/ACM-123/${title})`, updatedAt });
+    const seen = advance(emptyCursor(PR), snapshot({ ...openThread, comments: [backLink("fix-login", "2026-10-25T10:00:00Z")] }));
+    expect(classify(snapshot({ ...openThread, comments: [backLink("fix-the-login-form", "2026-10-25T11:00:00Z")] }), seen)).toBeNull();
+    expect(classify(snapshot({ ...openThread, comments: [backLink("fix-the-login-form", "2026-10-25T11:00:00Z"), botComment(3)] }), seen)).toBe("activity");
+  });
+
+  test("a bot comment reported early and then edited into new text wakes it again, flagged edited", () => {
+    const placeholder = botComment(4, { kind: "issue", threadId: null, path: null, line: null, author: "claude[bot]", body: "Reviewing… [job](https://github.com/acme/app/actions/runs/1)" });
+    const early = runWatch([snapshot({ checks: [pending("e2e")], comments: [placeholder] })], emptyCursor(PR), { intervalSeconds: 60, timeoutSeconds: 3600 });
+    expect(early.report.verdict).toBe("activity");
+    const review = { ...placeholder, body: "a.ts:3 drops the last item. [job](https://github.com/acme/app/actions/runs/1)", updatedAt: "2026-10-25T11:00:00Z" };
+    const edited = runWatch([snapshot({ checks: [passed("e2e")], comments: [review] })], early.cursor ?? undefined, ONCE);
+    if (!("newComments" in edited.report)) throw new Error("unexpected");
+    expect(edited.report.verdict).toBe("activity");
+    expect(edited.report.newComments.map((c) => [c.key, c.body, c.edited])).toEqual([["issue:4", review.body, true]]);
+  });
+
+  test("bot comments wait while checks run, until a poll brings no new or changed comment", () => {
+    const one = snapshot({ checks: [pending("e2e")], comments: [botComment(1)] });
+    const two = snapshot({ checks: [pending("e2e")], comments: [botComment(1), botComment(2)] });
+    expect(classify(one, emptyCursor(PR))).toBeNull();
+    expect(classify(two, emptyCursor(PR), one)).toBeNull();
+    expect(classify(two, emptyCursor(PR), snapshot({ comments: [botComment(1), botComment(2, { updatedAt: "2026-10-25T09:00:00Z" })] }))).toBeNull();
+    expect(classify(two, emptyCursor(PR), two)).toBe("activity");
+    expect(classify(snapshot({ ...two, truncated: true }), emptyCursor(PR), two)).toBeNull();
+  });
+
+  test("a failing check alone still waits for every check to finish, even across quiet polls", () => {
+    const red = snapshot({ checks: [failed("ci"), pending("e2e")] });
+    expect(classify(red, emptyCursor(PR), red)).toBeNull();
   });
 
   test("a failure already reported on this head doesn't wake it again, but its re-run's failure does", () => {
@@ -205,10 +239,10 @@ describe("watch", () => {
     const actions: Check = { ...failed("test", "run:5"), detailsUrl: "https://github.com/o/r/actions/runs/42/job/5", runId: 42, rerunnable: true };
     const status: Check = { ...failed("ci/legacy", "status:ci/legacy:t"), conclusion: "ERROR", detailsUrl: "https://ci.example.com/1" };
     const r = runWatch([snapshot({ checks: [actions, status] })]);
-    if (r.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in r.report)) throw new Error("unexpected");
     expect(r.report.failingChecks).toEqual([
-      { name: "test", status: "COMPLETED", conclusion: "FAILURE", failedOnPreviousHead: false, detailsUrl: "https://github.com/o/r/actions/runs/42/job/5", runId: 42, rerunnable: true },
-      { name: "ci/legacy", status: "COMPLETED", conclusion: "ERROR", failedOnPreviousHead: false, detailsUrl: "https://ci.example.com/1", runId: null, rerunnable: false },
+      { name: "test", status: "COMPLETED", conclusion: "FAILURE", failedOnPreviousHead: false, detailsUrl: "https://github.com/o/r/actions/runs/42/job/5", runId: 42, rerunnable: true, runInProgress: false },
+      { name: "ci/legacy", status: "COMPLETED", conclusion: "ERROR", failedOnPreviousHead: false, detailsUrl: "https://ci.example.com/1", runId: null, rerunnable: false, runInProgress: false },
     ]);
   });
 
@@ -225,6 +259,7 @@ describe("watch", () => {
       truncated: false,
       newComments: [],
       failingChecks: [],
+      pendingChecks: 0,
       unresolvedThreads: 1,
     });
     expect(r.sleeps).toEqual([]);
@@ -249,25 +284,53 @@ describe("watch", () => {
     expect(r.sleeps).toEqual([60, 120, 240, 60, 120]);
   });
 
-  test("pending checks and a bot comment keep waiting until the round settles", () => {
+  test("a bot comment seen on two polls is reported with the failures that came meanwhile", () => {
     const r = runWatch([snapshot({ checks: [pending("ci")], comments: [botComment(1)] }), snapshot({ checks: [failed("ci")], comments: [botComment(1)] })]);
     expect(r.report.verdict).toBe("activity");
     expect(r.calls).toBe(2);
-    if (r.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in r.report)) throw new Error("unexpected");
     expect(r.report.newComments.map((c) => [c.key, c.bot, c.edited])).toEqual([["thread:1", true, false]]);
     expect(r.report.failingChecks).toEqual([failure("ci")]);
   });
 
+  test("bot comments are reported once they stop arriving, with the failures so far, while slow checks still run", () => {
+    const one = snapshot({ checks: [failed("lint"), pending("e2e")], comments: [botComment(1)] });
+    const two = snapshot({ checks: [failed("lint"), pending("e2e")], comments: [botComment(1), botComment(2)] });
+    const r = runWatch([one, two, two], emptyCursor(PR), { intervalSeconds: 60, timeoutSeconds: 3600 });
+    if (!("newComments" in r.report)) throw new Error("unexpected");
+    expect(r.report.verdict).toBe("activity");
+    expect(r.calls).toBe(3);
+    expect(r.report.newComments.map((c) => c.id)).toEqual([1, 2]);
+    expect(r.report.failingChecks).toEqual([failure("lint")]);
+    const settled = runWatch([snapshot({ checks: [failed("lint"), passed("e2e")], comments: [botComment(1), botComment(2)] })], r.cursor ?? undefined, ONCE);
+    expect(settled.report.verdict).toBe("timeout");
+  });
+
+  test("an early wake counts the checks still running, and a failure whose run still has jobs going is reported again once it finishes", () => {
+    const job = (check: Check, runId: number): Check => ({ ...check, runId, rerunnable: true });
+    const early = snapshot({ checks: [job(failed("lint"), 41), job(failed("unit"), 42), job(pending("e2e"), 42)], comments: [botComment(1)] });
+    const r = runWatch([early], emptyCursor(PR), { intervalSeconds: 60, timeoutSeconds: 3600 });
+    if (!("newComments" in r.report)) throw new Error("unexpected");
+    expect(r.report.verdict).toBe("activity");
+    expect(r.report.pendingChecks).toBe(1);
+    expect(r.report.failingChecks.map((c) => [c.name, c.runInProgress])).toEqual([["lint", false], ["unit", true]]);
+    const settled = runWatch([snapshot({ checks: [job(failed("lint"), 41), job(failed("unit"), 42), job(passed("e2e"), 42)], comments: [botComment(1)] })], r.cursor ?? undefined, ONCE);
+    if (!("newComments" in settled.report)) throw new Error("unexpected");
+    expect(settled.report.verdict).toBe("activity");
+    expect(settled.report.pendingChecks).toBe(0);
+    expect(settled.report.failingChecks.map((c) => [c.name, c.runInProgress])).toEqual([["lint", false], ["unit", false]]);
+  });
+
   test("times out with what it saw, and --once is a zero timeout", () => {
     const quiet = snapshot({ checks: [pending("ci")], comments: [botComment(1)] });
-    const timedOut = runWatch([quiet], emptyCursor(PR), { intervalSeconds: 60, timeoutSeconds: 150 });
+    const timedOut = runWatch([snapshot({ checks: [failed("lint"), pending("ci")] })], emptyCursor(PR), { intervalSeconds: 60, timeoutSeconds: 150 });
     expect(timedOut.report.verdict).toBe("timeout");
     expect(timedOut.sleeps).toEqual([60, 90]);
     const once = runWatch([quiet], emptyCursor(PR), ONCE);
     expect(once.report.verdict).toBe("timeout");
     expect(once.calls).toBe(1);
     expect(once.sleeps).toEqual([]);
-    if (once.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in once.report)) throw new Error("unexpected");
     expect(once.report.newComments.map((c) => c.id)).toEqual([1]);
   });
 
@@ -328,11 +391,11 @@ describe("watch", () => {
     expect(first.report.verdict).toBe("activity");
     const quiet = runWatch([snapshot({ ...openThread, comments: [comment(1)] })], first.cursor ?? undefined, ONCE);
     expect(quiet.report.verdict).toBe("timeout");
-    if (quiet.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in quiet.report)) throw new Error("unexpected");
     expect(quiet.report.newComments).toEqual([]);
     const edited = runWatch([snapshot({ comments: [comment(1, { updatedAt: "2026-10-25T12:00:00Z", body: "edited" })] })], first.cursor ?? undefined);
     expect(edited.report.verdict).toBe("activity");
-    if (edited.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in edited.report)) throw new Error("unexpected");
     expect(edited.report.newComments.map((c) => [c.body, c.edited])).toEqual([["edited", true]]);
   });
 
@@ -340,11 +403,11 @@ describe("watch", () => {
     const first = runWatch([snapshot({ checks: [failed("ci"), passed("lint")] })]);
     expect(first.cursor).toMatchObject({ head: HEAD, reported: ["run:ci"], failing: ["ci"], previousFailing: [] });
     const pushed = runWatch([snapshot({ head: NEW_HEAD, checks: [failed("ci", "run:3"), failed("lint", "run:4")] })], first.cursor ?? undefined);
-    if (pushed.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in pushed.report)) throw new Error("unexpected");
     expect(pushed.report.failingChecks).toEqual([failure("ci", true), failure("lint")]);
     expect(pushed.cursor).toMatchObject({ head: NEW_HEAD, reported: ["run:3", "run:4"], failing: ["ci", "lint"], previousFailing: ["ci"] });
     const again = runWatch([snapshot({ head: NEW_HEAD, state: "CLOSED", checks: [failed("ci", "run:3")] })], pushed.cursor ?? undefined);
-    if (again.report.verdict === "query-error") throw new Error("unexpected");
+    if (!("newComments" in again.report)) throw new Error("unexpected");
     expect(again.report.failingChecks).toEqual([failure("ci", true)]);
   });
 });
@@ -363,7 +426,7 @@ describe("the cursor file", () => {
     return dir;
   }
 
-  const CURSOR: Cursor = { pr: PR, comments: { "thread:1": "2026-10-25T10:00:00Z" }, head: HEAD, reported: ["run:1"], failing: ["ci"], previousFailing: ["lint"], waitingReportedFor: HEAD, approvedReportedFor: HEAD };
+  const CURSOR: Cursor = { pr: PR, comments: { "thread:1": "2026-10-25T10:00:00Z" }, bodies: { "thread:1": "0123456789abcdef" }, head: HEAD, reported: ["run:1"], failing: ["ci"], previousFailing: ["lint"], waitingReportedFor: HEAD, approvedReportedFor: HEAD };
 
   test("lives in the git common dir and round-trips", () => {
     const dir = repo();
@@ -380,13 +443,13 @@ describe("the cursor file", () => {
     expect(readCursor(dir, "x", PR).comments).toEqual({ "issue:9": "2026-10-25T11:00:00Z", "thread:1": "2026-10-25T10:00:00Z", "thread:2": "2026-10-25T09:00:00Z" });
   });
 
-  test("a cursor written before waitingReportedFor and approvedReportedFor existed reads as never reported", () => {
+  test("a cursor written before waitingReportedFor, approvedReportedFor and bodies existed reads as never reported", () => {
     const dir = repo();
     const path = cursorPath(dir, "x");
     mkdirSync(dirname(path), { recursive: true });
-    const { waitingReportedFor: _, approvedReportedFor: __, ...old } = CURSOR;
+    const { waitingReportedFor: _, approvedReportedFor: __, bodies: ___, ...old } = CURSOR;
     writeFileSync(path, JSON.stringify(old));
-    expect(readCursor(dir, "x", PR)).toEqual({ ...CURSOR, waitingReportedFor: null, approvedReportedFor: null });
+    expect(readCursor(dir, "x", PR)).toEqual({ ...CURSOR, waitingReportedFor: null, approvedReportedFor: null, bodies: {} });
   });
 
   test("a cursor left by another PR number starts over", () => {
@@ -408,6 +471,7 @@ describe("the cursor file", () => {
       JSON.stringify({ ...emptyCursor(PR), reported: { ci: "run:1" } }),
       JSON.stringify({ ...emptyCursor(PR), waitingReportedFor: 3 }),
       JSON.stringify({ ...emptyCursor(PR), approvedReportedFor: false }),
+      JSON.stringify({ ...emptyCursor(PR), bodies: { "thread:1": 5 } }),
     ];
     for (const content of bad) {
       writeFileSync(path, content);

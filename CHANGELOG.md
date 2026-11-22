@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.5.0
+
+**Landing**
+
+- Land on plain words: "go ahead and merge it" works, not only `land`. The hook records the user's own words; scheduled prompts and "not yet" never land.
+- Repos with no CI land when the base branch requires no checks.
+- GitHub stacks: fbs recognizes a native stack, tells you the whole stack can be merged with `gh stack merge`, and records each merged PR afterwards.
+- Rewriting an open PR's branch: a messages-only rewrite passes; anything else needs your words or `fbs rewrite request` and a yes.
+
+**Camp**
+
+- Only the newest run of each check counts, bot comment edits that change nothing are ignored, and quiet review comments are reported without waiting for every check.
+- A camp belongs to its session; a second session takes over and says so. PRs merged outside fbs are recorded (`fbs status reconcile`).
+- Raw PR comment, reply and review endpoints are denied during a camp; replies go through `fbs pr reply` and `fbs pr comment`.
+
+**Branches, units and stacks**
+
+- Conventional Commit branch types (`feat/`, `fix/`, `chore/`…) beside `feature/bugfix/hotfix`, following the repo's convention or `branches.types`.
+- Independent work units can start from the default branch; `fbs status unit --move` renumbers units, and `fbs status move --to` moves a feature to another repo.
+- A restack that conflicts falls back to one commit holding the unit's change (git 2.40 or later); a parent branch fbs doesn't know is followed once it's merged.
+
+**Verifying**
+
+- `(rollout)` acceptance criteria: verify passes without them, the PR lists them, and their outcome is recorded after the merge (`fbs status rollout`).
+- The stamp carries over a change to another unit's section, a branch tip that isn't checked out, and plain `CLAUDE.md` or `AGENTS.md` edits.
+- `verify.suite` for heavy suites, and `verify.ciEvidence` with `fbs ci evidence`: green CI on the exact head commit stands in for the local run.
+
+**Documents**
+
+- A user-level config (`$XDG_CONFIG_HOME/fbs/config.json`) with defaults for every repo or per GitHub owner; `fbs config show` and `fbs config set`.
+- `docs.store`: feature documents tracked in the repo or kept local.
+- `docs.publish`: the spec, the design and a short changes log mirrored to a documentation tool the session can reach (Notion has an adapter), updated in place after each approval.
+
+**Flow**
+
+- Grilling settles a design-deciding fact before the design instead of leaving it as an open call; questions go in plain text while background work runs.
+- Implement runs its baseline in the foreground; the tracker assigns you and records what changed; `fbs push` works from any checkout; every command has `--help`.
+
 ## 0.4.0 — first public release
 
 fbs is a Claude Code plugin that takes a feature from an idea to a reviewed, verified pull request in one conversation, with a small CLI that enforces approvals, the verify stamp and a never-merge guard.

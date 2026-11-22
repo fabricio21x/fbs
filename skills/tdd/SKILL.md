@@ -31,8 +31,8 @@ Restate the bug in one line each: what happens, what should happen, how to trigg
 ## 2. A clean start, the test command and a baseline
 
 1. If `git status --porcelain` isn't empty, show what's dirty and ask once (the question UI when available): commit it, ignore it locally (add it to `.git/info/exclude`, which changes nothing in the repo), or set it aside with `git stash -u` until this stage ends. Do what the user chooses and go on; never discard their changes.
-2. Find the project's test command in `CLAUDE.md`, the `package.json` scripts or the equivalent. If you can't find one, ask once.
-3. Run the whole suite before changing anything and keep its summary line. Failures that exist now are not yours: list them, and don't fix them here.
+2. Find the project's test command in `CLAUDE.md`, the `package.json` scripts or the equivalent. If you can't find one, ask once. The whole suite is `verify.suite` from `fbs config show` when it is set (a scoped or capped command for this machine), else that test command.
+3. Run the whole suite before changing anything, in the foreground with a Bash `timeout` (per workspace or package when the root command hangs), and keep its summary line. Failures that exist now are not yours: list them, and don't fix them here.
 
 ## 3. Reproduce
 
@@ -44,7 +44,7 @@ Restate the bug in one line each: what happens, what should happen, how to trigg
 
 Pick a slug for the bug: lowercase words joined by `-`, at most four words. Run `fbs status init <slug> --size bug` and take `dir` from its JSON; on `error: exists`, ask whether to continue that record or pick another slug. Then `fbs status show <slug>` gives `docs` and `docsRoot`: `bug.md` is written under `docsRoot`, and committed only when `docs` is `tracked` (`local`: git ignores it).
 
-When the bug comes from a tracker ticket, record it first: `fbs status ticket <slug> '<id>' --url <its url>`. Then run `fbs branch <slug> --type bugfix` (`--type hotfix` when the user calls it an urgent production fix; it takes the ticket from the record): the fix goes on its own branch, cut from the remote's default branch, so it ships on its own; the reproduction test comes along uncommitted. Pass `--parent <the current branch>` when the code the test exercises exists only on that unmerged feature branch (`git diff origin/<default branch>...HEAD` touches it): the fix then stacks on it. Pass `--use <branch>` only when the user explicitly asked to fix it on that branch. Say each `note:` in one line; on `refused:`, show it to the user and do what they choose, never discarding their changes.
+When the bug comes from a tracker ticket, record it first: `fbs status ticket <slug> '<id>' --url <its url>`. Then run `fbs branch --types` and `fbs branch <slug> --type <type>` (it takes the ticket from the record), the type picked from the `types` it printed (the repo's config, else the family its branches use): `fix` or `bugfix`, or `hotfix` when it's listed and the user calls this an urgent production fix, else the closest type it lists. The fix goes on its own branch, cut from the remote's default branch, so it ships on its own; the reproduction test comes along uncommitted. Pass `--parent <the current branch>` when the code the test exercises exists only on that unmerged feature branch (`git diff origin/<default branch>...HEAD` touches it): the fix then stacks on it. Pass `--use <branch>` only when the user explicitly asked to fix it on that branch. Say each `note:` in one line; on `refused:`, show it to the user and do what they choose, never discarding their changes.
 
 Then the ticket, when the bug has none yet: load `fbs:tracker` with the Skill tool (its setting step first); with a tracker, propose one issue for the bug and create it on the user's one-line go-ahead; it renames the branch to carry the id. Commit a tracker setting it wrote, unless git ignores it (`git check-ignore -q .fbs/config.json` exits 0).
 

@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { gitCommonDir } from "./git";
@@ -10,6 +10,8 @@ export interface Cursor {
   pr: number;
   /** `<kind>:<id>` → the updatedAt last reported. */
   comments: Record<string, string>;
+  /** `<kind>:<id>` → a short hash of the body last reported, links left out, to tell a bot's new text from a refreshed link. */
+  bodies: Record<string, string>;
   head: string | null;
   /** Ids of the failing checks reported on `head`. */
   reported: string[];
@@ -23,9 +25,9 @@ export interface Cursor {
   approvedReportedFor: string | null;
 }
 
-export type Verdict = "approved-green" | "ready" | "waiting" | "conflict" | "activity" | "closed" | "timeout" | "query-error";
+export type Verdict = "approved-green" | "ready" | "waiting" | "conflict" | "activity" | "closed" | "timeout" | "query-error" | "taken-over";
 
-export const EXIT_CODES: Record<Verdict, number> = { "approved-green": 0, activity: 3, closed: 4, timeout: 5, conflict: 6, "query-error": 7, ready: 8, waiting: 9 };
+export const EXIT_CODES: Record<Verdict, number> = { "approved-green": 0, activity: 3, closed: 4, timeout: 5, conflict: 6, "query-error": 7, ready: 8, waiting: 9, "taken-over": 10 };
 
 /** Verdicts whose report the agent acts on in full; the others leave the cursor alone, so nothing is lost. */
 const SAVING: readonly Verdict[] = ["approved-green", "ready", "waiting", "activity", "closed"];
@@ -46,10 +48,12 @@ export interface FailingCheck {
   /** The GitHub Actions run, for `gh run rerun`; null for other checks. */
   runId: number | null;
   rerunnable: boolean;
+  /** Its Actions run still has jobs going, so `gh run rerun` would refuse; it is reported again once the run finishes. */
+  runInProgress: boolean;
 }
 
 export interface Report {
-  verdict: Exclude<Verdict, "query-error">;
+  verdict: Exclude<Verdict, "query-error" | "taken-over">;
   pr: number;
   state: Snapshot["state"];
   head: string;
@@ -59,6 +63,8 @@ export interface Report {
   truncated: boolean;
   newComments: NewComment[];
   failingChecks: FailingCheck[];
+  /** Checks still running: a report can come before the round's checks have all finished. */
+  pendingChecks: number;
   unresolvedThreads: number;
 }
 
@@ -68,10 +74,19 @@ export interface QueryErrorReport {
   error: string;
 }
 
+/** The camp this watcher works for is now held by another Claude Code session, `session`, or was stopped (null). */
+export interface TakenOverReport {
+  verdict: "taken-over";
+  pr: number;
+  session: string | null;
+}
+
 const REPORTED_FOR = ["waitingReportedFor", "approvedReportedFor"];
+// Older cursors were saved without these.
+const ADDED_LATER = [...REPORTED_FOR, "bodies"];
 
 export function emptyCursor(pr: number): Cursor {
-  return { pr, comments: {}, head: null, reported: [], failing: [], previousFailing: [], waitingReportedFor: null, approvedReportedFor: null };
+  return { pr, comments: {}, bodies: {}, head: null, reported: [], failing: [], previousFailing: [], waitingReportedFor: null, approvedReportedFor: null };
 }
 
 export function cursorPath(cwd: string, slug: string): string {
@@ -90,11 +105,12 @@ export function readCursor(cwd: string, slug: string, pr: number): Cursor {
   } catch (e) {
     throw invalid((e as Error).message.split("\n")[0]);
   }
-  // A cursor saved before the reported-for fields existed has every other key.
-  const keys = Object.keys(raw ?? {}).filter((key) => !REPORTED_FOR.includes(key)).sort().join();
+  const keys = Object.keys(raw ?? {}).filter((key) => !ADDED_LATER.includes(key)).sort().join();
   if (!isObject(raw) || keys !== "comments,failing,head,pr,previousFailing,reported") {
-    throw invalid("expected { pr, comments, head, reported, failing, previousFailing, waitingReportedFor, approvedReportedFor }");
+    throw invalid("expected { pr, comments, bodies, head, reported, failing, previousFailing, waitingReportedFor, approvedReportedFor }");
   }
+  const bodies = raw.bodies ?? {};
+  if (!isObject(bodies) || !Object.values(bodies).every((v) => typeof v === "string")) throw invalid("bodies must map ids to strings");
   const [waitingReportedFor, approvedReportedFor] = REPORTED_FOR.map((key) => raw[key] ?? null);
   for (const key of REPORTED_FOR) {
     if (!(raw[key] === undefined || raw[key] === null || typeof raw[key] === "string")) throw invalid(`${key} must be null or a string`);
@@ -109,6 +125,7 @@ export function readCursor(cwd: string, slug: string, pr: number): Cursor {
   return {
     pr,
     comments: raw.comments as Record<string, string>,
+    bodies: bodies as Record<string, string>,
     head: raw.head,
     reported: raw.reported as string[],
     failing: raw.failing as string[],
@@ -129,7 +146,7 @@ export function saveCursor(cwd: string, slug: string, cursor: Cursor): void {
   mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.${randomBytes(8).toString("hex")}.tmp`;
   try {
-    writeFileSync(temp, `${JSON.stringify({ ...cursor, comments }, null, 2)}\n`, { flag: "wx" });
+    writeFileSync(temp, `${JSON.stringify({ ...cursor, comments, bodies: { ...onDisk.bodies, ...cursor.bodies } }, null, 2)}\n`, { flag: "wx" });
     renameSync(temp, path);
   } finally {
     rmSync(temp, { force: true });
@@ -145,11 +162,27 @@ const isSettled = (check: Check) => check.status === "COMPLETED" || BLOCKED_STAT
 const isFailing = (check: Check) => BLOCKED_STATUSES.includes(check.status) || (check.status === "COMPLETED" && !PASSING.includes(check.conclusion));
 const commentKey = (comment: Pick<Comment, "kind" | "id">) => `${comment.kind}:${comment.id}`;
 
+const LINKS = [/!?\[[^\]]*\]\([^)]*\)/g, /<a\b[^>]*>[\s\S]*?<\/a>/gi, /https?:\/\/\S+/g];
+
+/** A short hash of a comment's text without its links (markdown, HTML anchors, bare URLs) and with whitespace collapsed. */
+function bodyHash(body: string): string {
+  const text = LINKS.reduce((rest, link) => rest.replace(link, " "), body).replace(/\s+/g, " ").trim();
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+/** Bots edit their comments to refresh a link (a tracker's back-link); only an edit that changes their text counts, such as a placeholder filled in with a review. */
+function botEditCounts(comment: Comment, cursor: Cursor): boolean {
+  const reported = cursor.bodies[commentKey(comment)];
+  // A cursor saved before bodies were kept can't tell, so the edit stays quiet.
+  return reported !== undefined && reported !== bodyHash(comment.body);
+}
+
 function unseenComments(snapshot: Snapshot, cursor: Cursor): NewComment[] {
   return snapshot.comments
     .filter((comment) => {
       const seen = cursor.comments[commentKey(comment)];
-      return seen === undefined || Date.parse(comment.updatedAt) > Date.parse(seen);
+      if (seen === undefined) return true;
+      return Date.parse(comment.updatedAt) > Date.parse(seen) && (!comment.bot || botEditCounts(comment, cursor));
     })
     .map((comment) => ({ ...comment, key: commentKey(comment), edited: cursor.comments[commentKey(comment)] !== undefined }))
     .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
@@ -172,16 +205,26 @@ function isApproved(snapshot: Snapshot): boolean {
   return states.includes("APPROVED") && !states.includes("CHANGES_REQUESTED");
 }
 
-/** The verdict for one snapshot, or null to keep waiting. */
-export function classify(snapshot: Snapshot, cursor: Cursor): Exclude<Verdict, "timeout" | "query-error"> | null {
+/** No unseen comment was added or changed since `previous`, the poll before; never true on a watch's first poll. */
+function commentsQuiet(unseen: NewComment[], previous: Snapshot | null): boolean {
+  if (previous === null) return false;
+  const before = new Map(previous.comments.map((comment) => [commentKey(comment), comment.updatedAt]));
+  return unseen.every((comment) => before.get(comment.key) === comment.updatedAt);
+}
+
+/** The verdict for one snapshot, or null to keep waiting; `previous` is the same PR's snapshot from the poll before. */
+export function classify(snapshot: Snapshot, cursor: Cursor, previous: Snapshot | null = null): Exclude<Verdict, "timeout" | "query-error" | "taken-over"> | null {
   if (snapshot.state !== "OPEN") return "closed";
   if (snapshot.mergeable === "CONFLICTING") return "conflict";
   const unseen = unseenComments(snapshot, cursor);
-  // A human is waiting on an answer; bots and CI wait for the round to settle.
+  // A human is waiting on an answer; bot comments wait until they stop arriving, failures until every check finishes.
   if (unseen.some((comment) => !comment.bot)) return "activity";
   // A truncated snapshot may hide comments or checks, so it never counts as settled.
-  if (snapshot.truncated || !snapshot.checks.every(isSettled)) return null;
-  if (unseen.length > 0 || newFailures(snapshot, cursor).length > 0) return "activity";
+  if (snapshot.truncated) return null;
+  const settled = snapshot.checks.every(isSettled);
+  if (unseen.length > 0 && (settled || commentsQuiet(unseen, previous))) return "activity";
+  if (!settled) return null;
+  if (newFailures(snapshot, cursor).length > 0) return "activity";
   if (snapshot.checks.some(isFailing)) return null;
   if (snapshot.draft) return "ready";
   if (isApproved(snapshot)) {
@@ -220,22 +263,33 @@ export function report(verdict: Report["verdict"], snapshot: Snapshot, cursor: C
         detailsUrl: check.detailsUrl,
         runId: check.runId,
         rerunnable: check.rerunnable,
+        runInProgress: runInProgress(check, snapshot),
       })),
+    pendingChecks: snapshot.checks.filter((check) => !isSettled(check)).length,
     unresolvedThreads: snapshot.threads.filter((thread) => !thread.isResolved).length,
   };
 }
 
+const runInProgress = (check: Check, snapshot: Snapshot) => check.runId !== null && snapshot.checks.some((other) => other.runId === check.runId && !isSettled(other));
+
 /** The cursor once everything in `snapshot` has been reported under `verdict`. */
 export function advance(cursor: Cursor, snapshot: Snapshot, verdict?: Verdict): Cursor {
   const comments = { ...cursor.comments };
-  for (const comment of snapshot.comments) comments[commentKey(comment)] = comment.updatedAt;
+  const bodies = { ...cursor.bodies };
+  for (const comment of snapshot.comments) {
+    comments[commentKey(comment)] = comment.updatedAt;
+    bodies[commentKey(comment)] = bodyHash(comment.body);
+  }
   const failing = snapshot.checks.filter(isFailing);
   const kept = cursor.head === snapshot.head ? cursor.reported : [];
+  // A failure whose run is still going stays unreported, so it wakes camp again once the run can be re-run.
+  const reported = failing.filter((check) => !runInProgress(check, snapshot));
   return {
     pr: cursor.pr,
     comments,
+    bodies,
     head: snapshot.head,
-    reported: [...new Set([...kept, ...failing.map((check) => check.id)])],
+    reported: [...new Set([...kept, ...reported.map((check) => check.id)])],
     failing: [...new Set(failing.map((check) => check.name))],
     previousFailing: previousFailing(snapshot, cursor),
     waitingReportedFor: verdict === "waiting" ? snapshot.head : cursor.waitingReportedFor,
@@ -257,6 +311,8 @@ export interface WatchOptions {
   intervalSeconds: number;
   /** null waits until a verdict; 0 takes one snapshot. */
   timeoutSeconds: number | null;
+  /** Asked before each poll: the other session that now holds the camp (session null: the camp is gone), or null to keep watching. */
+  takenOver?: () => { session: string | null } | null;
 }
 
 export const DEFAULT_INTERVAL_SECONDS = 60;
@@ -264,7 +320,7 @@ const MAX_WAIT_SECONDS = 300;
 const RETRY_DELAY_SECONDS = 15;
 
 /** `cursor` is what to save, or null to leave the saved one as it is. */
-export type WatchResult = { report: Report; cursor: Cursor | null } | { report: QueryErrorReport; cursor: null };
+export type WatchResult = { report: Report; cursor: Cursor | null } | { report: QueryErrorReport | TakenOverReport; cursor: null };
 
 /** Poll until a verdict. A GhError (gh missing, unauthenticated, no such PR) is not retried and propagates. */
 export function watch(reader: GitHubReader, cursor: Cursor, options: WatchOptions, clock: Clock, progress: (line: string) => void): WatchResult {
@@ -286,19 +342,24 @@ export function watchAll(targets: WatchTarget[], options: WatchOptions, clock: C
   const deadline = options.timeoutSeconds === null ? Number.POSITIVE_INFINITY : clock.now() + options.timeoutSeconds * 1000;
   const remaining = () => (deadline - clock.now()) / 1000;
   let wait = options.intervalSeconds;
-  const lastHeads: (string | null)[] = targets.map(() => null);
+  const previous: (Snapshot | null)[] = targets.map(() => null);
   for (let poll = 1; ; poll++) {
+    const taken = options.takenOver?.() ?? null;
+    if (taken !== null) {
+      progress(JSON.stringify({ poll, verdict: "taken-over", session: taken.session }));
+      return { index: 0, result: { report: { verdict: "taken-over", pr: targets[0].cursor.pr, session: taken.session }, cursor: null } };
+    }
     let first: Snapshot | null = null;
     for (const [index, { reader, cursor, label }] of targets.entries()) {
       const snapshot = readSnapshot(reader, cursor.pr, clock, remaining, (fields) => progress(JSON.stringify({ poll, ...label, ...fields })));
       if (snapshot instanceof QueryError) return { index, result: { report: { verdict: "query-error", pr: cursor.pr, error: snapshot.message }, cursor: null } };
-      if (snapshot.head !== lastHeads[index]) wait = options.intervalSeconds;
-      lastHeads[index] = snapshot.head;
+      if (snapshot.head !== previous[index]?.head) wait = options.intervalSeconds;
+      const decided = classify(snapshot, cursor, previous[index]);
+      previous[index] = snapshot;
       first ??= snapshot;
 
       const last = index === targets.length - 1;
       const left = remaining();
-      const decided = classify(snapshot, cursor);
       const status = {
         poll,
         ...label,

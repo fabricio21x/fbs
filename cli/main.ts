@@ -4,20 +4,22 @@ import plugin from "../.claude-plugin/plugin.json";
 import { AfkError, type AfkDeps, afkGuardRun, checkStep, finalRun, parseSpec, REAL_AFK_DEPS, resumeRun, showRun, startRun, stopCheck, stopRun } from "./afk";
 import { preflight } from "./afk-preflight";
 import { askCheck } from "./ask-check";
-import { BranchRefusedError, enterFeatureBranch, pushFeatureBranch } from "./branch";
-import { addFollowup, CampError, COUNTS, type Counts, closeFollowup, recordCheckpoint, recordRound, showCamp, startCamp, stopCamp } from "./camp";
+import { BranchRefusedError, branchTypes, enterFeatureBranch, pushFeatureBranch } from "./branch";
+import { addFollowup, CampError, COUNTS, type Counts, campOwner, closeFollowup, recordCheckpoint, recordRound, showCamp, startCamp, stopCamp } from "./camp";
+import { CiRefusedError, ciEvidence } from "./ci";
 import { CommitsRefusedError, commitProblems, isConventionalSubject } from "./commits";
-import { ConfigError, projectConfig } from "./config";
+import { ConfigError, projectConfig, resolveConfig, setConfig } from "./config";
 import { checkContext } from "./context";
 import { isValidDate, localDate } from "./date";
 import { GitError, NotAGitRepoError, rootFor, setGitBinary } from "./git";
-import { COMMENT_KEY_FORMS, type CommentKey, GhError, type GhRunner, ghReader, NotOnPrError, parseCommentKey, replyToComment, repoName, resolveThread, runGh, setGhBinary } from "./github";
+import { COMMENT_KEY_FORMS, commentOnPr, GhError, type GhRunner, ghReader, NotOnPrError, parseCommentKey, replyToComment, repoName, resolveThread, runGh, setGhBinary } from "./github";
 import { guardPrompt, guardReply, guardToolUse } from "./guard";
-import { LandRefusedError, land, requestLand } from "./land";
+import { LandRefusedError, land, requestLand, requestRewrite } from "./land";
+import { moveFeature } from "./move";
 import { checkPolish, type PolishDeps, REAL_POLISH_DEPS, setClaudeBinary } from "./polish";
-import { syncStack } from "./stack";
+import { reconcileLandings, syncStack } from "./stack";
 import { detectTracker } from "./tracker";
-import type { GateResult } from "./spec-gate";
+import { type GateResult, SOURCE_FORMS } from "./spec-gate";
 import { carryStamp, checkStamp, setStamp, StampRefusedError, stampProblems } from "./stamp";
 import {
   ApprovalRefusedError,
@@ -30,6 +32,8 @@ import {
   docsDir,
   docsMode,
   documentsRecord,
+  docsStoreWarning,
+  excludeLocalDocs,
   type FeatureRecord,
   featurePr,
   featureUnits,
@@ -39,10 +43,12 @@ import {
   isApprovalCurrent,
   isUnit,
   listFeatures,
+  moveUnit,
   parsePrRef,
   plannedUnit,
   readFeature,
   RecordError,
+  recordRollout,
   setPr,
   setTicket,
   StatusError,
@@ -71,34 +77,86 @@ const USAGE = [
   "",
   "commands:",
   "  --version                 print the fbs version",
-  "  help                      show this help",
+  "  help [<command>]          show this help, or that command's part; so does fbs <command> --help (or -h)",
   "  context check [--json]    validate .fbs/context.md",
   "  status init <slug> --size <tiny|bug|mid|big>",
   "  status init <unit slug> --unit-of <feature> [--unit <n>]",
   "                            record a work unit of a big feature whose design approval is current, numbered next",
-  "                            in its stack unless --unit names a free number; its dir is <feature dir>/units/<unit slug>",
-  "                            and it goes by the feature's spec, design and approvals (approve and gate refuse a unit)",
-  "  status show <slug>        a unit adds covers and dependsOn from the design; a feature lists its units",
+  "                            in its stack unless --unit names a number (a taken one is freed by shifting the units at",
+  "                            and above it up one); its dir is <feature dir>/units/<unit slug> and it goes by the",
+  "                            feature's spec, design and approvals (approve and gate refuse a unit); every number must",
+  "                            be listed in the design, and a shift that would put another unit under an unlanded unit",
+  "                            whose branch is cut, or leave an independent unit on a design entry that doesn't let it",
+  "                            stand apart or below every unit of the stack, is refused with breaks-stack",
+  "  status unit <unit slug> --move <n>",
+  "                            renumber the unit to n, shifting the units between one place toward its old number;",
+  "                            prints [{slug,unit}]; n must be listed in the approved design; breaks-stack as above",
+  "  status move <slug> --to <path> [--remove-source]",
+  "                            copy the feature's record and its units' into the git repo at path (relative to the",
+  "                            checkout), without pr, repo, branch, stamp, landed and independent, and its documents into",
+  "                            that repo's features dir, local or tracked as its git ignores them; --remove-source then",
+  "                            removes the records and documents here; refused for a unit, an unlanded PR (open-pr), any",
+  "                            landed unit (has-landed), an approved document not in this checkout (doc-missing), a slug",
+  "                            the target has (exists) or a path that isn't another repo (bad-target); prints",
+  "                            {slug,to,dir,docs,docsRoot,units,sourceRemoved,deletionToCommit}, the last the tracked",
+  "                            folder --remove-source deleted, to commit, else null",
+  "  status show <slug>        a unit adds covers and dependsOn from the design; a feature lists its units, an",
+  "                            independent one with independent: true",
   "  status list",
   "  status gate <slug> <spec|design>",
   "                            a design's Work units are checked against the spec: units numbered U1..N, one Covers and",
   "                            one Depends on line each, every acceptance criterion covered by exactly one unit (a struck",
   "                            through ~~criterion~~ by none), and dependencies only on existing lower-numbered units;",
-  "                            a big design needs the section, None when it ships as one PR",
+  "                            a big design needs the section, None when it ships as one PR; a fact ends with its source:",
+  "                            (user, YYYY-MM-DD), (spec), (<https url>) or (<file path>[:<line>]), then optionally , <detail>",
+  "                            or ; <detail> inside the parentheses",
   "  status approve <slug> <spec|design> --quote <the user's words>",
   "  status approve <slug> design --auto <why the agent may approve it>",
+  "  status reconcile          ask gh about every record with an open PR: one merged outside fbs land is recorded as landed",
+  "                            (by: outside, its camp markers removed), one closed unmerged has its link cleared as status",
+  "                            pr <slug> none does; nothing is restacked or pushed (stack sync restacks a feature cut from",
+  "                            a landed branch at its next sync); prints {outside:[{slug,pr,kind,reason}]}, kinds as stack",
+  "                            sync's",
   "  status pr <slug> <number|url|none>",
+  "  status rollout <slug> AC<n> <pass|fail> [--note <text>]",
+  "                            record how a rollout criterion turned out after the deploy: one the record lists in rollout",
+  "                            (a spec criterion marked (rollout), which verify passes without evidence), kept beside its",
+  "                            text; a later outcome replaces an earlier one; status show prints rollout, and pendingRollout",
+  "                            for the ones still waiting (a feature's own and its units', each with its slug)",
   "  status ticket <slug> <id|none> [--url <https url>]",
   "                            record the tracker issue the feature works on (ACM-123, or an issue number), or clear it",
-  "  tracker show              print .fbs/config.json's tracker as one JSON line, or unset",
+  "  config show               print the resolved config as one JSON line, validated and with the defaults filled in, and",
+  "                            sources: where each top-level key came from (repo, owner:<owner>, user, default, joined by",
+  "                            + when a section's fields came from several); each key is taken from the repo's",
+  "                            .fbs/config.json, else the user file's block for origin's owner (that owner name on any",
+  "                            host), else its defaults ($XDG_CONFIG_HOME/fbs/config.json, default",
+  "                            ~/.config/fbs/config.json), else the built-in; the user file may set only context, tracker,",
+  "                            camp, branches and docs; warns on stderr when docs.store is tracked but git ignores the",
+  "                            features folder",
+  "  config set <key> <json> [--owner|--user]",
+  "                            write one key (featuresDir, tracker, docs.store, docs.publish, verify.suite, …), validated:",
+  "                            to .fbs/config.json, or with --owner to origin's owner block in the user file, or with",
+  "                            --user to its defaults (featuresDir, afk and verify are repo-only); null removes it; prints",
+  "                            {set,level,path}, plus excluded when this call added the features folder to",
+  "                            .git/info/exclude for docs.store local",
+  "  ci evidence <slug> [--wait]",
+  "                            whether CI stands in for verify's local suite: needs verify.ciEvidence, the feature's branch",
+  "                            checked out and its PR open; reads the runs on HEAD's exact commit through gh and takes the",
+  "                            newest of each workflow verify.ciWorkflows names: success, running, skipped, failed or missing;",
+  "                            prints {sha,tree,verdict,runs:[{workflow,state,url?,conclusion?}]}, verdict evidence (exit 0)",
+  "                            when every one succeeded, wait (exit 1) while one runs, else refused (exit 1); --wait polls",
+  "                            every 30s until none runs or is missing, for up to an hour; refused: <reason> otherwise",
+  "  tracker show              print the resolved config's tracker as one JSON line, or unset",
   "  tracker detect            print the evidence for a tracker setting as one JSON line: the config, ticket-id prefixes",
   "                            in branch names, tracker links in the last 30 merged PR bodies and the issue count (each",
   "                            null when gh can't tell); reads only",
-  "  branch <slug> [--type <feature|bugfix|hotfix|chore>] [--ticket <id>] [--existing] [--parent <branch>]",
+  "  branch <slug> [--type <type>] [--ticket <id>] [--existing] [--parent <branch>]",
   "  branch <slug> --use <branch>",
   "                            put the work tree on the feature's branch and record it; prints one JSON line",
   "                            the recorded branch, else a new <type>/<ticket>-<slug> (or <type>/<slug>) from origin's",
-  "                            --parent or default branch; --type is needed only to create one; --ticket defaults to the",
+  "                            --parent or default branch; --type is needed only to create one, and is one of",
+  "                            feature, bugfix, hotfix, chore, feat, fix, docs, style, refactor, perf, test, build, ci or revert",
+  "                            (only those in .fbs/config.json branches.types, when set); --ticket defaults to the",
   "                            record's ticket; the ticket is lowercased",
   "                            and a bare issue number becomes issue-<n>; --existing never creates one; --parent moves",
   "                            a recorded branch that has no PR and whose origin copy is only what fbs pushed;",
@@ -106,21 +164,48 @@ const USAGE = [
   "                            below it, which becomes its parent); an explicit --ticket renames a recorded branch fbs",
   "                            cut to carry it, refused while its PR is open, origin has commits fbs didn't push, the",
   "                            new name is taken or another feature is stacked on it; the next push deletes the old",
-  "                            name on origin",
-  "  push <slug>               push the feature's branch to origin's branch of that name and track it; prints one JSON line",
+  "                            name on origin; a type branches.types leaves out becomes an allowed one in that rename",
+  "                            (feature and feat, bugfix or hotfix and fix, swap; else the first listed); a unit's",
+  "                            parent comes from its stack, the nearest lower unit that isn't independent; --parent",
+  "                            <default branch> makes a unit above unit 1 independent, cut from or moved onto the default",
+  "                            branch, when the approved design says it depends on no unit still to land and no later",
+  "                            unit depends on it, nothing is stacked on it and, with tracked documents, unit 1 landed;",
+  "                            --parent <the branch of the unit below> puts an independent unit with no PR back in the",
+  "                            stack; a unit that depends on an independent unit still to land is refused a branch",
+  "  branch --types            print the types to pick --type from as one JSON line: {types,from,seen}, from config",
+  "                            (branches.types), else branches (the family, conventional branch or Conventional Commit",
+  "                            types, that the 50 most recently committed local and remote branch names with a type prefix",
+  "                            use more, by the types only it has), else default (feature, bugfix, hotfix, chore; also on",
+  "                            a tie); seen counts each type prefix among those 50; reads only",
+  "  push <slug>               push the tip of the feature's recorded branch to origin's branch of that name and track it,",
+  "                            from any worktree and whatever is checked out; prints one JSON line, with headNotPushed",
+  "                            {head,on} and a note when this checkout is off the branch and its HEAD isn't in what was",
+  "                            pushed; refused while any worktree is rebasing the branch",
   "                            before a PR it overwrites only what fbs pushed last, after one it only adds commits;",
   "                            never main, master or origin's default branch; skipped without an origin remote",
   "  stamp set <slug> --verdict <repo-relative path>",
-  "  stamp check <slug>        a unit whose branch isn't checked out is judged on its branch's tip, local else origin's",
+  "                            records on the record's rollout the spec's criteria marked (rollout) (a unit: the ones it",
+  "                            covers) with their text, which verify passes without evidence, to be checked after the",
+  "                            deploy; an outcome already recorded for a criterion whose text held is kept",
+  "  stamp check <slug>        a record whose branch isn't the one checked out is judged on its branch's tip, local else",
+  "                            origin's; a detached HEAD (a stopped rebase) is judged on itself",
   "  stamp carry <slug>        move the stamp onto HEAD's tree without verifying again, when every path changed since the",
   "                            stamped tree is a plain, non-executable .md or .html file in the feature's documents",
   "                            folder, none named afk*, spec.md, design.md, bug.md or plan.md (any case) or the stamp's",
-  "                            verdict, and no symlink in the tree points into that folder; keeps verifiedTree, the tree",
-  "                            verify ran on; refused on uncommitted changes, an approval that isn't current, a changed",
-  "                            local verdict, and for a unit whose branch isn't checked out; prints ok when the stamp",
-  "                            already covers HEAD, else carried: <old tree> -> <new tree>; only documents changed: <paths>",
+  "                            verdict, and no symlink in the tree points into that folder; or a plain file named exactly",
+  "                            CLAUDE.md or AGENTS.md at any depth, no other symlink reaching it; for a unit, also the",
+  "                            feature's design.md when the unit's own ### U<n> section is unchanged as written, and its",
+  "                            spec.md when the criteria that section covers are unchanged, the lines under each included;",
+  "                            keeps verifiedTree, the tree verify ran on; refused on",
+  "                            uncommitted changes, an approval that isn't current, a changed local verdict, and while the",
+  "                            record's branch isn't checked out; prints ok when the stamp already covers HEAD, else",
+  "                            carried: <old tree> -> <new tree>; nothing verify reads changed: <paths>",
   "  commits check <slug>      list each non-merge commit on the feature's branch since its base, leaving out the parent",
-  "                            branch's, whose subject isn't a conventional commit; ok, else exit 1",
+  "                            branch's, whose subject isn't a conventional commit or whose message breaks commitlint",
+  "                            config-conventional's rules (header and lines of 100 characters at most, no spaces around",
+  "                            the header, a subject that doesn't start with a capital or end with a full stop), as <sha>",
+  "                            <header> [<what breaks>]; a missing blank line after the header is a warning; fixup!,",
+  "                            squash! and amend! commits are skipped; ok when nothing fails, else exit 1",
   "  commits title <text>      check a PR title the same way; ok, else title: <text> and exit 1",
   "                            conventional: <type>[(<scope>)][!]: <description>, with one of commitlint config-conventional's",
   "                            lowercase types: build, chore, ci, docs, feat, fix, perf, refactor, revert, style, test",
@@ -128,52 +213,83 @@ const USAGE = [
   "                            wait for a verdict on the feature's PR; prints one JSON line",
   "                            a feature with units watches each unit's open PR, lowest first, and reports the first",
   "                            with a verdict, adding its slug and unit; a timeout reports the lowest",
-  "                            exit 0 approved-green, 3 activity, 4 closed, 5 timeout, 6 conflict, 7 query-error, 8 ready, 9 waiting",
+  "                            exit 0 approved-green, 3 activity, 4 closed, 5 timeout, 6 conflict, 7 query-error, 8 ready, 9 waiting,",
+  "                            10 taken-over: before each poll, when the slug's camp names a session other than",
+  "                            $CLAUDE_CODE_SESSION_ID, it prints {verdict,pr,session} (the holder) and saves nothing;",
+  "                            session null when the camp it started with is gone (stopped); a watcher with no session,",
+  "                            or a camp that names none, never stops for this",
   "                            --once takes one snapshot (nothing decisive is a timeout)",
   "  pr reply <slug> --comment <thread|issue|review>:<id> --body-file <path>",
   "                            a review thread's key may also be its GraphQL node id, or one of its comments' (thread:PRRT_…,",
   "                            thread:PRRC_…); the reply goes into that thread",
+  "  pr comment <slug> --body-file <path>",
+  "                            a new top-level comment on the PR, marked seen so the watcher doesn't wake on it",
   "  pr resolve <slug> --thread <id>",
   "                            the review thread's node id (PRRT_…)",
   "  camp start <slug> [--auto-fix-rounds <n>]",
   "                            create the PR camp's state (its existence switches on the never-merge guard), or keep its",
   "                            rounds on a resume; the fix budget is --auto-fix-rounds, else the recorded one, else",
-  "                            .fbs/config.json camp.autoFixRounds, else 2; prints the state",
+  "                            .fbs/config.json camp.autoFixRounds, else 2; prints the state, with session its holder;",
+  "                            the camp is held by $CLAUDE_CODE_SESSION_ID (without one, the holder stays), and taken over",
+  "                            from another session, printing takenOverFrom; first asks gh about each unlanded PR it camps",
+  "                            as status reconcile does, printing outside; refused once everything it camps has landed",
   "  camp round <slug> --in <n> --fixed <n> --declined <n> --followups <n> --asked <n> [--note <text>] [--unit <unit slug>]",
   "                            record a round and print what comes next: continue while fewer rounds than the budget fixed",
   "                            something, checkpoint once the budget is spent until camp checkpoint records it, then",
-  "                            blockers-only; --unit counts a stack's rounds per unit, under the feature's camp",
+  "                            blockers-only; --unit counts a stack's rounds per unit, under the feature's camp; refused",
+  "                            (error: camp held by <id>; camp start takes it over) when the camp names another session",
+  "                            than $CLAUDE_CODE_SESSION_ID, and so is camp checkpoint",
   "  camp checkpoint <slug> [--unit <unit slug>]",
   "                            record that the checkpoint was held; prints blockers-only; refused before one is due",
   "  camp show <slug> [--unit <unit slug>]",
   "                            print the state: budget, phase (auto, checkpoint or blockers-only; of --unit when given),",
   "                            each unit's phase, checkpoints held, rounds, followups (each with its status: open, filed or",
   "                            declined) and openFollowups (the open ones); a camp file fbs didn't write counts as empty",
-  "  camp stop <slug>          remove the camp file, switching the never-merge guard off; follow-ups stay; prints stopped",
+  "  camp stop <slug>          remove the camp file, switching the never-merge guard off; follow-ups stay; asks gh about",
+  "                            each PR it camps as status reconcile does, then prints stopped and <kind>: <reason> for each",
+  "                            PR found not open; the camp file goes first, so a failure asking gh leaves it stopped; when",
+  "                            the camp names another session it is refused as camp round is while a PR it camps is open",
   "  camp followup <slug> --thread <key> --summary <text> [--why <text>] [--unit <unit slug>]",
-  "                            record a valid out-of-scope finding (the thread key as pr reply takes it) for a ticket later;",
+  "                            record a valid out-of-scope finding (the thread key as pr reply takes it, or check:<name>",
+  "                            for a failing CI check, which has no thread to reply to or resolve) for a ticket later;",
   "                            kept in <git common dir>/fbs/pr/<slug>.followups.json, outside the tree, which camp stop and",
   "                            land leave; prints it as one JSON line with its number, round and status open",
   "  camp followup <slug> --filed <n> --link <url>",
   "  camp followup <slug> --declined <n>",
   "                            close follow-up n: filed with its ticket's link, or declined; prints it; works after the camp",
   "                            stopped; a filed one can't be declined, nor a declined one filed",
-  "  land <slug>                merge the feature's PR; needs the token the user's /fbs:land writes",
+  "  land <slug>                merge the feature's PR; needs the land token the user's own message writes, kept until",
+  "                            a merge is tried or their next message that doesn't ask to land (asking to merge or land",
+  "                            it, a yes to a land request, or /fbs:land; bound to their session); a PR with",
+  "                            no checks lands when the base requires none (checks: \"none\" in the JSON); a PR in a GitHub",
+  "                            stack with other open PRs merges nothing: prints {merged:false,stack:{number,prs,upTo,",
+  "                            command}}, each open PR checked as land would ({pr,slug,ready,reasons?}), upTo the highest",
+  "                            ready one with only ready ones below, command gh stack merge <upTo> --squash for the user;",
   "                            a feature with units lands its lowest unit with an open PR, and a unit lands only when it",
-  "                            is that one (bottom-up); /fbs:land on the feature or that unit writes the unit's token;",
+  "                            is that one (bottom-up), an independent unit whenever it's ready (the feature's slug takes",
+  "                            one only when no other unit has an open PR) unless the design no longer lets it stand",
+  "                            apart; /fbs:land on the feature or that unit writes",
+  "                            the unit's token;",
   "                            then the unit above, when its PR is open, is restacked in a temporary worktree: git rebase",
   "                            --onto origin/<default> <landed head>, a push with --force-with-lease on origin's tip and",
   "                            gh pr edit --base <default>; each unit above it is rebased onto the one below the same way,",
   "                            and so is each plain feature whose parent is the landed branch (one with no PR and no push",
-  "                            only here); only for branches still stacked on the landed one; restack in the JSON says",
-  "                            what happened to the unit above, stacked (when any) to the rest ({slug,pr,done,treeChanged}",
-  "                            or {slug,pr,done,kind,reason}, kind as for stack sync), and a restack that fails (a",
-  "                            conflict or a refused push leaves the branch as it was) never fails the land",
+  "                            only here); only for branches still stacked on the landed one; a rebase that conflicts",
+  "                            falls back to one commit on the new base carrying the branch's own change (git merge-tree",
+  "                            from where its work forked off the branch below, named after its first own commit),",
+  "                            reported as squashed:true with squashedFrom the old tip (not when the branch merged the",
+  "                            default branch directly, nor on git before 2.40), and only otherwise is it a conflict; restack in",
+  "                            the JSON says what happened to the unit above, stacked (when any) to the rest",
+  "                            ({slug,pr,done,treeChanged,squashed?,squashedFrom?} or {slug,pr,done,kind,reason,squashed?,squashedFrom?}, kind as for",
+  "                            stack sync), and a restack that fails (a conflict or a refused push leaves the branch as it",
+  "                            was) never fails the land",
   "  land request <slug>       ask for a land: write a pending request for the PR and stamp that land <slug> would land;",
-  "                            the user's bare reply (land, land it, land #<pr>) within 10 minutes, in the session that",
-  "                            asked ($CLAUDE_CODE_SESSION_ID, required), turns it into the land token; prints",
-  "                            {requested,slug,pr}; refused like land with no PR or no stamp, and while another",
-  "                            feature's request waits for an answer (the same feature's is refreshed)",
+  "                            the user's yes (yes, go ahead, land it anyway, land #<pr>) as their next message in the",
+  "                            session that asked ($CLAUDE_CODE_SESSION_ID, required), turns it into the land token, and",
+  "                            anything else they say drops it; prints {requested,slug,pr}; refused like",
+  "                            land with no PR or no stamp, and while another feature's request waits for an answer (the",
+  "                            same feature's is refreshed); in a GitHub stack it writes nothing and prints",
+  "                            {requested:false,stack} as land does",
   "  land request <slug> --over-failing",
   "                            the same, listing in over ({name,workflow?,state}) the PR's checks that completed without",
   "                            passing (failed or cancelled) and the base branch's required checks that never ran",
@@ -183,29 +299,49 @@ const USAGE = [
   "                            any other failure, accepts UNSTABLE, and on BLOCKED merges with --admin only for a repo",
   "                            admin, every required check passed or confirmed, and every branch protection setting and",
   "                            ruleset rule one fbs understands (else refused, naming it); the landed record keeps over",
+  "  rewrite request <slug>    ask to rewrite the open PR's branch (a rebase, a squash, a changed commit): write a pending",
+  "                            request the user's yes, as their next message in the session that asked",
+  "                            ($CLAUDE_CODE_SESSION_ID, required), turns into the one-time rewrite token, one lease push",
+  "                            to an open PR's branch; anything else they say drops it; prints {requested,slug,pr,branch};",
+  "                            refused with no PR or branch recorded, landed, and while another request waits",
   "  stack sync <slug>         keep every unlanded unit of the feature (or of a unit's feature) holding the tip of the unit",
   "                            below it, or origin's default branch once that unit landed, bottom-up; first asks gh for",
   "                            each unlanded unit's PR and records one merged outside fbs land as landed (by: outside);",
   "                            then fast-forward each",
   "                            to origin's copy, merge what it lacks (where it is checked out, which must be clean, else in",
   "                            a temporary worktree); a unit whose parent landed is rebased onto origin's default branch,",
-  "                            pushed with a lease and retargeted, and the units above it rebased onto it and pushed; a",
-  "                            unit based on the default branch is only fast-forwarded, since camp merges a moved base; prints",
-  "                            {units:[{slug,unit,fastForwarded,merged,treeChanged,retargeted,pushNeeded,done,kind?,reason?}],",
-  "                            outside?:[{slug,pr,kind,reason,stacked?}]}, kind landed, closed, merged-elsewhere or",
-  "                            gh-failed, stacked the plain features restacked on a landed one as land does;",
+  "                            pushed with a lease and retargeted, and the units above it rebased onto it and pushed (a",
+  "                            rebase that conflicts falls back to one commit, squashed:true, as land's restack does); so",
+  "                            is unit 1 when its parent is a branch no fbs record owns and gh pr list --head finds that",
+  "                            branch's PR merged into the default branch, holding the commit unit 1 was cut at, and the",
+  "                            branch is gone from origin (still there: an outside note, kind parent-kept); a",
+  "                            unit based on the default branch is only fast-forwarded, since camp merges a moved base; an",
+  "                            independent unit is skipped in the chain (the unit above it holds the unit below it), is",
+  "                            only fast-forwarded in a pass of its own, never skipped when the stack stops, and one the",
+  "                            design no longer lets stand apart is left alone with kind not-independent; prints",
+  "                            {units:[{slug,unit,fastForwarded,merged,treeChanged,retargeted,squashed?,squashedFrom?,pushNeeded,done,kind?,reason?}],",
+  "                            outside?:[{slug,pr,parent?,kind,reason,stacked?}]}, kind landed, closed, merged-elsewhere,",
+  "                            gh-failed or parent-kept, stacked the plain features restacked on a landed one as land does,",
+  "                            parent the branch no fbs record owns that slug was cut from (pr: its merged PR, or null);",
   "                            stops at the first unit it can't sync with exit 1; treeChanged is against the unit's stamp,",
   "                            else origin's tip before the sync; a plain feature records its own PR merged outside fbs",
   "                            land (restacking what was cut from it), and one cut from another feature's branch is",
-  "                            restacked as land would once that one landed (asking gh first), printing {units:[],",
+  "                            restacked as land would once that one landed (asking gh first), and one cut from a branch",
+  "                            no fbs record owns once gh finds that branch's PR merged and it is gone, as for unit 1, printing {units:[],",
   "                            outside?, restack} with restack null when nothing is due, exit 1 when it isn't done",
   "                            kind, on a unit or restack not done: conflict, dirty, diverged, gone (its branch or origin's",
   "                            default branch is missing), missing-below (the branch it stacks on is), not-merged-yet (the",
   "                            squash commit isn't on origin's default branch), push-rejected, retarget-failed, error (an",
-  "                            unexpected git failure in land's restack)",
+  "                            unexpected git failure in land's restack), not-independent (see above)",
   "  guard [--prompt|--reply]  hook entry: deny merges and default-branch pushes while a PR flow runs (a camp, or any",
   "                            feature with an open PR); --prompt writes the land token when the user types /fbs:land;",
-  "                            --reply writes it when the user answers a pending land request with a bare land",
+  "                            --reply writes it when the user's message may ask to land (for the PR it names, else the",
+  "                            one open PR flow's, bound to the session) or says yes to a pending land request, and",
+  "                            writes the session's one-time rewrite token when it may ask to amend, rebase, squash or",
+  "                            force-push while an fbs PR is open, or says yes to a pending rewrite request; a lease push",
+  "                            to an open PR's branch passes with that token, or as the whole command when only commit",
+  "                            messages changed (the same base and the same tree for every commit); during a camp it",
+  "                            also denies raw PR comments, replies, reviews and resolves: pr reply, pr comment and pr resolve",
   "  ask-check                 hook entry on AskUserQuestion: deny an Assuming, Confirm or Approve question, or one that",
   "                            says \"above\", when its message wrote no text in the chat before the call",
   "  afk start <slug> --spec <file> [--session <id>] [--restart]",
@@ -216,7 +352,7 @@ const USAGE = [
   "                            nothing changes, check the same HEAD again) or stopped; stop rules: met, max-iterations,",
   "                            discards-in-row, protected-changed, guard-flag, judge-error (3 held in a row), state-changed",
   "  afk stop <slug> --reason <text>",
-  "  afk show <slug>",
+  "  afk show <slug>           print the run and a summary, or none when the slug has no afk run",
   "  afk resume <slug>         log a new pickup of a running run and rebind it to $CLAUDE_CODE_SESSION_ID; prints the run",
   "  afk final <slug>          measure a met run's HEAD after the final review: afk-guard and every check, both votes;",
   "                            records it and writes verify's evidence index; prints one JSON line",
@@ -234,10 +370,50 @@ const USAGE = [
   "                            in the run's diff since its start; prints one JSON line, exit 1 when flagged, 2 on an error",
 ].join("\n");
 
+const USAGE_LINES = USAGE.split("\n");
+
+// Read off the usage's "--name <value>" forms, so a value of -h (a quote, say) is never taken for a help request.
+const VALUED_OPTIONS = new Set(USAGE.match(/--[a-z-]+(?= <)/g));
+
+function asksForHelp(args: string[]): boolean {
+  return args.some((arg, i) => (arg === "--help" || arg === "-h") && !VALUED_OPTIONS.has(args[i - 1]));
+}
+
+/** The usage entries of one top-level command: each starts with the command's name, its continuation lines indented. */
+function commandUsage(command: string): string | null {
+  const section: string[] = [];
+  let inside = false;
+  for (const line of USAGE_LINES) {
+    const entry = /^ {2}(\S+)/.exec(line);
+    if (entry !== null) inside = entry[1] === command;
+    else if (!line.startsWith("   ")) inside = false;
+    if (inside) section.push(line);
+  }
+  return section.length > 0 ? ["usage:", ...section].join("\n") : null;
+}
+
+/** The command a usage error names: with its subcommand when the usage lists one, as in camp followup. */
+function usageName(command: string, rest: string[]): string {
+  const sub = rest[0];
+  const listed = sub !== undefined && USAGE_LINES.some((line) => line === `  ${command} ${sub}` || line.startsWith(`  ${command} ${sub} `));
+  return listed ? `${command} ${sub}` : command;
+}
+
+class UsageError extends Error {}
+
 export function run(argv: string[], io: Io, deps: PrDeps = REAL_PR_DEPS, afkDeps: AfkDeps = REAL_AFK_DEPS, polishDeps: PolishDeps = REAL_POLISH_DEPS): number {
   const [command, ...rest] = argv;
   if (command === "--version") {
     io.out(`fbs ${plugin.version}`);
+    return 0;
+  }
+  if (command === "help" && rest.length === 1 && !rest[0].startsWith("-")) {
+    const section = commandUsage(rest[0]);
+    if (section === null) {
+      io.err(`unknown command: ${rest[0]}`);
+      return 2;
+    }
+    io.out(section);
     return 0;
   }
   if (command === "help" || command === "--help" || command === "-h") {
@@ -248,25 +424,37 @@ export function run(argv: string[], io: Io, deps: PrDeps = REAL_PR_DEPS, afkDeps
     io.err(USAGE);
     return 2;
   }
+  const help = asksForHelp(rest) ? commandUsage(command) : null;
+  if (help !== null) {
+    io.out(help);
+    return 0;
+  }
   if (command === "guard") return runGuard(rest, io, deps);
   if (command === "ask-check") return runAskCheck(rest, io, deps);
   try {
     if (command === "context") return runContext(rest, io);
     if (command === "status") return runStatus(rest, io, deps);
     if (command === "tracker") return runTracker(rest, io, deps);
+    if (command === "config") return runConfig(rest, io);
+    if (command === "ci") return runCi(rest, io, deps);
     if (command === "stamp") return runStamp(rest, io);
     if (command === "branch") return runBranch(rest, io);
     if (command === "push") return runPush(rest, io);
     if (command === "commits") return runCommits(rest, io);
-    if (command === "watch-pr") return runWatchPr(rest, io, deps);
+    if (command === "watch-pr") return runWatchPr(rest, io, deps, afkDeps.sessionId());
     if (command === "pr") return runPr(rest, io, deps);
-    if (command === "camp") return runCamp(rest, io);
+    if (command === "camp") return runCamp(rest, io, deps, afkDeps.sessionId());
     if (command === "land") return runLand(rest, io, deps, afkDeps);
+    if (command === "rewrite") return runRewrite(rest, io, deps, afkDeps);
     if (command === "stack") return runStack(rest, io, deps);
     if (command === "afk") return runAfk(rest, io, deps, afkDeps);
     if (command === "afk-guard") return runAfkGuard(rest, io);
     if (command === "polish") return runPolish(rest, io, polishDeps);
   } catch (e) {
+    if (e instanceof UsageError) {
+      io.err(`${usageName(command, rest)}: ${e.message}`);
+      return 2;
+    }
     if (e instanceof ConfigError || e instanceof NotAGitRepoError || e instanceof GitError || e instanceof RecordError || e instanceof GhError) {
       io.err(e.message);
       return 2;
@@ -367,7 +555,22 @@ function dispatchStatus(args: string[], io: Io, deps: PrDeps): number {
     } else return usage();
     return 0;
   }
-  const parsed = parseFlags(rest, subcommand === "approve" ? ["--quote", "--auto"] : subcommand === "ticket" ? ["--url"] : []);
+  if (subcommand === "unit") {
+    const move = parseOptions(rest, ["--move"], []);
+    const to = move?.values["--move"];
+    if (!move || move.positionals.length !== 1 || to === undefined || !/^[1-9][0-9]*$/.test(to)) return usage();
+    io.out(JSON.stringify(moveUnit(io.cwd, move.positionals[0], Number(to)).map(({ slug, unit }) => ({ slug, unit }))));
+    return 0;
+  }
+  if (subcommand === "move") {
+    const move = parseOptions(rest, ["--to"], ["--remove-source"]);
+    const to = move?.values["--to"];
+    if (!move || move.positionals.length !== 1 || to === undefined) return usage();
+    io.out(JSON.stringify(moveFeature(io.cwd, move.positionals[0], resolve(io.cwd, to), move.flags.includes("--remove-source"))));
+    return 0;
+  }
+  const valued: Record<string, string[]> = { approve: ["--quote", "--auto"], ticket: ["--url"], rollout: ["--note"] };
+  const parsed = parseFlags(rest, valued[subcommand] ?? []);
   if (!parsed) return usage();
   const { positionals, name, flag } = parsed;
 
@@ -379,6 +582,10 @@ function dispatchStatus(args: string[], io: Io, deps: PrDeps): number {
     case "list":
       if (positionals.length !== 0) return usage();
       for (const rec of listFeatures(io.cwd, io.err)) io.out(`${rec.slug}\t${rec.size}\t${stage(rec)}`);
+      return 0;
+    case "reconcile":
+      if (positionals.length !== 0) return usage();
+      io.out(JSON.stringify({ outside: reconcileLandings(io.cwd, deps.gh, io.today) }));
       return 0;
     case "gate": {
       const [slug, kind] = positionals;
@@ -403,6 +610,12 @@ function dispatchStatus(args: string[], io: Io, deps: PrDeps): number {
       printRecord(id === "none" ? clearTicket(io.cwd, slug) : setTicket(io.cwd, slug, id, flag));
       return 0;
     }
+    case "rollout": {
+      const [slug, criterion, outcome] = positionals;
+      if (positionals.length !== 3) return usage();
+      printRecord(recordRollout(io.cwd, slug, criterion, outcome, io.today, flag));
+      return 0;
+    }
     case "approve": {
       const [slug, kind] = positionals;
       if (positionals.length !== 2 || !DOC_KINDS.includes(kind) || flag === undefined) return usage();
@@ -424,17 +637,25 @@ function shown(cwd: string, rec: FeatureRecord): object {
   const docsRoot = docsDir(cwd, rec);
   if (isUnit(rec)) {
     const planned = plannedUnit(cwd, rec);
-    return { ...rec, docs, docsRoot, approvals, stamp, covers: planned?.covers ?? null, dependsOn: planned?.dependsOn ?? null };
+    return { ...rec, docs, docsRoot, approvals, stamp, covers: planned?.covers ?? null, dependsOn: planned?.dependsOn ?? null, ...waiting([rec]) };
   }
-  const units = featureUnits(cwd, rec.slug).map((unit) => ({
+  const unitRecords = featureUnits(cwd, rec.slug);
+  const units = unitRecords.map((unit) => ({
     slug: unit.slug,
     unit: unit.unit,
     branch: unit.branch?.name ?? null,
     pr: unit.pr,
     stamp: unit.stamp ? { current: stampProblems(cwd, unit).length === 0 } : null,
     landed: unit.landed !== undefined,
+    ...(unit.independent && { independent: true }),
   }));
-  return { ...rec, docs, docsRoot, approvals, stamp, ...(units.length > 0 && { units }) };
+  return { ...rec, docs, docsRoot, approvals, stamp, ...(units.length > 0 && { units }), ...waiting([rec, ...unitRecords]) };
+}
+
+/** The rollout criteria of `records` still waiting for the user's check after the deploy, as `pendingRollout` when any. */
+function waiting(records: FeatureRecord[]): { pendingRollout?: { slug: string; ac: number; text: string }[] } {
+  const pendingRollout = records.flatMap(({ slug, rollout }) => (rollout ?? []).filter((item) => item.outcome === undefined).map(({ ac, text }) => ({ slug, ac, text })));
+  return pendingRollout.length > 0 ? { pendingRollout } : {};
 }
 
 function runTracker(args: string[], io: Io, deps: PrDeps): number {
@@ -448,6 +669,46 @@ function runTracker(args: string[], io: Io, deps: PrDeps): number {
   }
   const { tracker } = projectConfig(io.cwd);
   io.out(tracker === undefined ? "unset" : JSON.stringify(tracker));
+  return 0;
+}
+
+function runCi(args: string[], io: Io, deps: PrDeps): number {
+  const parsed = parseOptions(args.slice(1), [], ["--wait"]);
+  if (args[0] !== "evidence" || !parsed || parsed.positionals.length !== 1) {
+    io.err(`unknown command: ci ${args.join(" ")}`.trimEnd());
+    return 2;
+  }
+  return refusingOnStdout(io, () => {
+    try {
+      const evidence = ciEvidence(io.cwd, parsed.positionals[0], deps.gh, deps, { wait: parsed.flags.includes("--wait") });
+      io.out(JSON.stringify(evidence));
+      return evidence.verdict === "evidence" ? 0 : 1;
+    } catch (e) {
+      if (!(e instanceof CiRefusedError)) throw e;
+      io.out(`refused: ${e.reason}`);
+      return 1;
+    }
+  });
+}
+
+function runConfig(args: string[], io: Io): number {
+  const [subcommand, ...rest] = args;
+  if (subcommand === "show" && rest.length === 0) {
+    const { config, sources } = resolveConfig(io.cwd);
+    io.out(JSON.stringify({ ...config, sources }));
+    const warning = docsStoreWarning(io.cwd);
+    if (warning !== null) io.err(warning);
+    return 0;
+  }
+  const parsed = parseOptions(rest, [], ["--owner", "--user"]);
+  if (subcommand !== "set" || !parsed || parsed.positionals.length !== 2 || parsed.flags.length > 1) {
+    io.err(`unknown command: config ${args.join(" ")}`.trimEnd());
+    return 2;
+  }
+  const level = parsed.flags[0] === "--owner" ? "owner" : parsed.flags[0] === "--user" ? "user" : "repo";
+  const written = setConfig(io.cwd, parsed.positionals[0], parsed.positionals[1], level);
+  const excluded = excludeLocalDocs(io.cwd);
+  io.out(JSON.stringify({ ...written, ...(excluded !== null && { excluded }) }));
   return 0;
 }
 
@@ -474,7 +735,7 @@ function runStamp(args: string[], io: Io): number {
     }
     if (subcommand === "carry") {
       const carried = carryStamp(io.cwd, slug);
-      io.out(carried === null ? "ok" : `carried: ${carried.from.slice(0, 12)} -> ${carried.to.slice(0, 12)}; only documents changed: ${carried.paths.join(", ")}`);
+      io.out(carried === null ? "ok" : `carried: ${carried.from.slice(0, 12)} -> ${carried.to.slice(0, 12)}; nothing verify reads changed: ${carried.paths.join(", ")}`);
       return 0;
     }
   } catch (e) {
@@ -492,6 +753,10 @@ function runStamp(args: string[], io: Io): number {
 }
 
 function runBranch(args: string[], io: Io): number {
+  if (args.length === 1 && args[0] === "--types") {
+    io.out(JSON.stringify(branchTypes(io.cwd)));
+    return 0;
+  }
   const parsed = parseOptions(args, ["--type", "--ticket", "--parent", "--use"], ["--existing"]);
   if (!parsed || parsed.positionals.length !== 1) {
     io.err(`unknown command: branch ${args.join(" ")}`.trimEnd());
@@ -551,8 +816,10 @@ function runCommits(args: string[], io: Io): number {
   return refusingOnStdout(io, () => {
     try {
       const problems = commitProblems(io.cwd, arg);
-      for (const line of problems.length > 0 ? problems : ["ok"]) io.out(line);
-      return problems.length > 0 ? 1 : 0;
+      for (const { line } of problems) io.out(line);
+      if (problems.some((problem) => problem.fails)) return 1;
+      io.out("ok");
+      return 0;
     } catch (e) {
       if (!(e instanceof CommitsRefusedError)) throw e;
       io.out(`refused: ${e.reason}`);
@@ -561,7 +828,7 @@ function runCommits(args: string[], io: Io): number {
   });
 }
 
-function runWatchPr(args: string[], io: Io, deps: PrDeps): number {
+function runWatchPr(args: string[], io: Io, deps: PrDeps, session: string | null): number {
   const parsed = parseOptions(args, ["--interval", "--timeout"], ["--once"]);
   const interval = parsed?.values["--interval"] ?? String(DEFAULT_INTERVAL_SECONDS);
   const timeout = parsed?.values["--timeout"];
@@ -571,8 +838,15 @@ function runWatchPr(args: string[], io: Io, deps: PrDeps): number {
   }
   const [slug] = parsed.positionals;
   const timeoutSeconds = parsed.flags.includes("--once") ? 0 : timeout === undefined ? null : Number(timeout);
-  const options = { intervalSeconds: Number(interval), timeoutSeconds };
   return refusingOnStdout(io, () => {
+    const atStart = campOwner(io.cwd, slug);
+    const takenOver = () => {
+      const now = campOwner(io.cwd, slug);
+      if (now === null) return atStart === null ? null : { session: null };
+      return now.session !== null && now.session !== session ? { session: now.session } : null;
+    };
+    // A watcher with no session can't tell another session's camp from its own, so it watches on as it always has.
+    const options = { intervalSeconds: Number(interval), timeoutSeconds, ...(session !== null && { takenOver }) };
     const rec = readFeature(io.cwd, slug);
     const units = isUnit(rec) ? [] : featureUnits(io.cwd, slug);
     if (units.length > 0) return watchStack(slug, units, options, io, deps);
@@ -600,16 +874,17 @@ function watchStack(feature: string, units: UnitRecord[], options: WatchOptions,
   return EXIT_CODES[result.report.verdict];
 }
 
+const PR_OPTIONS: Record<string, string[]> = { reply: ["--comment", "--body-file"], comment: ["--body-file"], resolve: ["--thread"] };
+
 function runPr(args: string[], io: Io, deps: PrDeps): number {
   const [subcommand, ...rest] = args;
-  const parsed = parseOptions(rest, subcommand === "reply" ? ["--comment", "--body-file"] : subcommand === "resolve" ? ["--thread"] : [], []);
-  const comment = parsed?.values["--comment"];
-  const bodyFile = parsed?.values["--body-file"];
-  const thread = parsed?.values["--thread"];
-  if (!parsed || parsed.positionals.length !== 1 || (subcommand === "reply" ? comment === undefined || bodyFile === undefined : subcommand !== "resolve" || thread === undefined)) {
+  const options = Object.hasOwn(PR_OPTIONS, subcommand) ? PR_OPTIONS[subcommand] : null;
+  const parsed = options === null ? null : parseOptions(rest, options, []);
+  if (options === null || !parsed || parsed.positionals.length !== 1 || options.some((option) => parsed.values[option] === undefined)) {
     io.err(`unknown command: pr ${args.join(" ")}`.trimEnd());
     return 2;
   }
+  const { "--comment": comment, "--body-file": bodyFile, "--thread": thread } = parsed.values;
   const key = comment === undefined ? null : parseCommentKey(comment);
   if (comment !== undefined && key === null) {
     io.err(`pr reply: --comment takes ${COMMENT_KEY_FORMS}, not ${comment}`);
@@ -630,7 +905,7 @@ function runPr(args: string[], io: Io, deps: PrDeps): number {
     const path = resolve(io.cwd, bodyFile as string);
     const body = readFileSync(path, "utf8");
     if (body.trim() === "") throw new StatusError("bad-body", `${path} is empty`);
-    const posted = replyToComment(deps.gh, io.cwd, repo, pr, key as CommentKey, body);
+    const posted = key === null ? commentOnPr(deps.gh, io.cwd, repo, pr, body) : replyToComment(deps.gh, io.cwd, repo, pr, key, body);
     saveCursor(io.cwd, slug, markSeen(readCursor(io.cwd, slug, pr), posted));
     io.out(JSON.stringify(posted, null, 2));
     return 0;
@@ -639,7 +914,12 @@ function runPr(args: string[], io: Io, deps: PrDeps): number {
 
 const COUNT_FLAGS = COUNTS.map((name) => `--${name}`);
 
-function runCamp(args: string[], io: Io): number {
+/** A check: key with its name trimmed, so check:  CI and check:CI are one key. */
+function followupKey(thread: string): string {
+  return thread.startsWith("check:") ? `check:${thread.slice("check:".length).trim()}` : thread;
+}
+
+function runCamp(args: string[], io: Io, deps: PrDeps, session: string | null): number {
   const [subcommand, ...rest] = args;
   const valued = { start: ["--auto-fix-rounds"], round: [...COUNT_FLAGS, "--note", "--unit"], checkpoint: ["--unit"], show: ["--unit"], stop: [], followup: ["--thread", "--summary", "--why", "--unit", "--filed", "--link", "--declined"] }[subcommand] ?? null;
   const parsed = valued === null ? null : parseOptions(rest, valued, []);
@@ -664,8 +944,9 @@ function runCamp(args: string[], io: Io): number {
       io.err("camp followup takes --thread <key> --summary <text> [--why <text>] [--unit <unit slug>], --filed <n> --link <url>, or --declined <n>");
       return 2;
     }
-    if (thread !== undefined && parseCommentKey(thread) === null) {
-      io.err(`camp followup: --thread takes ${COMMENT_KEY_FORMS}, not ${thread}`);
+    // A failing CI check can be a follow-up's source too; it has no thread, and nothing replies to or resolves a follow-up's key.
+    if (thread !== undefined && parseCommentKey(thread) === null && !/^check:\s*\S/.test(thread)) {
+      io.err(`camp followup: --thread takes ${COMMENT_KEY_FORMS}, or check:<check name> for a failing CI check, not ${thread}`);
       return 2;
     }
     if (closing !== undefined && !/^[1-9][0-9]*$/.test(closing)) {
@@ -683,22 +964,23 @@ function runCamp(args: string[], io: Io): number {
   }
   return refusingOnStdout(io, () => {
     try {
-      if (subcommand === "start") io.out(JSON.stringify(startCamp(io.cwd, slug, budget === undefined ? undefined : Number(budget), io.err), null, 2));
+      if (subcommand === "start") io.out(JSON.stringify(startCamp(io.cwd, slug, budget === undefined ? undefined : Number(budget), session, deps.gh, io.today, io.err), null, 2));
       else if (subcommand === "show") io.out(JSON.stringify(showCamp(io.cwd, slug, unit, io.err), null, 2));
-      else if (subcommand === "checkpoint") io.out(recordCheckpoint(io.cwd, slug, unit, io.err));
+      else if (subcommand === "checkpoint") io.out(recordCheckpoint(io.cwd, slug, unit, session, io.err));
       else if (subcommand === "stop") {
-        stopCamp(io.cwd, slug);
+        const outside = stopCamp(io.cwd, slug, session, deps.gh, io.today);
         io.out("stopped");
+        for (const found of outside) io.out(`${found.kind}: ${found.reason}`);
       } else if (subcommand === "followup") {
         const followup =
           closing !== undefined
             ? closeFollowup(io.cwd, slug, Number(closing), link ?? null)
-            : addFollowup(io.cwd, slug, unit, { thread: thread as string, summary: summary as string, why }, io.today, io.err);
+            : addFollowup(io.cwd, slug, unit, { thread: followupKey(thread as string), summary: summary as string, why }, io.today, io.err);
         io.out(JSON.stringify(followup));
       }
       else {
         const counts = Object.fromEntries(COUNTS.map((name) => [name, Number(parsed.values[`--${name}`])])) as Counts;
-        io.out(recordRound(io.cwd, slug, unit, counts, note, io.today, io.err));
+        io.out(recordRound(io.cwd, slug, unit, counts, note, io.today, session, io.err));
       }
       return 0;
     } catch (e) {
@@ -749,12 +1031,35 @@ function runAskCheck(args: string[], io: Io, deps: PrDeps): number {
   return 2;
 }
 
+function runRewrite(args: string[], io: Io, deps: PrDeps, afkDeps: AfkDeps): number {
+  if (args.length !== 2 || args[0] !== "request") {
+    io.err(`unknown command: rewrite ${args.join(" ")}`.trimEnd());
+    return 2;
+  }
+  return refusingOnStdout(io, () => {
+    try {
+      const { slug, pr, branch } = requestRewrite(io.cwd, args[1], deps.now(), afkDeps.sessionId());
+      io.out(JSON.stringify({ requested: true, slug, pr, branch }));
+      return 0;
+    } catch (e) {
+      if (!(e instanceof LandRefusedError)) throw e;
+      for (const reason of e.reasons) io.out(`refused: ${reason}`);
+      return 1;
+    }
+  });
+}
+
 function runLand(args: string[], io: Io, deps: PrDeps, afkDeps: AfkDeps): number {
   const overFailing = args.length === 3 && args[2] === "--over-failing";
   if ((args.length === 2 || overFailing) && args[0] === "request") {
     return refusingOnStdout(io, () => {
       try {
-        const { slug, pr, over } = requestLand(io.cwd, args[1], deps.now(), afkDeps.sessionId(), overFailing ? deps.gh : undefined);
+        const requested = requestLand(io.cwd, args[1], deps.now(), afkDeps.sessionId(), deps.gh, overFailing);
+        if ("stack" in requested) {
+          io.out(JSON.stringify({ requested: false, ...requested }));
+          return 0;
+        }
+        const { slug, pr, over } = requested;
         const note = overFailing && over === undefined ? { note: "no check is failing, so this is a plain land request" } : {};
         io.out(JSON.stringify({ requested: true, slug, pr, ...(over !== undefined && { over }), ...note }));
         return 0;
@@ -771,7 +1076,8 @@ function runLand(args: string[], io: Io, deps: PrDeps, afkDeps: AfkDeps): number
   }
   return refusingOnStdout(io, () => {
     try {
-      io.out(JSON.stringify({ merged: true, ...land(io.cwd, args[0], deps.gh, deps.now(), io.today) }));
+      const landed = land(io.cwd, args[0], deps.gh, deps.now(), io.today, afkDeps.sessionId(), deps.sleep);
+      io.out(JSON.stringify({ merged: !("stack" in landed), ...landed }));
       return 0;
     } catch (e) {
       if (!(e instanceof LandRefusedError)) throw e;
@@ -830,9 +1136,11 @@ function runAfk(args: string[], io: Io, deps: PrDeps, afkDeps: AfkDeps): number 
       case "stop":
         io.out(JSON.stringify(stopRun(io.cwd, slug, parsed.values["--reason"], deps.now())));
         return 0;
-      case "show":
-        io.out(JSON.stringify(showRun(io.cwd, slug)));
+      case "show": {
+        const shown = showRun(io.cwd, slug);
+        io.out(shown === null ? "none" : JSON.stringify(shown));
         return 0;
+      }
       case "resume":
         io.out(JSON.stringify(resumeRun(io.cwd, slug, deps.now(), afkDeps.sessionId())));
         return 0;
@@ -899,7 +1207,10 @@ function refusingOnStdout(io: Io, body: () => number): number {
   }
 }
 
-/** Split args into positionals, `--name <value>` options from `valued` (each at most once) and bare `flags`; null when malformed. */
+/**
+ * Split args into positionals, `--name <value>` options from `valued` (each at most once) and bare `flags`; null when
+ * malformed. Throws a UsageError for a known option with no value: none, a blank one, or another known option.
+ */
 function parseOptions(args: string[], valued: string[], flags: string[]): { positionals: string[]; values: Record<string, string>; flags: string[] } | null {
   const positionals: string[] = [];
   const values: Record<string, string> = {};
@@ -909,16 +1220,15 @@ function parseOptions(args: string[], valued: string[], flags: string[]): { posi
     if (!arg.startsWith("--")) positionals.push(arg);
     else if (flags.includes(arg) && !seen.includes(arg)) seen.push(arg);
     else {
-      const value = args[i + 1];
-      if (!valued.includes(arg) || arg in values || value === undefined || value.trim() === "") return null;
-      values[arg] = value;
+      if (!valued.includes(arg) || arg in values) return null;
+      values[arg] = optionValue(arg, args[i + 1], [...valued, ...flags]);
       i++;
     }
   }
   return { positionals, values, flags: seen };
 }
 
-/** Split args into positionals and at most one `--flag <value>` from `allowed`; null when the flags are malformed. */
+/** Split args into positionals and at most one `--flag <value>` from `allowed`; null when malformed, a UsageError without its value. */
 function parseFlags(args: string[], allowed: string[]): { positionals: string[]; name: string | undefined; flag: string | undefined } | null {
   const positionals: string[] = [];
   let name: string | undefined;
@@ -928,13 +1238,17 @@ function parseFlags(args: string[], allowed: string[]): { positionals: string[];
       positionals.push(args[i]);
       continue;
     }
-    const value = args[i + 1];
-    if (!allowed.includes(args[i]) || flag !== undefined || value === undefined || value.trim() === "") return null;
+    if (!allowed.includes(args[i]) || flag !== undefined) return null;
     name = args[i];
-    flag = value;
+    flag = optionValue(args[i], args[i + 1], allowed);
     i++;
   }
   return { positionals, name, flag };
+}
+
+function optionValue(option: string, value: string | undefined, known: string[]): string {
+  if (value === undefined || value.trim() === "" || known.includes(value)) throw new UsageError(`${option} needs a value`);
+  return value;
 }
 
 function stage(rec: FeatureRecord): string {
@@ -949,7 +1263,7 @@ function blockerLines(result: GateResult): string[] {
   return [
     ...result.missingSections.map((name) => `missing section: ${name}`),
     ...result.emptySections.map((name) => `empty section: ${name} (write None if there are none)`),
-    ...result.unsourced.map((text) => `unsourced: ${text}`),
+    ...result.unsourced.map((text) => `unsourced: ${text} (end the line with its source: ${SOURCE_FORMS})`),
     ...result.unconfirmed.map((text) => `unconfirmed: ${text}`),
     ...result.openQuestions.map((text) => `open question: ${text}`),
     ...result.workUnits.map((text) => `work units: ${text}`),
@@ -957,15 +1271,15 @@ function blockerLines(result: GateResult): string[] {
   ];
 }
 
-const TOOL_FLAGS = { git: "--fbs-git=", gh: "--fbs-gh=", claude: "--fbs-claude=" };
+const TOOL_FLAGS = { git: "--fbs-git=", gh: "--fbs-gh=", claude: "--fbs-claude=", session: "--fbs-session=" };
 type ToolPaths = Record<keyof typeof TOOL_FLAGS, string | null>;
 
-/** Split off the leading `--fbs-git=`, `--fbs-gh=` and `--fbs-claude=<path>` that `bin/fbs` adds, in any order. */
+/** Split off the leading `--fbs-git=`, `--fbs-gh=`, `--fbs-claude=<path>` and `--fbs-session=<id>` that `bin/fbs` adds, in any order. */
 export function takeToolFlags(argv: string[]): ToolPaths & { argv: string[] } {
-  const tools: ToolPaths = { git: null, gh: null, claude: null };
+  const tools: ToolPaths = { git: null, gh: null, claude: null, session: null };
   let i = 0;
   for (; i < argv.length; i++) {
-    const tool = (["git", "gh", "claude"] as const).find((name) => tools[name] === null && argv[i].startsWith(TOOL_FLAGS[name]) && argv[i].length > TOOL_FLAGS[name].length);
+    const tool = (["git", "gh", "claude", "session"] as const).find((name) => tools[name] === null && argv[i].startsWith(TOOL_FLAGS[name]) && argv[i].length > TOOL_FLAGS[name].length);
     if (tool === undefined) break;
     tools[tool] = argv[i].slice(TOOL_FLAGS[tool].length);
   }
@@ -973,7 +1287,8 @@ export function takeToolFlags(argv: string[]): ToolPaths & { argv: string[] } {
 }
 
 if (import.meta.main) {
-  const { git, gh, claude, argv } = takeToolFlags(process.argv.slice(2));
+  const { git, gh, claude, session, argv } = takeToolFlags(process.argv.slice(2));
+  if (session && !process.env.CLAUDE_CODE_SESSION_ID) process.env.CLAUDE_CODE_SESSION_ID = session;
   if (git) setGitBinary(git);
   if (gh) setGhBinary(gh);
   if (claude) setClaudeBinary(claude);

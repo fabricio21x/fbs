@@ -123,6 +123,58 @@ describe("parseSnapshot", () => {
     expect(parseSnapshot(answer).comments.filter((c) => c.kind === "issue").map((c) => c.bot)).toEqual([true, true, false]);
   });
 
+  test("only the newest run of each workflow's check counts, as in gh pr checks", () => {
+    const run = (databaseId: number, workflow: string, status: string, conclusion: string | null, startedAt: string | null) => ({
+      __typename: "CheckRun",
+      databaseId,
+      name: "e2e",
+      status,
+      conclusion,
+      startedAt,
+      detailsUrl: null,
+      checkSuite: { app: { slug: "github-actions" }, workflowRun: { databaseId: databaseId * 10, workflow: { name: workflow } } },
+    });
+    const nodes = [
+      run(1, "CI", "COMPLETED", "CANCELLED", "2026-11-04T14:07:36Z"),
+      run(2, "CI", "COMPLETED", "SUCCESS", "2026-11-04T14:09:11Z"),
+      run(3, "Deploy", "COMPLETED", "SUCCESS", "2026-11-04T14:07:36Z"),
+      run(4, "Deploy", "QUEUED", null, null),
+      run(5, "Nightly", "COMPLETED", "FAILURE", "2026-11-04T14:00:00Z"),
+    ];
+    const answer = graphqlPr({ commits: { nodes: [{ commit: { oid: HEAD, statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, nodes } } } }] } });
+    expect(parseSnapshot(answer).checks.map((c) => [c.id, c.status, c.conclusion])).toEqual([
+      ["run:2", "COMPLETED", "SUCCESS"],
+      ["run:4", "QUEUED", ""],
+      ["run:5", "COMPLETED", "FAILURE"],
+    ]);
+  });
+
+  const rollup = (nodes: unknown[]) => graphqlPr({ commits: { nodes: [{ commit: { oid: HEAD, statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, nodes } } } }] } });
+  const ciRun = (databaseId: number, status: string, conclusion: string | null, startedAt: string | null) => ({
+    __typename: "CheckRun",
+    databaseId,
+    name: "e2e",
+    status,
+    conclusion,
+    startedAt,
+    detailsUrl: null,
+    checkSuite: { app: { slug: "github-actions" }, workflowRun: { databaseId: databaseId * 10, workflow: { name: "CI" } } },
+  });
+
+  test("runs started in the same second count by the newer run, the larger id", () => {
+    const same = "2026-11-04T14:07:36Z";
+    expect(parseSnapshot(rollup([ciRun(2, "COMPLETED", "SUCCESS", same), ciRun(1, "COMPLETED", "CANCELLED", same)])).checks.map((c) => c.id)).toEqual(["run:2"]);
+  });
+
+  test("a run that completed without starting, cancelled while queued, is the oldest, not the newest", () => {
+    expect(parseSnapshot(rollup([ciRun(1, "COMPLETED", "CANCELLED", null), ciRun(2, "COMPLETED", "SUCCESS", "2026-11-04T14:07:36Z")])).checks.map((c) => c.id)).toEqual(["run:2"]);
+  });
+
+  test("a status reported twice counts by its newest report", () => {
+    const status = (state: string, createdAt: string) => ({ __typename: "StatusContext", context: "deploy", state, createdAt, targetUrl: null });
+    expect(parseSnapshot(rollup([status("SUCCESS", "2026-11-04T14:09:00Z"), status("FAILURE", "2026-11-04T14:07:00Z")])).checks.map((c) => c.conclusion)).toEqual(["SUCCESS"]);
+  });
+
   test("a head with no checks has an empty rollup", () => {
     expect(parseSnapshot(graphqlPr({ commits: { nodes: [{ commit: { oid: HEAD, statusCheckRollup: null } }] } })).checks).toEqual([]);
   });

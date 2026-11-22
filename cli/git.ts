@@ -1,6 +1,6 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export class NotAGitRepoError extends Error {}
 
@@ -61,6 +61,19 @@ export function gitCommonDir(cwd: string): string {
   return revParse(cwd, ["--path-format=absolute", "--git-common-dir"]);
 }
 
+/** The worktree where a rebase (either backend) of `branch` is in progress, or null; read from every worktree's git dir. */
+export function worktreeRebasing(cwd: string, branch: string): string | null {
+  const common = gitCommonDir(cwd);
+  const linked = join(common, "worktrees");
+  const gitDirs = [common, ...(existsSync(linked) ? readdirSync(linked).map((name) => join(linked, name)) : [])];
+  const readText = (path: string) => (existsSync(path) ? readFileSync(path, "utf8").trim() : null);
+  for (const dir of gitDirs) {
+    if (!["rebase-merge", "rebase-apply"].some((state) => readText(join(dir, state, "head-name")) === `refs/heads/${branch}`)) continue;
+    return dir === common ? dirname(common) : dirname(readText(join(dir, "gitdir")) ?? join(dir, ".git"));
+  }
+  return null;
+}
+
 /** True when git ignores `path`, relative to the repo root; a tracked path never is. A trailing `/` asks about a directory, which needn't exist. */
 export function isIgnored(cwd: string, path: string): boolean {
   const root = repoRoot(cwd);
@@ -115,12 +128,23 @@ function userExcludesFile(cwd: string): string | null {
 
 /**
  * Untracked paths that neither a `.gitignore` nor the user's excludes file covers; `.git/info/exclude` hides nothing
- * here, except Claude Code's agent worktrees under `.claude/worktrees/`, which implement excludes there.
+ * here, except Claude Code's agent worktrees under `.claude/worktrees/`, which implement excludes there, and the
+ * `alsoExclude` patterns.
  */
-export function untrackedNotIgnored(cwd: string): string[] {
+export function untrackedNotIgnored(cwd: string, alsoExclude: string[] = []): string[] {
   const excludes = userExcludesFile(cwd);
   // --no-empty-directory, or a `.claude/` holding only excluded worktrees is listed as an untracked directory.
-  const args = ["ls-files", "-z", "--others", "--directory", "--no-empty-directory", "--exclude-per-directory=.gitignore", "--exclude=/.claude/worktrees/", ...(excludes === null ? [] : [`--exclude-from=${excludes}`])];
+  const args = [
+    "ls-files",
+    "-z",
+    "--others",
+    "--directory",
+    "--no-empty-directory",
+    "--exclude-per-directory=.gitignore",
+    "--exclude=/.claude/worktrees/",
+    ...alsoExclude.map((pattern) => `--exclude=${pattern}`),
+    ...(excludes === null ? [] : [`--exclude-from=${excludes}`]),
+  ];
   const result = runGit(cwd, args);
   if (!result.ok) throw new GitError(`cannot list the untracked files of ${cwd}: ${firstLine(result.stderr)}`);
   return result.stdout.split("\0").filter((path) => path !== "");
@@ -219,7 +243,13 @@ export function fetchBranch(cwd: string, branch: string): void {
 }
 
 export function hasRemote(cwd: string, name: string): boolean {
-  return runGit(cwd, ["config", "--get", `remote.${name}.url`]).ok;
+  return remoteUrl(cwd, name) !== null;
+}
+
+/** The URL of remote `name`; null when there is no such remote. */
+export function remoteUrl(cwd: string, name: string): string | null {
+  const result = runGit(cwd, ["config", "--get", `remote.${name}.url`]);
+  return result.ok ? result.stdout.trim() : null;
 }
 
 /** The commit `ref` points at; null when there is none. */
@@ -294,6 +324,37 @@ export function rebaseOnto(cwd: string, onto: string, upstream: string, branch: 
   throw new GitError(`cannot rebase ${branch} onto ${onto}: ${firstLine(result.stderr || result.stdout)}`);
 }
 
+/** The tree of merging `theirs` into `ours` with `base` as the merge base, without a work tree; null on a conflict. */
+export function mergedTree(cwd: string, base: string, ours: string, theirs: string): string | null {
+  const result = runGit(cwd, ["merge-tree", "--write-tree", "--merge-base", base, ours, theirs]);
+  // 129: a git before 2.40 has no --merge-base, which only costs the caller its fallback.
+  if (result.exitCode === 1 || result.exitCode === 129) return null;
+  if (!result.ok) throw new GitError(`cannot merge ${theirs} into ${ours}: ${firstLine(result.stderr)}`);
+  return result.stdout.split("\n")[0];
+}
+
+/** Who wrote `commit`, and when. */
+export interface Author {
+  name: string;
+  email: string;
+  date: string;
+}
+
+export function authorOf(cwd: string, commit: string): Author {
+  const result = runGit(cwd, ["log", "-1", "--no-show-signature", "--format=%an%x00%ae%x00%aI", "--end-of-options", commit]);
+  if (!result.ok) throw new GitError(`cannot read the author of ${commit}: ${firstLine(result.stderr)}`);
+  const [name, email, date] = result.stdout.trim().split("\0");
+  return { name, email, date };
+}
+
+/** A new commit of `tree` whose only parent is `parent`, written by `author`. */
+export function commitOnto(cwd: string, tree: string, parent: string, message: string, author: Author): string {
+  const env = { GIT_AUTHOR_NAME: author.name, GIT_AUTHOR_EMAIL: author.email, GIT_AUTHOR_DATE: author.date };
+  const result = runGit(cwd, ["commit-tree", tree, "-p", parent, "-m", message], env);
+  if (!result.ok) throw new GitError(`cannot commit ${tree} onto ${parent}: ${firstLine(result.stderr)}`);
+  return result.stdout.trim();
+}
+
 /** Point the unborn `branch` at a new empty root commit; the index and work tree are left alone. */
 export function makeEmptyRootCommit(cwd: string, branch: string, message: string): string {
   const tree = runGit(cwd, ["hash-object", "-t", "tree", "-w", "/dev/null"]);
@@ -306,11 +367,18 @@ export function makeEmptyRootCommit(cwd: string, branch: string, message: string
   return sha;
 }
 
-/** Local and remote-tracking branch names, without `refs/heads/` or `refs/remotes/<remote>/`, each once. */
+/** Local and remote-tracking branch names, without `refs/heads/` or `refs/remotes/<remote>/`, each once, newest commit first. */
 export function branchNames(cwd: string): string[] {
-  const refs = gitOutput(cwd, ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"]).split("\n");
+  const refs = gitOutput(cwd, ["for-each-ref", "--sort=-committerdate", "--format=%(refname)", "refs/heads", "refs/remotes"]).split("\n");
   const names = refs.flatMap((ref) => /^refs\/(?:heads|remotes\/[^/]+)\/(.+)$/.exec(ref)?.[1] ?? []);
   return [...new Set(names.filter((name) => name !== "HEAD"))];
+}
+
+/** The tree of each commit in `from..to`, children first; null when either isn't a commit here. */
+export function commitTrees(cwd: string, from: string, to: string): string[] | null {
+  // Topological order follows the graph alone, so commits rewritten with new dates list in the same order.
+  const result = runGit(cwd, ["log", "--topo-order", "--no-show-signature", "--format=%T", "--end-of-options", `${from}..${to}`]);
+  return result.ok ? result.stdout.split("\n").filter((line) => line !== "") : null;
 }
 
 /** The tree of `commit`; null when the commit isn't here. */
@@ -355,16 +423,19 @@ export function symlinksIn(cwd: string, tree: string): { path: string; target: s
     });
 }
 
-/** The non-merge commits in `from..to` not reachable from any of `excluded`, oldest first, each with its subject line. */
-export function nonMergeCommits(cwd: string, from: string, to: string, excluded: string[] = []): { sha: string; subject: string }[] {
+/** The non-merge commits in `from..to` not reachable from any of `excluded`, oldest first, each with its whole message. */
+export function nonMergeCommits(cwd: string, from: string, to: string, excluded: string[] = []): { sha: string; message: string }[] {
   const revisions = [`${from}..${to}`, ...excluded.map((ref) => `^${ref}`)];
   // A signature check would print into the log, so it's off whatever the user's config says.
-  const result = runGit(cwd, ["log", "--no-merges", "--reverse", "--no-show-signature", "--format=%H %s", "--end-of-options", ...revisions]);
+  const result = runGit(cwd, ["log", "-z", "--no-merges", "--reverse", "--no-show-signature", "--format=%H%n%B", "--end-of-options", ...revisions]);
   if (!result.ok) throw new GitError(`cannot list the commits in ${revisions.join(" ")}: ${firstLine(result.stderr)}`);
   return result.stdout
-    .split("\n")
-    .filter((line) => line !== "")
-    .map((line) => ({ sha: line.slice(0, line.indexOf(" ")), subject: line.slice(line.indexOf(" ") + 1) }));
+    .split("\0")
+    .filter((entry) => entry !== "")
+    .map((entry) => {
+      const at = entry.indexOf("\n");
+      return { sha: entry.slice(0, at), message: entry.slice(at + 1).replace(/(\r?\n)+$/, "") };
+    });
 }
 
 /** True when `ancestor` is reachable from `commit`, or is it. */

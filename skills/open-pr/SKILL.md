@@ -39,6 +39,8 @@ Run `fbs push <slug>`. Organizing may have rewritten commits the stages pushed b
 
 Read `${CLAUDE_SKILL_DIR}/pr-body-template.md` (if unexpanded: `<plugin root>/skills/open-pr/pr-body-template.md`), and the project's `.github/pull_request_template.md` and any PR rules in `CLAUDE.md` when they exist (they win). Write the body from `spec.md`, `design.md`, `verdict.md` and the branch's commits into `$(git rev-parse --path-format=absolute --git-common-dir)/fbs/pr/<slug>.md`, outside the repo, replacing every guidance comment. Links point at the head commit: `https://github.com/<owner>/<repo>/blob/<head sha>/<path>`.
 
+When `fbs status show <slug>` lists `rollout` criteria (the record's, which `fbs stamp set` wrote), the description lists each one, `AC<n>` and text, under "After the deploy": shown once it's deployed, checked with the user after the merge.
+
 When `docs` is `local`, the PR carries no spec, design or verdict: leave out the document links, and make the description hold what a reviewer needs from them, every acceptance criterion with its evidence and the suite's summary line.
 
 When the record has a `ticket`, the body ends with `Fixes <id>` on its own line (the adapter's form: `Fixes ACM-124`, `Fixes #45`), and, when a Big feature ships as one PR (no unit records), one such line for each unit id in `<dir>/tracker.md` too. A unit's PR fixes only its own ticket.

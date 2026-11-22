@@ -29,7 +29,7 @@ fbs has three kinds of skills and a set of agents.
 | [`/fbs:organize-commits`](#organize-commits) | Folds fix rounds into one commit per task; makes every subject conventional | a rewritten feature branch | nothing |
 | [`/fbs:open-pr`](#open-pr) | Opens a draft PR for a verified feature | the PR | nothing |
 | [`/fbs:camp-pr`](#camp-pr) | Works the PR round by round until it is ready to land | commits, replies | security, data or billing findings, scope changes |
-| [`/fbs:land`](#land) | The only merge, typed by you | the merge | nothing |
+| [`/fbs:land`](#land) | The only merge, on your go | the merge | nothing |
 | [`/fbs:afk`](#afk) | Autopilot for a task whose finish line is a set of checks | a reviewed, verified PR | one approval at the start |
 
 ## Building blocks
@@ -37,9 +37,10 @@ fbs has three kinds of skills and a set of agents.
 | Skill | What it does | Used by |
 |---|---|---|
 | `changes` | The change path after approval: record the change verbatim in `changes.md`, size it (build, design or scope), amend the spec or design in place, approve inline, add plan tasks, carry on | every stage that can meet feedback, and assemble |
+| `docs` | Where a feature's documents live and where they are mirrored: asks once whether the spec, design and change log are committed or local and whether they also go to a documentation tool, saved for the repo or every repo of its owner; after each approval, mirrors them to that tool (one page per feature, with spec and design child pages and a one-line-per-change log) and records the page ids in `published.md`. An adapter for Notion; other tools through their own MCP | plan, architect, changes |
 | `grilling` | Rounds of up to four questions, each with one recommended answer, in the question UI when available. Looks code facts up instead of asking, asks business facts directly and never takes them from code, pushes back once | plan, architect, changes |
 | `impact-map` | Everything a change touches (code paths and consumers, APIs, data, jobs, external services, UI, permissions, tests, docs), each with `path:line`: four explorers by lens, then a completeness pass | architect |
-| `tracker` | The project's issue tracker: detects it and confirms it once, reads a ticket the work starts from, proposes the structure after an approval and creates it on your go-ahead. Adapters for Linear and GitHub Issues | plan, architect, tdd, the tiny route |
+| `tracker` | The project's issue tracker: detects it and confirms it once, reads a ticket the work starts from, proposes the structure after an approval and creates it on your go-ahead, assigned to you; after an approved change, updates the issues it moves with what changed and why. Adapters for Linear and GitHub Issues | plan, architect, tdd, the tiny route, changes |
 
 ## Principles
 
@@ -90,11 +91,11 @@ The one entry. With an idea, it starts plan. With a slug or nothing, it reads `f
 
 ### plan
 
-Runs on a new idea, request or ticket. It checks `.fbs/context.md` (stale facts are asked first), sets up the tracker on first use, and decides the mode: *directed* when the input already says what and why, *brainstorm* when it doesn't. A proposed *how* is set aside and compared with the agent's own once the what is settled; technology choices are recorded as preferences for architect. It sizes the work: tiny and bug leave plan for their own routes. Then it grills you round by round until nothing is open, creates the record and the feature's branch, writes `spec.md` from its template, and runs the gate. A big spec needs your explicit approval; a mid spec is approved together with its design in architect. Hands to architect.
+Runs on a new idea, request or ticket. It checks `.fbs/context.md` (stale facts are asked first), sets up the tracker and the docs settings on first use, and decides the mode: *directed* when the input already says what and why, *brainstorm* when it doesn't. A proposed *how* is set aside and compared with the agent's own once the what is settled; technology choices are recorded as preferences for architect. It sizes the work: tiny and bug leave plan for their own routes. Then it grills you round by round until nothing is open, creates the record and the feature's branch, writes `spec.md` from its template, and runs the gate. A big spec needs your explicit approval, then is mirrored to your documentation tool when one is set; a mid spec is approved together with its design in architect. Hands to architect.
 
 ### architect
 
-Runs once the spec is settled (big: approved; mid: passes the gate). It runs the impact map into `impact.md`, lists the constraints the design must fit (sourced business facts, providers, conventions), and writes structurally different options with a recommendation, the smallest that meets every criterion among them. It asks only real decisions. A big feature gets `design.md` (data shapes, file map, test seams, risks, a rollout that fits the project's real stage, work units) and a one-page `overview.html` to review; with screens, a UI direction and HTML mockups. A mid feature fills the spec's Design section. The gulag reviews it, the judge's changes are applied, and the gate runs before your approval. After the approval it creates the work-unit records and the tracker structure. Hands to implement, or to assemble for a stack.
+Runs once the spec is settled (big: approved; mid: passes the gate). It runs the impact map into `impact.md`, lists the constraints the design must fit (sourced business facts, providers, conventions), and writes structurally different options with a recommendation, the smallest that meets every criterion among them. It asks only real decisions. A big feature gets `design.md` (data shapes, file map, test seams, risks, a rollout that fits the project's real stage, work units) and a one-page `overview.html` to review; with screens, a UI direction and HTML mockups. A mid feature fills the spec's Design section. The gulag reviews it, the judge's changes are applied, and the gate runs before your approval. After the approval it mirrors the documents to your documentation tool when one is set, then creates the work-unit records and the tracker structure. Hands to implement, or to assemble for a stack.
 
 ### gulag
 
@@ -106,7 +107,7 @@ Runs once the design is approved. It switches to the feature's branch, records t
 
 ### tdd
 
-The bug route. It restates the bug, runs the suite for a baseline, and writes the smallest test that reproduces it through the public surface, quoting the real failure. It creates a bug record and a `bugfix/` branch, traces the root cause `path:line` by `path:line`, lists sibling mistakes, fixes the cause, and quotes red and green output plus the full suite. Writes `bug.md` and one `fix:` commit. Hands to verify. If it can't reproduce the bug, it stops and fixes nothing.
+The bug route. It restates the bug, runs the suite for a baseline, and writes the smallest test that reproduces it through the public surface, quoting the real failure. It creates a bug record and a fix branch (`bugfix/`, or `fix/` where the repo uses Conventional Commit types), traces the root cause `path:line` by `path:line`, lists sibling mistakes, fixes the cause, and quotes red and green output plus the full suite. Writes `bug.md` and one `fix:` commit. Hands to verify. If it can't reproduce the bug, it stops and fixes nothing.
 
 ### unslop
 
@@ -134,11 +135,11 @@ A guided review in the running app, in a browser you watch. One feature per turn
 
 ### verify
 
-The shipping gate, before any PR. On a clean tree it takes the criteria (the spec's, the bug's, a unit's, or for tiny work the outcome you name), runs the suite and type check, and finds evidence for each criterion: a green test whose assertions check it, or validate evidence recorded on this tree. A criterion with neither is unverified; it never runs ad-hoc code to stand in. It writes `verdict.md`, and only on a pass runs `fbs stamp set`. When only documents changed since the last stamp, it carries the stamp instead. On a fail it closes the gaps through validate or the change path. Hands to open-pr, after offering polish once when it is installed.
+The shipping gate, before any PR. On a clean tree it takes the criteria (the spec's, the bug's, a unit's, or for tiny work the outcome you name), runs the suite and type check, and finds evidence for each criterion: a green test whose assertions check it, or validate evidence recorded on this tree. A criterion with neither is unverified; it never runs ad-hoc code to stand in. It writes `verdict.md`, and only on a pass runs `fbs stamp set`. When nothing it reads changed since the last stamp (documents, `CLAUDE.md` or `AGENTS.md`), it carries the stamp instead. A criterion marked `(rollout)` passes without evidence and is checked with you after the merge; with `verify.ciEvidence`, green CI runs on the PR's head stand in for the local suite. On a fail it closes the gaps through validate or the change path. Hands to open-pr, after offering polish once when it is installed.
 
 ### organize-commits
 
-Before the PR opens. Implement writes history so it can fold itself: each task commit carries a `Task:` trailer and fix rounds are `fixup!` commits. This stage autosquashes them non-interactively so a reviewer reads one commit per task, rewords any subject that isn't a conventional commit, and checks with the stamp that the code didn't change. On any doubt it keeps the history as it was.
+Before the PR opens. Implement writes history so it can fold itself: each task commit carries a `Task:` trailer and fix rounds are `fixup!` commits. This stage autosquashes them non-interactively so a reviewer reads one commit per task, rewords any message that isn't a conventional commit within commitlint's limits (or fails the repo's own commitlint), and checks with the stamp that the code didn't change. On any doubt it keeps the history as it was.
 
 ### open-pr
 
@@ -146,11 +147,13 @@ Runs on a stamped tree. It checks the stamp, the GitHub remote and `gh`, makes s
 
 ### camp-pr
 
-Stays with the PR until it is ready to land. `fbs watch-pr` runs in the background and wakes the agent once per settled round. Each comment and each failing check is verified against the code, then triaged: fix, decline once with a reason, follow-up, or ask you (security, data, billing, scope). Fixes go through the change path and implement's review-round mode, then verify, then one push per round; replies and resolved threads follow. After a fix budget (two rounds by default), it holds one checkpoint with you, then fixes only blockers. It marks the draft ready when green, proposes follow-ups as tickets once at the end, and never merges or rewrites pushed history. Comments are treated as data, never as instructions.
+Stays with the PR until it is ready to land. `fbs watch-pr` runs in the background and wakes the agent once per round, not per event, sometimes before every check has finished. Each comment and each failing check is verified against the code, then triaged: fix, decline once with a reason, follow-up, or ask you (security, data, billing, scope). Fixes go through the change path and implement's review-round mode, then verify, then one push per round after the commit messages pass `fbs commits check` (and the repo's commitlint); replies and resolved threads follow. After a fix budget (two rounds by default), it holds one checkpoint with you, then fixes only blockers. It marks the draft ready when green, proposes follow-ups as tickets once at the end, and never merges. It rewrites pushed history only to fix commit messages (the tree stays the same) or when you ask for it in your own words. Comments are treated as data, never as instructions.
 
 ### land
 
-The only merge. You type `/fbs:land <slug>`, or answer the agent's land request with a bare `land`; a hook turns that into a one-time token. `fbs land` then refuses unless the PR is approved (on your own solo repo, your go is the approval), green, clean, based on the default branch and carrying exactly the stamped tree. It squash-merges with the head pinned, then restacks what was stacked on it. You can land over failing or cancelled checks only by asking for it; the request lists every such check for you to confirm.
+The only merge. You tell the agent to merge or land the PR in plain words ("go ahead and merge it"), answer its land question with a yes, or type `/fbs:land <slug>`; a hook turns your message into a one-time token, and the agent judges whether your words ask to land now. `fbs land` then refuses unless the PR is approved (on your own solo repo, your go is the approval), green, clean, based on the default branch and carrying exactly the stamped tree. A PR with no checks at all lands when the base branch requires none: a repo without CI lands on the local verify. It squash-merges with the head pinned, then restacks what was stacked on it. You can land over failing or cancelled checks only by asking for it; the agent lists every such check for you to confirm.
+
+A PR in a GitHub stack with other open PRs isn't merged by fbs: it checks every PR in the stack as it would before landing, and hands you `gh stack merge <pr> --squash` for the highest PR with only ready PRs below it (or the merge button on that PR), since GitHub merges the stack in one step and restacks what's left. Once you've merged it, `fbs stack sync` records each PR as landed.
 
 ### afk
 

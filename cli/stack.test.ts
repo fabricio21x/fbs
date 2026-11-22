@@ -2,8 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { setGitBinary } from "./git";
+import { REAL_AFK_DEPS } from "./afk";
 import type { GhResult, GhRunner } from "./github";
-import { campMarkerPath, writeLandToken } from "./guard";
+import { campMarkerPath, openPrRecords, writeLandToken } from "./guard";
 import { land } from "./land";
 import { run } from "./main";
 import { syncStack } from "./stack";
@@ -29,13 +31,16 @@ function tempDir(): string {
   return dir;
 }
 
-function commitFile(cwd: string, path: string, content: string, subject: string): string {
+function commitFile(cwd: string, path: string, content: string, subject: string, ...commitArgs: string[]): string {
   mkdirSync(dirname(join(cwd, path)), { recursive: true });
   writeFileSync(join(cwd, path), content);
   git(cwd, "add", path);
-  git(cwd, "commit", "-q", "-m", subject);
+  git(cwd, "commit", "-q", "-m", subject, ...commitArgs);
   return git(cwd, "rev-parse", "HEAD");
 }
+
+const AUTHOR = "Alex <alex@example.com>";
+const AUTHOR_DATE = "2026-10-20T10:00:00Z";
 
 const UNITS = [
   { slug: "f-a", unit: 1, pr: 31, branch: "feature/f-a", line: "B1" },
@@ -54,26 +59,40 @@ interface Stack {
 /**
  * Feature f with units f-a, f-b and f-c stacked in order, each rewriting the same line of shared.txt, pushed to a bare
  * origin with their PRs recorded and stamped. `verdict` commits a verdict on f-a after the units above were cut.
+ * `independent` cuts f-b from main instead, writing b.txt, and records it independent, so f-c stacks on f-a.
  */
-function stack(options: { verdict?: boolean; on?: string } = {}): Stack {
+function stack(options: { verdict?: boolean; on?: string; outside?: string; independent?: boolean } = {}): Stack {
   const origin = join(tempDir(), "origin.git");
   git(dirname(origin), "init", "-q", "--bare", "-b", "main", origin);
   const work = join(tempDir(), "work");
   git(dirname(work), "init", "-q", "-b", "main", work);
   for (const [key, value] of [["user.name", "fbs"], ["user.email", "fbs@example.com"], ["commit.gpgsign", "false"]]) git(work, "config", key, value);
   git(work, "remote", "add", "origin", origin);
+  writeFileSync(join(work, "f.txt"), "A\n");
+  git(work, "add", "f.txt");
   let base = commitFile(work, "shared.txt", "a\nb\nc\n", "chore: init");
   git(work, "push", "-q", "origin", "main");
   const common = join(work, ".git");
   const dir = "docs/features/2026-10-21-f";
   mkdirSync(join(common, "fbs", "features"), { recursive: true });
   writeFileSync(join(common, "fbs", "features", "f.json"), JSON.stringify({ slug: "f", dir, size: "big", approvals: {}, pr: null }));
+  const init = base;
   let parent = "main";
+  if (options.outside !== undefined) {
+    git(work, "switch", "-q", "-c", options.outside);
+    base = commitFile(work, "ext.txt", "ext\n", "feat: ext");
+    git(work, "push", "-q", "origin", options.outside);
+    parent = options.outside;
+  }
   for (const u of UNITS) {
-    git(work, "switch", "-q", "-c", u.branch);
-    const tip = commitFile(work, "shared.txt", `a\n${u.line}\nc\n`, `feat: ${u.slug}`);
-    const record = { slug: u.slug, dir: `${dir}/units/${u.slug}`, size: "big", approvals: {}, pr: u.pr, repo: "acme/app", unitOf: "f", unit: u.unit, branch: { name: u.branch, parent, base } };
+    const alone = options.independent === true && u.slug === "f-b";
+    git(work, "switch", "-q", "-c", u.branch, alone ? "main" : parent);
+    const authored = ["--author", AUTHOR, "--date", AUTHOR_DATE];
+    const tip = alone ? commitFile(work, "b.txt", "B2\n", `feat: ${u.slug}`, ...authored) : commitFile(work, "shared.txt", `a\n${u.line}\nc\n`, `feat: ${u.slug}`, ...authored);
+    const branch = alone ? { name: u.branch, parent: "main", base: init } : { name: u.branch, parent, base };
+    const record = { slug: u.slug, dir: `${dir}/units/${u.slug}`, size: "big", approvals: {}, pr: u.pr, repo: "acme/app", unitOf: "f", unit: u.unit, branch, ...(alone && { independent: true }) };
     writeFileSync(join(common, "fbs", "features", `${u.slug}.json`), JSON.stringify(record));
+    if (alone) continue;
     parent = u.branch;
     base = tip;
   }
@@ -96,18 +115,23 @@ function restamp(s: Stack, slug: Slug, pushed = false): void {
   writeFileSync(path, JSON.stringify({ ...record, stamp, ...(pushed && { branch: { ...record.branch, pushed: head } }) }));
 }
 
-/** A gh that answers land's calls for every unit's PR, squash-merging the head into origin's main as GitHub would. */
-function fakeGh(s: Stack) {
+/**
+ * A gh that answers land's calls for every unit's PR, squash-merging the head into origin's main as GitHub would; `listed`
+ * answers gh pr list --head for a branch.
+ */
+function fakeGh(s: Stack, listed: Record<string, object[]> = {}) {
   const calls: string[][] = [];
   const squashes: Record<number, string> = {};
   const ok = (stdout: string): GhResult => ({ code: 0, stdout, stderr: "" });
   const gh: GhRunner = (args) => {
     calls.push(args);
+    if (args[0] === "api" && args[1] === "graphql") return ok(JSON.stringify({ data: { repository: { pullRequest: { stack: null } } } }));
     const [, verb, number] = args;
     const u = UNITS.find((unit) => String(unit.pr) === number);
     const line = args.join(" ");
     if (line.startsWith("repo view acme/app")) return ok("main\n");
     if (verb === "edit") return ok("");
+    if (verb === "list") return ok(JSON.stringify(listed[args[args.indexOf("--head") + 1]] ?? []));
     if (u === undefined) return { code: 1, stdout: "", stderr: `unexpected gh ${line}` };
     const head = git(s.origin, "rev-parse", `refs/heads/${u.branch}`);
     if (verb === "view" && line.includes("state,isDraft")) {
@@ -145,6 +169,25 @@ const originTip = (s: Stack, slug: Slug) => git(s.origin, "rev-parse", `refs/hea
 const show = (s: Stack, rev: string, path: string) => git(s.origin, "show", `${rev}:${path}`);
 /** The subjects of the commits origin's `branch` has beyond origin's main, oldest first: what its PR lists. */
 const ownCommits = (s: Stack, branch: string) => git(s.origin, "log", "--reverse", "--format=%s", `main..refs/heads/${branch}`).split("\n").filter((l) => l !== "");
+
+/**
+ * `below` gets a fix on the line `above` rewrites, and `above` merges it forward with the conflict resolved to keep its
+ * own line, as implement would: replaying `above`'s commit onto the fix conflicts, while its end result doesn't.
+ */
+function fixMergedByHand(s: Stack, below: Slug = "f-a", above: Slug = "f-b"): void {
+  git(s.work, "switch", "-q", unitOf(below).branch);
+  commitFile(s.work, "shared.txt", `a\n${unitOf(below).line} fixed\nc\n`, `fix: ${below} line`);
+  git(s.work, "push", "-q", "origin", unitOf(below).branch);
+  git(s.work, "switch", "-q", unitOf(above).branch);
+  expect(() => git(s.work, "merge", "-q", "--no-edit", unitOf(below).branch)).toThrow();
+  writeFileSync(join(s.work, "shared.txt"), `a\n${unitOf(above).line}\nc\n`);
+  git(s.work, "add", "shared.txt");
+  git(s.work, "commit", "-q", "--no-edit");
+  git(s.work, "push", "-q", "origin", unitOf(above).branch);
+  git(s.work, "switch", "-q", "main");
+}
+
+const LIST = ["--state", "merged", "--json", "number,headRefOid,mergeCommit,baseRefName"];
 
 describe("land restacks the unit above", () => {
   test("a three-unit stack lands bottom-up, each restack keeping the trees and leaving each PR only its own commits", () => {
@@ -184,6 +227,46 @@ test("a restack that carries a local commit nobody stamped reports the tree chan
   git(s.work, "switch", "-q", "main");
   expect(landUnit(s, fakeGh(s).gh, "f-a")).toMatchObject({ restack: { slug: "f-b", done: true, treeChanged: true } });
   expect(show(s, originTip(s, "f-b"), "wip.txt")).toBe("wip");
+});
+
+test("an independent unit lands before the units below it and restacks nothing; the unit above it is restacked when the one below lands", () => {
+  const s = stack({ independent: true });
+  const { gh } = fakeGh(s);
+  const above = originTip(s, "f-c");
+  expect(landUnit(s, gh, "f-b")).toMatchObject({ slug: "f-b", unit: 2, restack: null });
+  expect(originTip(s, "f-c")).toBe(above);
+  expect(landUnit(s, gh, "f-a")).toMatchObject({ slug: "f-a", restack: { slug: "f-c", done: true, treeChanged: true } });
+  expect(ownCommits(s, "feature/f-c")).toEqual(["feat: f-c"]);
+  expect(show(s, originTip(s, "f-c"), "b.txt")).toBe("B2");
+  expect(readFeature(s.work, "f-c").branch).toMatchObject({ parent: "main" });
+  expect(show(s, "main", "b.txt")).toBe("B2");
+});
+
+/** Write feature f's design into the checkout with `deps` as each unit's Depends on, as an amendment would. */
+function design(s: Stack, deps: string[]): void {
+  const units = deps.map((dep, i) => `### U${i + 1}: Part ${i + 1}\n- Covers: none\n- Depends on: ${dep}\n`).join("");
+  mkdirSync(join(s.work, "docs/features/2026-10-21-f"), { recursive: true });
+  writeFileSync(join(s.work, "docs/features/2026-10-21-f/design.md"), `## Work units\n${units}`);
+}
+
+const NO_LONGER = "f-b is independent, but U2 depends on U1, which hasn't landed; put it back in the stack (fbs branch f-b --parent <the branch of the unit below>, once it has no PR), or amend the design";
+
+test("an independent unit the design now makes depend on a unit still to land is refused, and sync reports it without touching it", () => {
+  const s = stack({ independent: true });
+  design(s, ["none", "U1", "U1"]);
+  const { gh } = fakeGh(s);
+  let reasons: string[] = [];
+  try {
+    landUnit(s, gh, "f-b");
+  } catch (e) {
+    reasons = (e as { reasons: string[] }).reasons;
+  }
+  expect(reasons).toEqual([NO_LONGER]);
+  const before = originTip(s, "f-b");
+  expect(syncStack(s.work, "f", gh, "2026-10-25").units.find((unit) => unit.slug === "f-b")).toMatchObject({ done: false, kind: "not-independent", reason: NO_LONGER });
+  expect(originTip(s, "f-b")).toBe(before);
+  design(s, ["none", "none", "U1"]);
+  expect(landUnit(s, gh, "f-b")).toMatchObject({ slug: "f-b", restack: null });
 });
 
 test("land leaves a unit above alone when it isn't stacked on the landed unit", () => {
@@ -243,6 +326,29 @@ describe("fbs stack sync", () => {
     const before = tips(s);
     expect(sync(s.work, "f", fakeGh(s).gh)).toEqual(first.map((unit) => ({ ...unit, merged: null })));
     expect(tips(s)).toEqual(before);
+  });
+
+  test("the unit above an independent unit holds the unit below it, skipping the independent one, which is only kept up with origin", () => {
+    const s = stack({ independent: true, verdict: true });
+    expect(sync(s.work, "f", fakeGh(s).gh)).toEqual([
+      { slug: "f-a", unit: 1, ...quiet, pushNeeded: false },
+      { slug: "f-b", unit: 2, ...quiet, pushNeeded: false },
+      { slug: "f-c", unit: 3, ...quiet, merged: "feature/f-a", treeChanged: true, pushNeeded: true },
+    ]);
+    expect(git(s.work, "show", `${local(s, "f-c")}:docs/features/2026-10-21-f/units/f-a/verdict.md`)).toBe("Verdict: pass");
+    expect(() => git(s.work, "show", `${local(s, "f-c")}:b.txt`)).toThrow();
+    const squash = landedWithoutRestack(s, "f-a");
+    expect(sync(s.work, "f", fakeGh(s).gh)).toEqual([
+      { slug: "f-b", unit: 2, ...quiet, pushNeeded: false },
+      { slug: "f-c", unit: 3, ...quiet, merged: "origin/main", retargeted: true, treeChanged: true, pushNeeded: false },
+    ]);
+    expect(readFeature(s.work, "f-c").branch).toMatchObject({ parent: "main", base: squash });
+  });
+
+  test("an independent unit is synced even when the stack stops below it", () => {
+    const s = stack({ independent: true });
+    updateFeature(s.work, "f-a", ({ branch: _, ...rec }) => rec);
+    expect(sync(s.work, "f", fakeGh(s).gh)).toEqual([{ slug: "f-b", unit: 2, ...quiet, pushNeeded: false }]);
   });
 
   test("after land restacked units 2 and 3, sync has nothing left to do", () => {
@@ -329,6 +435,90 @@ describe("fbs stack sync", () => {
     expect(readFeature(s.work, "f-b").branch).toEqual({ name: "feature/f-b", parent: "main", base: squash });
     expect(Bun.spawnSync(["git", "rev-parse", "-q", "--verify", "refs/heads/feature/f-b"], { cwd: s.origin, env: isolatedGitEnv() }).exitCode).toBe(1);
     expect(besidesViews(calls)).toEqual([]);
+  });
+
+  test("a restack whose rebase conflicts across a merge resolved by hand becomes one commit on main, and says so", () => {
+    const s = stack();
+    fixMergedByHand(s);
+    landedWithoutRestack(s, "f-a");
+    const old = originTip(s, "f-b");
+    expect(sync(s.work, "f", fakeGh(s).gh)).toEqual([
+      { slug: "f-b", unit: 2, ...quiet, merged: "origin/main", retargeted: true, pushNeeded: false, squashed: true, squashedFrom: old },
+      { slug: "f-c", unit: 3, ...quiet, merged: "feature/f-b", pushNeeded: false },
+    ]);
+    expect(ownCommits(s, "feature/f-b")).toEqual(["feat: f-b"]);
+    expect(ownCommits(s, "feature/f-c")).toEqual(["feat: f-b", "feat: f-c"]);
+  });
+
+  test("a unit that merged main directly isn't folded, since a change main reverted since would come back", () => {
+    const s = stack();
+    fixMergedByHand(s);
+    commitOnOriginMain(s, "f.txt", "B\n", "feat: x");
+    git(s.work, "switch", "-q", "feature/f-b");
+    git(s.work, "merge", "-q", "--no-edit", "origin/main");
+    git(s.work, "push", "-q", "origin", "feature/f-b");
+    git(s.work, "switch", "-q", "main");
+    commitOnOriginMain(s, "f.txt", "A\n", "revert: x");
+    landedWithoutRestack(s, "f-a");
+    const before = tips(s);
+    expect(sync(s.work, "f", fakeGh(s).gh)).toEqual([
+      { slug: "f-b", unit: 2, ...quiet, done: false, pushNeeded: false, kind: "conflict", reason: "rebasing feature/f-b onto origin/main conflicts, and so does folding its change into one commit; feature/f-b is left as it was, rebase it by hand" },
+    ]);
+    expect(tips(s)).toEqual(before);
+  });
+
+  describe("unit 1 cut from a branch fbs doesn't know", () => {
+    const view = (head: string, squash: string, base = "main") => [{ number: 7, headRefOid: head, mergeCommit: { oid: squash }, baseRefName: base }];
+
+    test("is restacked onto main once that branch's PR merged, and the units above onto it", () => {
+      const s = stack({ outside: "feature/ext" });
+      const head = git(s.origin, "rev-parse", "refs/heads/feature/ext");
+      const tree = git(s.origin, "merge-tree", "--write-tree", "main", head).split("\n")[0];
+      const squash = git(s.origin, "commit-tree", tree, "-p", "main", "-m", "feat: ext (#7)");
+      git(s.origin, "update-ref", "refs/heads/main", squash);
+      git(s.origin, "update-ref", "-d", "refs/heads/feature/ext");
+      const { gh, calls } = fakeGh(s, { "feature/ext": view(head, squash) });
+      expect(sync(s.work, "f", gh)).toEqual([
+        { slug: "f-a", unit: 1, ...quiet, merged: "origin/main", retargeted: true, pushNeeded: false },
+        { slug: "f-b", unit: 2, ...quiet, merged: "feature/f-a", pushNeeded: false },
+        { slug: "f-c", unit: 3, ...quiet, merged: "feature/f-b", pushNeeded: false },
+      ]);
+      expect(besidesViews(calls)).toEqual([
+        ["pr", "list", "--head", "feature/ext", "--repo", "acme/app", ...LIST],
+        ["pr", "edit", "31", "--repo", "acme/app", "--base", "main"],
+      ]);
+      expect(ownCommits(s, "feature/f-a")).toEqual(["feat: f-a"]);
+      expect(ownCommits(s, "feature/f-c")).toEqual(["feat: f-a", "feat: f-b", "feat: f-c"]);
+      expect(readFeature(s.work, "f-a").branch).toMatchObject({ parent: "main", base: squash });
+    });
+
+    test("stays on that branch while it still exists on origin after its PR merged, and says so", () => {
+      const s = stack({ outside: "feature/ext" });
+      const head = git(s.origin, "rev-parse", "refs/heads/feature/ext");
+      const tree = git(s.origin, "merge-tree", "--write-tree", "main", head).split("\n")[0];
+      const squash = git(s.origin, "commit-tree", tree, "-p", "main", "-m", "release (#7)");
+      git(s.origin, "update-ref", "refs/heads/main", squash);
+      const before = tips(s);
+      const result = syncStack(s.work, "f", fakeGh(s, { "feature/ext": view(head, squash) }).gh, "2026-11-01");
+      expect(result.outside).toEqual([
+        { slug: "f-a", pr: 7, parent: "feature/ext", kind: "parent-kept", reason: "PR #7 from feature/ext was merged into main, but feature/ext still exists on origin, so f-a stays on it; if feature/ext is done, delete it on origin and sync again" },
+      ]);
+      expect(result.units.map((unit) => [unit.slug, unit.done, unit.merged])).toEqual([["f-a", true, null], ["f-b", true, null], ["f-c", true, null]]);
+      expect(tips(s)).toEqual(before);
+      expect(readFeature(s.work, "f-a").branch).toMatchObject({ parent: "feature/ext" });
+    });
+
+    test.each([
+      ["has no merged PR", (_head: string) => []],
+      ["had its PR merged into another branch", (head: string) => view(head, "e".repeat(40), "release")],
+    ])("is synced as before when that branch %s", (_, answer) => {
+      const s = stack({ outside: "feature/ext" });
+      const head = git(s.origin, "rev-parse", "refs/heads/feature/ext");
+      const before = tips(s);
+      expect(sync(s.work, "f", fakeGh(s, { "feature/ext": answer(head) }).gh)).toEqual(UNITS.map((u) => ({ slug: u.slug, unit: u.unit, ...quiet, pushNeeded: false })));
+      expect(tips(s)).toEqual(before);
+      expect(readFeature(s.work, "f-a").branch).toMatchObject({ parent: "feature/ext" });
+    });
   });
 
   test("a conflict stops the sync with exit 1 and leaves every branch as it was", () => {
@@ -524,6 +714,49 @@ describe("a merge outside fbs land", () => {
     expect(calls).toContainEqual(["pr", "edit", "40", "--repo", "acme/app", "--base", "main"]);
   });
 
+  test("a GitHub stack merged whole is recorded unit by unit, each PR's base its branch below, since each squash is on main", () => {
+    const s = stack();
+    const answers: Record<number, GhResult> = {};
+    let base = "main";
+    for (const u of UNITS) {
+      const head = originTip(s, u.slug);
+      // Each unit's tree holds every unit below it, so its squash onto main is its own tree.
+      const squash = git(s.origin, "commit-tree", `${head}^{tree}`, "-p", "main", "-m", `feat: ${u.slug} (#${u.pr})`);
+      git(s.origin, "update-ref", "refs/heads/main", squash);
+      answers[u.pr] = { code: 0, stdout: JSON.stringify({ state: "MERGED", headRefOid: head, mergeCommit: { oid: squash }, baseRefName: base }), stderr: "" };
+      base = u.branch;
+    }
+    const result = syncStack(s.work, "f", answering(fakeGh(s).gh, answers), "2026-11-01");
+    expect(result.outside.map((o) => [o.slug, o.kind])).toEqual([["f-a", "landed"], ["f-b", "landed"], ["f-c", "landed"]]);
+    expect(result.units).toEqual([]);
+    for (const u of UNITS) expect(readFeature(s.work, u.slug).landed).toMatchObject({ pr: u.pr, by: "outside" });
+  });
+
+  test("a GitHub stack merged up to f-a: GitHub restacked f-b and f-c on origin, and sync takes its branches rather than calling them diverged", () => {
+    const s = stack();
+    const head = originTip(s, "f-a");
+    const squash = squashOnOrigin(s, head, "feat: f-a (#31)");
+    const rebasedB = git(s.origin, "commit-tree", `${originTip(s, "f-b")}^{tree}`, "-p", squash, "-m", "feat: f-b");
+    const rebasedC = git(s.origin, "commit-tree", `${originTip(s, "f-c")}^{tree}`, "-p", rebasedB, "-m", "feat: f-c");
+    git(s.origin, "update-ref", "refs/heads/feature/f-b", rebasedB);
+    git(s.origin, "update-ref", "refs/heads/feature/f-c", rebasedC);
+    const { gh, calls } = fakeGh(s);
+    // GitHub manages a stacked PR's base itself and refuses gh pr edit on it; it already retargeted #32 to main.
+    const stacked: GhRunner = (args, cwd) => {
+      if (args[1] === "edit") return (calls.push(args), { code: 1, stdout: "", stderr: "GraphQL: Pull request is part of a stack and its base can't be changed" });
+      if (args[1] === "view" && args.includes(".baseRefName")) return (calls.push(args), { code: 0, stdout: "main\n", stderr: "" });
+      return gh(args, cwd);
+    };
+    const result = syncStack(s.work, "f", answering(stacked, { 31: merged(head, squash) }), "2026-11-01");
+    expect(result.outside.map((o) => [o.slug, o.kind])).toEqual([["f-a", "landed"]]);
+    expect(result.units.map((unit) => [unit.slug, unit.done, unit.treeChanged, unit.retargeted])).toEqual([["f-b", true, false, true], ["f-c", true, false, false]]);
+    expect(git(s.work, "rev-parse", "refs/heads/feature/f-b")).toBe(rebasedB);
+    expect(git(s.work, "rev-parse", "refs/heads/feature/f-c")).toBe(rebasedC);
+    expect([originTip(s, "f-b"), originTip(s, "f-c")]).toEqual([rebasedB, rebasedC]);
+    expect(readFeature(s.work, "f-b").branch).toMatchObject({ parent: "main" });
+    expect(calls).toContainEqual(["pr", "edit", "32", "--repo", "acme/app", "--base", "main"]);
+  });
+
   test("a PR merged into another branch is reported and not recorded", () => {
     const s = stack();
     const answer = { code: 0, stdout: JSON.stringify({ state: "MERGED", headRefOid: originTip(s, "f-a"), mergeCommit: { oid: "e".repeat(40) }, baseRefName: "release" }), stderr: "" };
@@ -582,42 +815,43 @@ describe("a merge outside fbs land", () => {
     expect(["f", "f-a"].map((slug) => existsSync(campMarkerPath(s.common, slug)))).toEqual([false, false]);
   });
 
+  /** Plain feature p on main with PR 50, and q cut from p's branch with PR 51, both pushed. */
+  function plainPair(): Stack & { pTip: string } {
+    const origin = join(tempDir(), "origin.git");
+    git(dirname(origin), "init", "-q", "--bare", "-b", "main", origin);
+    const work = join(tempDir(), "work");
+    git(dirname(work), "init", "-q", "-b", "main", work);
+    git(work, "remote", "add", "origin", origin);
+    const base = commitFile(work, "shared.txt", "a\n", "chore: init");
+    git(work, "push", "-q", "origin", "main");
+    git(work, "switch", "-q", "-c", "feature/p");
+    const pTip = commitFile(work, "p.txt", "p\n", "feat: p");
+    git(work, "switch", "-q", "-c", "feature/q");
+    const qTip = commitFile(work, "q.txt", "q\n", "feat: q");
+    git(work, "push", "-q", "origin", "feature/p", "feature/q");
+    git(work, "switch", "-q", "main");
+    const common = join(work, ".git");
+    mkdirSync(join(common, "fbs", "features"), { recursive: true });
+    const record = (slug: string, pr: number, branch: object) => ({ slug, dir: `docs/features/2026-10-21-${slug}`, size: "mid", approvals: {}, pr, repo: "acme/app", branch });
+    writeFileSync(join(common, "fbs", "features", "p.json"), JSON.stringify(record("p", 50, { name: "feature/p", parent: "main", base, pushed: pTip })));
+    writeFileSync(join(common, "fbs", "features", "q.json"), JSON.stringify(record("q", 51, { name: "feature/q", parent: "feature/p", base: pTip, pushed: qTip })));
+    return { work, origin, common, pTip };
+  }
+
+  /** A gh where every PR is open unless `answers` says otherwise, edits succeed, and `listed` answers gh pr list --head. */
+  function plainGh(answers: Record<number, GhResult> = {}, listed: Record<string, object[]> = {}) {
+    const calls: string[][] = [];
+    const open: GhResult = { code: 0, stdout: JSON.stringify({ state: "OPEN", headRefOid: "0".repeat(40), mergeCommit: null, baseRefName: "main" }), stderr: "" };
+    const gh: GhRunner = (args) => {
+      calls.push(args);
+      if (args[1] === "edit") return { code: 0, stdout: "", stderr: "" };
+      if (args[1] === "list") return { code: 0, stdout: JSON.stringify(listed[args[args.indexOf("--head") + 1]] ?? []), stderr: "" };
+      return answers[Number(args[2])] ?? open;
+    };
+    return { gh, calls };
+  }
+
   describe("a plain feature cut from another feature's branch", () => {
-    /** Plain feature p on main with PR 50, and q cut from p's branch with PR 51, both pushed. */
-    function plainPair(): Stack & { pTip: string } {
-      const origin = join(tempDir(), "origin.git");
-      git(dirname(origin), "init", "-q", "--bare", "-b", "main", origin);
-      const work = join(tempDir(), "work");
-      git(dirname(work), "init", "-q", "-b", "main", work);
-      git(work, "remote", "add", "origin", origin);
-      const base = commitFile(work, "shared.txt", "a\n", "chore: init");
-      git(work, "push", "-q", "origin", "main");
-      git(work, "switch", "-q", "-c", "feature/p");
-      const pTip = commitFile(work, "p.txt", "p\n", "feat: p");
-      git(work, "switch", "-q", "-c", "feature/q");
-      const qTip = commitFile(work, "q.txt", "q\n", "feat: q");
-      git(work, "push", "-q", "origin", "feature/p", "feature/q");
-      git(work, "switch", "-q", "main");
-      const common = join(work, ".git");
-      mkdirSync(join(common, "fbs", "features"), { recursive: true });
-      const record = (slug: string, pr: number, branch: object) => ({ slug, dir: `docs/features/2026-10-21-${slug}`, size: "mid", approvals: {}, pr, repo: "acme/app", branch });
-      writeFileSync(join(common, "fbs", "features", "p.json"), JSON.stringify(record("p", 50, { name: "feature/p", parent: "main", base, pushed: pTip })));
-      writeFileSync(join(common, "fbs", "features", "q.json"), JSON.stringify(record("q", 51, { name: "feature/q", parent: "feature/p", base: pTip, pushed: qTip })));
-      return { work, origin, common, pTip };
-    }
-
-    /** A gh where every PR is open unless `answers` says otherwise, and edits succeed. */
-    function plainGh(answers: Record<number, GhResult> = {}) {
-      const calls: string[][] = [];
-      const open: GhResult = { code: 0, stdout: JSON.stringify({ state: "OPEN", headRefOid: "0".repeat(40), mergeCommit: null, baseRefName: "main" }), stderr: "" };
-      const gh: GhRunner = (args) => {
-        calls.push(args);
-        if (args[1] === "edit") return { code: 0, stdout: "", stderr: "" };
-        return answers[Number(args[2])] ?? open;
-      };
-      return { gh, calls };
-    }
-
     test("its parent squash-merged outside fbs is recorded, and it is restacked to its own commits and retargeted", () => {
       const s = plainPair();
       const squash = squashOnOrigin(s, s.pTip, "feat: p (#50)");
@@ -654,6 +888,70 @@ describe("a merge outside fbs land", () => {
       ]);
     });
 
+    describe("when that branch is one fbs doesn't know", () => {
+      const view = (head: string, squash: string, base = "main") => [{ number: 50, headRefOid: head, mergeCommit: { oid: squash }, baseRefName: base }];
+
+      test("it is restacked onto main once that branch's PR merged", () => {
+        const s = plainPair();
+        rmSync(join(s.common, "fbs", "features", "p.json"));
+        const squash = squashOnOrigin(s, s.pTip, "feat: p (#50)");
+        git(s.origin, "update-ref", "-d", "refs/heads/feature/p");
+        const { gh, calls } = plainGh({}, { "feature/p": view(s.pTip, squash) });
+        const out: string[] = [];
+        const deps = { gh, now: () => NOW, sleep: () => {}, stdin: () => "" };
+        expect(run(["stack", "sync", "q"], { cwd: s.work, today: "2026-11-01", out: (l) => out.push(l), err: () => {} }, deps)).toBe(0);
+        expect(JSON.parse(out[0])).toEqual({ units: [], restack: { slug: "q", pr: 51, done: true, treeChanged: false } });
+        expect(ownCommits(s, "feature/q")).toEqual(["feat: q"]);
+        expect(readFeature(s.work, "q").branch).toMatchObject({ parent: "main", base: squash });
+        expect(calls).toEqual([
+          ["pr", "view", "51", "--repo", "acme/app", "--json", "state,headRefOid,mergeCommit,baseRefName"],
+          ["pr", "list", "--head", "feature/p", "--repo", "acme/app", ...LIST],
+          ["pr", "edit", "51", "--repo", "acme/app", "--base", "main"],
+        ]);
+      });
+
+      test("a merged PR from a branch that still exists on origin, like a release from develop, leaves it there and says so", () => {
+        const s = plainPair();
+        rmSync(join(s.common, "fbs", "features", "p.json"));
+        const squash = squashOnOrigin(s, s.pTip, "release (#50)");
+        const before = git(s.origin, "rev-parse", "refs/heads/feature/q");
+        const { gh, calls } = plainGh({}, { "feature/p": view(s.pTip, squash) });
+        expect(syncStack(s.work, "q", gh, "2026-11-01")).toEqual({
+          units: [],
+          outside: [{ slug: "q", pr: 50, parent: "feature/p", kind: "parent-kept", reason: "PR #50 from feature/p was merged into main, but feature/p still exists on origin, so q stays on it; if feature/p is done, delete it on origin and sync again" }],
+          restack: null,
+        });
+        expect(git(s.origin, "rev-parse", "refs/heads/feature/q")).toBe(before);
+        expect(readFeature(s.work, "q").branch).toMatchObject({ parent: "feature/p" });
+        expect(calls.some((call) => call[1] === "edit")).toBe(false);
+      });
+
+      test("a gh that can't answer about that branch is reported, and nothing moves", () => {
+        const s = plainPair();
+        rmSync(join(s.common, "fbs", "features", "p.json"));
+        const { gh } = plainGh();
+        const failing: GhRunner = (args, cwd) => (args[1] === "list" ? { code: 1, stdout: "", stderr: "HTTP 502\n" } : gh(args, cwd));
+        expect(syncStack(s.work, "q", failing, "2026-11-01")).toEqual({
+          units: [],
+          outside: [{ slug: "q", pr: null, parent: "feature/p", kind: "gh-failed", reason: "gh pr list could not tell whether feature/p, which q was cut from, was merged: HTTP 502" }],
+          restack: null,
+        });
+      });
+
+      test.each([
+        ["has no merged PR", (_s: Stack & { pTip: string }) => []],
+        ["had its PR merged into another branch", (s: Stack & { pTip: string }) => view(s.pTip, "e".repeat(40), "release")],
+        ["only had an older PR merged, before it was cut from it", (s: Stack & { pTip: string }) => view(git(s.work, "rev-parse", "main"), git(s.work, "rev-parse", "main"))],
+      ])("it is left alone when that branch %s", (_, answer) => {
+        const s = plainPair();
+        rmSync(join(s.common, "fbs", "features", "p.json"));
+        const before = git(s.origin, "rev-parse", "refs/heads/feature/q");
+        expect(syncStack(s.work, "q", plainGh({}, { "feature/p": answer(s) }).gh, "2026-11-01")).toEqual({ units: [], outside: [], restack: null });
+        expect(git(s.origin, "rev-parse", "refs/heads/feature/q")).toBe(before);
+        expect(readFeature(s.work, "q").branch).toMatchObject({ parent: "feature/p" });
+      });
+    });
+
     test("one based on the default branch with its PR open has nothing to do", () => {
       const s = plainPair();
       const { gh, calls } = plainGh();
@@ -684,6 +982,120 @@ describe("a merge outside fbs land", () => {
       expect(result.restack).toBeNull();
       expect(ownCommits(s, "feature/q")).toEqual(["feat: q"]);
       expect(calls).toContainEqual(["pr", "edit", "51", "--repo", "acme/app", "--base", "main"]);
+    });
+  });
+
+  describe("camp and status reconcile record it too", () => {
+    const prDeps = (gh: GhRunner) => ({ gh, now: () => NOW, sleep: () => {}, stdin: () => "" });
+    function fbs(cwd: string, gh: GhRunner, ...args: string[]) {
+      return fbsAs(null, cwd, gh, ...args);
+    }
+    /** fbs run from the Claude Code session `session`, or from none. */
+    function fbsAs(session: string | null, cwd: string, gh: GhRunner, ...args: string[]) {
+      const out: string[] = [];
+      const code = run(args, { cwd, today: "2026-11-01", out: (l) => out.push(l), err: () => {} }, prDeps(gh), { ...REAL_AFK_DEPS, sessionId: () => session });
+      return { code, out };
+    }
+    /** q's record and branches, here and on origin: what a restack would change. */
+    const qState = (s: Stack) => [readFeature(s.work, "q"), git(s.work, "rev-parse", "feature/q"), git(s.origin, "rev-parse", "feature/q")];
+    const edits = (calls: string[][]) => calls.filter((call) => call[1] === "edit");
+
+    test("camp stop records a PR merged outside fbs as landed and says so, leaving the feature cut from it for its own sync", () => {
+      const s = plainPair();
+      expect(fbs(s.work, plainGh().gh, "camp", "start", "p").code).toBe(0);
+      const squash = squashOnOrigin(s, s.pTip, "feat: p (#50)");
+      const before = qState(s);
+      const { gh, calls } = plainGh({ 50: merged(s.pTip, squash) });
+      expect(fbs(s.work, gh, "camp", "stop", "p")).toEqual({
+        code: 0,
+        out: ["stopped", `landed: PR #50 was merged outside fbs land; recorded p as landed at ${squash}`],
+      });
+      expect(readFeature(s.work, "p").landed).toEqual({ pr: 50, repo: "acme/app", commit: squash, at: "2026-11-01", head: s.pTip, by: "outside" });
+      expect(openPrRecords(s.common).map((open) => open.slug)).toEqual(["q"]);
+      expect(existsSync(campMarkerPath(s.common, "p"))).toBe(false);
+      expect(qState(s)).toEqual(before);
+      expect(edits(calls)).toEqual([]);
+    });
+
+    test("camp stop on an open PR asks gh and changes nothing else", () => {
+      const s = plainPair();
+      const { gh, calls } = plainGh();
+      fbs(s.work, gh, "camp", "start", "p");
+      expect(fbs(s.work, gh, "camp", "stop", "p")).toEqual({ code: 0, out: ["stopped"] });
+      expect(readFeature(s.work, "p").landed).toBeUndefined();
+      expect(calls.map((call) => call.slice(0, 3))).toEqual([["pr", "view", "50"], ["pr", "view", "50"]]);
+    });
+
+    test("camp stop from a session that lost the camp is refused while the PR is open, and allowed once it merged", () => {
+      const s = plainPair();
+      fbsAs("s1", s.work, plainGh().gh, "camp", "start", "p");
+      fbsAs("s2", s.work, plainGh().gh, "camp", "start", "p");
+      expect(fbsAs("s1", s.work, plainGh().gh, "camp", "stop", "p")).toEqual({ code: 1, out: ["error: camp held by s2; camp start takes it over"] });
+      expect(existsSync(campMarkerPath(s.common, "p"))).toBe(true);
+      const squash = squashOnOrigin(s, s.pTip, "feat: p (#50)");
+      expect(fbsAs("s1", s.work, plainGh({ 50: merged(s.pTip, squash) }).gh, "camp", "stop", "p")).toEqual({
+        code: 0,
+        out: ["stopped", `landed: PR #50 was merged outside fbs land; recorded p as landed at ${squash}`],
+      });
+      expect(existsSync(campMarkerPath(s.common, "p"))).toBe(false);
+    });
+
+    test("camp stop without a session stops a camp another session holds", () => {
+      const s = plainPair();
+      fbsAs("s2", s.work, plainGh().gh, "camp", "start", "p");
+      expect(fbsAs(null, s.work, plainGh().gh, "camp", "stop", "p")).toEqual({ code: 0, out: ["stopped"] });
+      expect(existsSync(campMarkerPath(s.common, "p"))).toBe(false);
+    });
+
+    test("camp start on a PR merged outside fbs records it as landed and refuses to camp, saying what it recorded", () => {
+      const s = plainPair();
+      const squash = squashOnOrigin(s, s.pTip, "feat: p (#50)");
+      const before = qState(s);
+      const { gh, calls } = plainGh({ 50: merged(s.pTip, squash) });
+      expect(fbs(s.work, gh, "camp", "start", "p")).toEqual({
+        code: 1,
+        out: [`error: p has landed; there is nothing to camp (PR #50 was merged outside fbs land; recorded p as landed at ${squash})`],
+      });
+      expect(readFeature(s.work, "p").landed).toMatchObject({ by: "outside" });
+      expect(existsSync(campMarkerPath(s.common, "p"))).toBe(false);
+      expect(qState(s)).toEqual(before);
+      expect(edits(calls)).toEqual([]);
+    });
+
+    test("camp start on a stack records a unit merged outside, starts the camp for the rest and reports it", () => {
+      const s = stack();
+      const head = originTip(s, "f-a");
+      const squash = squashOnOrigin(s, head, "feat: f-a (#31)");
+      const r = fbs(s.work, answering(fakeGh(s).gh, { 31: merged(head, squash) }), "camp", "start", "f");
+      expect(r.code).toBe(0);
+      expect(JSON.parse(r.out.join("\n"))).toMatchObject({ slug: "f", outside: [{ slug: "f-a", pr: 31, kind: "landed" }] });
+      expect(readFeature(s.work, "f-a").landed).toMatchObject({ by: "outside" });
+      expect(existsSync(campMarkerPath(s.common, "f"))).toBe(true);
+    });
+
+    test("status reconcile records every open PR merged outside fbs as landed and leaves the rest, the feature cut from it included, for their own sync", () => {
+      const s = plainPair();
+      const squash = squashOnOrigin(s, s.pTip, "feat: p (#50)");
+      const before = qState(s);
+      const { gh, calls } = plainGh({ 50: merged(s.pTip, squash) });
+      const r = fbs(s.work, gh, "status", "reconcile");
+      expect(r.code).toBe(0);
+      expect(JSON.parse(r.out.join("\n"))).toEqual({ outside: [{ slug: "p", pr: 50, kind: "landed", reason: `PR #50 was merged outside fbs land; recorded p as landed at ${squash}` }] });
+      expect(readFeature(s.work, "p").landed).toMatchObject({ by: "outside" });
+      expect(openPrRecords(s.common).map((open) => open.slug)).toEqual(["q"]);
+      expect(qState(s)).toEqual(before);
+      expect(edits(calls)).toEqual([]);
+      expect(fbs(s.work, plainGh().gh, "status", "reconcile")).toEqual({ code: 0, out: ['{"outside":[]}'] });
+    });
+
+    test("status reconcile clears the link of a PR closed without merging, once, and says so", () => {
+      const s = plainPair();
+      const closed: GhResult = { code: 0, stdout: JSON.stringify({ state: "CLOSED", headRefOid: s.pTip, mergeCommit: null, baseRefName: "main" }), stderr: "" };
+      const r = fbs(s.work, plainGh({ 51: closed }).gh, "status", "reconcile");
+      expect(JSON.parse(r.out.join("\n"))).toEqual({ outside: [{ slug: "q", pr: 51, kind: "closed", reason: "PR #51 was closed without merging; cleared q's link to it, as fbs status pr q none would" }] });
+      expect(readFeature(s.work, "q")).toMatchObject({ pr: null });
+      expect("repo" in readFeature(s.work, "q")).toBe(false);
+      expect(fbs(s.work, plainGh({ 51: closed }).gh, "status", "reconcile")).toEqual({ code: 0, out: ['{"outside":[]}'] });
     });
   });
 
@@ -781,6 +1193,62 @@ describe("the restack is a rebase", () => {
     expect(git(s.work, "log", "--format=%s", "origin/main..feature/h")).toBe("feat: h");
     expect(readFeature(s.work, "h").branch).toEqual({ name: "feature/h", parent: "main", base: git(s.origin, "rev-parse", "main") });
     expect(Bun.spawnSync(["git", "rev-parse", "-q", "--verify", "refs/heads/feature/h"], { cwd: s.origin, env: isolatedGitEnv() }).exitCode).toBe(1);
+  });
+
+  test("a rebase that conflicts across a merge resolved by hand falls back to one commit on main carrying the unit's own change", () => {
+    const s = stack();
+    fixMergedByHand(s);
+    const { gh } = fakeGh(s);
+    const old = originTip(s, "f-b");
+    const result = landUnit(s, gh, "f-a");
+    expect(result).toMatchObject({ restack: { slug: "f-b", pr: 32, done: true, treeChanged: false, squashed: true, squashedFrom: old } });
+    expect(git(s.origin, "log", "-1", "--format=%an <%ae>|%aI|%s|%b", originTip(s, "f-b"))).toBe(`${AUTHOR}|${AUTHOR_DATE}|feat: f-b|- feat: f-b`);
+    expect("stacked" in result && result.stacked).toEqual([{ slug: "f-c", pr: 33, done: true, treeChanged: false }]);
+    expect(ownCommits(s, "feature/f-b")).toEqual(["feat: f-b"]);
+    expect(git(s.origin, "rev-parse", `${originTip(s, "f-b")}^@`)).toBe(git(s.origin, "rev-parse", "main"));
+    expect(show(s, originTip(s, "f-b"), "shared.txt")).toBe("a\nB2\nc");
+    expect(readFeature(s.work, "f-b").branch).toMatchObject({ parent: "main", pushed: originTip(s, "f-b") });
+    expect(ownCommits(s, "feature/f-c")).toEqual(["feat: f-b", "feat: f-c"]);
+    expect(landUnit(s, gh, "f-b")).toMatchObject({ restack: { slug: "f-c", done: true, treeChanged: false } });
+    expect(ownCommits(s, "feature/f-c")).toEqual(["feat: f-c"]);
+    expect(show(s, originTip(s, "f-c"), "shared.txt")).toBe("a\nB3\nc");
+  });
+
+  test("a restack whose single commit would conflict too stops with conflict, leaving the branch as it was", () => {
+    const s = stack();
+    commitOn(s, "feature/f-a", "shared.txt", "a\nB1 fixed\nc\n", "fix: f-a line");
+    const before = [originTip(s, "f-b"), git(s.work, "rev-parse", "feature/f-b")];
+    const reason = "rebasing feature/f-b onto origin/main conflicts, and so does folding its change into one commit; feature/f-b is left as it was, rebase it by hand";
+    expect(landUnit(s, fakeGh(s).gh, "f-a")).toMatchObject({ restack: { slug: "f-b", done: false, kind: "conflict", reason } });
+    expect([originTip(s, "f-b"), git(s.work, "rev-parse", "feature/f-b")]).toEqual(before);
+  });
+
+  test("a git too old for merge-tree --merge-base ends the fallback in conflict, not error", () => {
+    const s = stack();
+    fixMergedByHand(s);
+    const wrapper = join(tempDir(), "git");
+    writeFileSync(wrapper, `#!/bin/sh\nif [ "$1" = merge-tree ]; then echo "usage: git merge-tree" >&2; exit 129; fi\nexec "${Bun.which("git")}" "$@"\n`, { mode: 0o755 });
+    setGitBinary(wrapper);
+    try {
+      expect(landUnit(s, fakeGh(s).gh, "f-a")).toMatchObject({ restack: { slug: "f-b", done: false, kind: "conflict" } });
+    } finally {
+      setGitBinary("git");
+    }
+  });
+
+  test("a unit above a restacked one is folded onto it when its own rebase conflicts", () => {
+    const s = stack();
+    fixMergedByHand(s, "f-b", "f-c");
+    const old = originTip(s, "f-c");
+    const result = landUnit(s, fakeGh(s).gh, "f-a");
+    expect(result).toMatchObject({ restack: { slug: "f-b", done: true } });
+    expect("squashed" in (result as { restack: object }).restack).toBe(false);
+    expect("stacked" in result && result.stacked).toEqual([{ slug: "f-c", pr: 33, done: true, treeChanged: false, squashed: true, squashedFrom: old }]);
+    expect(ownCommits(s, "feature/f-b")).toEqual(["feat: f-b", "fix: f-b line"]);
+    expect(ownCommits(s, "feature/f-c")).toEqual(["feat: f-b", "fix: f-b line", "feat: f-c"]);
+    expect(git(s.origin, "rev-parse", `${originTip(s, "f-c")}^@`)).toBe(originTip(s, "f-b"));
+    expect(show(s, originTip(s, "f-c"), "shared.txt")).toBe("a\nB3\nc");
+    expect(readFeature(s.work, "f-c").branch).toMatchObject({ parent: "feature/f-b", base: originTip(s, "f-b") });
   });
 
   test("the lease refuses the push when origin's branch moved after the rebase started, leaving the branch as it was", () => {

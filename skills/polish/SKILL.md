@@ -23,6 +23,8 @@ Run every `fbs` command as its own Bash call, with nothing chained, piped or red
 
 ## 1. Preflight
 
+**Input first.** Polish works only on a feature fbs knows. With input, run `fbs status show <its first word>`. When that finds the feature, it's the slug, and any words after it are the user's focus for the review. When it finds none (`error: missing`, or free text like "check the repo before starting X"), it isn't polish's work: say so in one line, then read `<plugin root>/skills/assemble/SKILL.md` with the Read tool and follow it with the whole input as the idea. Never improvise a ticket, branch or PR outside fbs.
+
 1. Run `fbs polish check`.
    - Exit 1: show its output verbatim, say polish needs both plugins and only the user can install them, and stop. Never install or enable a plugin yourself.
    - Exit 2: report the error and stop.
@@ -33,11 +35,11 @@ Run every `fbs` command as its own Bash call, with nothing chained, piped or red
    - A lone `dirty:` line: show the files and ask once: ignore them locally (add them to `.git/info/exclude`) or set them aside (`git stash -u`, popped before this stage hands on). Then check again.
    - Anything else: say the feature has to pass verify before it's polished, and stop. Polish works only on a tree verify proved.
 5. The range is `$(git merge-base HEAD origin/<parent>)..HEAD`, or against the local `<parent>` when the repo has no remote. Say it in one line.
-6. Find the test command and the type-check command, when there is one (`CLAUDE.md`, `package.json` scripts or the equivalent), and run both. Keep the failing tests as the baseline and quote both summary lines.
+6. Find the test command and the type-check command, when there is one (`CLAUDE.md`, `package.json` scripts or the equivalent), and run both in the foreground with a Bash `timeout`, per workspace or package when the root command hangs. Keep the failing tests as the baseline and quote both summary lines.
 
 ## 2. Review
 
-Start two Agent calls in one message, both with `subagent_type: "fbs:polish-reviewer"`, one per rubric path. Give each the range, the repository root, its rubric path, and the absolute paths of `spec.md` and `design.md` under `docsRoot` that exist (a tiny feature or a bug may have neither). Wait for both reports.
+Start two Agent calls in one message, both with `subagent_type: "fbs:polish-reviewer"`, one per rubric path. Give each the range, the repository root, its rubric path, the absolute paths of `spec.md` and `design.md` under `docsRoot` that exist (a tiny feature or a bug may have neither), and the user's focus when they gave one. Wait for both reports.
 
 Save both reports, unedited, to `<git common dir>/fbs/evidence/<slug>/polish/<n>/` (`git rev-parse --path-format=absolute --git-common-dir`; `<n>` is the next free number): `ponytail.md` and `thermo.md`. They stay outside the tree, so the stamp holds.
 

@@ -96,6 +96,12 @@ if [ "$1" = "api" ]; then
     exit 0
   fi
   if any "PullRequestReviewThread" "$@"; then serve thread.json; fi
+  # fbs land asks whether the PR is in a GitHub stack; a fixture may answer with stack.json, else it is in none.
+  if any "stack{" "$@"; then
+    [ -f "$data/stack.json" ] && serve stack.json
+    echo '{"data":{"repository":{"pullRequest":{"stack":null}}}}'
+    exit 0
+  fi
   if any "reviewThreads" "$@"; then
     count=$(( $(cat "$data/graphql.count" 2>/dev/null || echo 0) + 1 ))
     [ -f "$data/graphql-$count.json" ] || count=$((count - 1))

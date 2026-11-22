@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { REAL_AFK_DEPS } from "./afk";
 import { gitCommonDir, repoRoot } from "./git";
 import type { GhResult } from "./github";
 import { type PrDeps, run, takeToolFlags } from "./main";
@@ -66,6 +67,95 @@ test("unknown subcommand is a usage error", () => {
   const err: string[] = [];
   expect(run(["nope"], io([], err))).toBe(2);
   expect(err.join("\n")).toContain("unknown command: nope");
+});
+
+describe("per-command help", () => {
+  const COMMANDS = ["context", "status", "tracker", "branch", "push", "stamp", "commits", "watch-pr", "pr", "camp", "land", "stack", "guard", "ask-check", "afk", "afk-guard", "polish", "rewrite"];
+  const CONTINUATION = " ".repeat(28);
+
+  test.each(COMMANDS.flatMap((command) => [[command, "--help"], [command, "-h"]]))("%s %s prints only that command's usage and exits 0", (command, flag) => {
+    const out: string[] = [];
+    const err: string[] = [];
+    expect(run([command, flag], io(out, err, tempDir()))).toBe(0);
+    expect(err).toEqual([]);
+    const [header, ...lines] = out.join("\n").split("\n");
+    expect(header).toBe("usage:");
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines[0]).toStartWith(`  ${command}`);
+    for (const line of lines) expect(line.startsWith(`  ${command} `) || line === `  ${command}` || line.startsWith(CONTINUATION)).toBe(true);
+  });
+
+  test("help is printed wherever --help comes after the command, and holds every line of its entries", () => {
+    const out: string[] = [];
+    expect(run(["push", "x", "--help"], io(out, [], tempDir()))).toBe(0);
+    const text = out.join("\n");
+    expect(text).toContain("  push <slug>");
+    expect(text).toContain("never main, master or origin's default branch");
+    expect(text).not.toContain("stamp set");
+    const camp: string[] = [];
+    expect(run(["camp", "followup", "-h"], io(camp, [], tempDir()))).toBe(0);
+    expect(camp.join("\n")).toContain("  camp followup <slug> --filed <n> --link <url>");
+  });
+
+  test("fbs help <command> prints that command's part, and an unknown one is a usage error", () => {
+    const viaHelp: string[] = [];
+    const viaFlag: string[] = [];
+    expect(run(["help", "push"], io(viaHelp, []))).toBe(0);
+    run(["push", "--help"], io(viaFlag, []));
+    expect(viaHelp).toEqual(viaFlag);
+    const err: string[] = [];
+    expect(run(["help", "nope"], io([], err))).toBe(2);
+    expect(err).toEqual(["unknown command: nope"]);
+    const full: string[] = [];
+    expect(run(["help", "--help"], io(full, []))).toBe(0);
+    expect(full[0]).toStartWith("usage: fbs <command>");
+  });
+
+  test("-h or --help given as an option's value is the value, not a request for help; after a bare flag it is help", () => {
+    const out: string[] = [];
+    expect(run(["status", "approve", "x", "spec", "--quote", "-h"], io(out, [], featureRepo(PASSING_SPEC)))).toBe(0);
+    expect(JSON.parse(out.join("\n")).approvals.spec.quote).toBe("-h");
+    const help: string[] = [];
+    expect(run(["branch", "x", "--existing", "--help"], io(help, [], tempDir()))).toBe(0);
+    expect(help[0]).toStartWith("usage:\n  branch <slug>");
+  });
+
+  test("afk's help leaves out afk-guard, and an unknown command with --help is still a usage error", () => {
+    const out: string[] = [];
+    run(["afk", "--help"], io(out, []));
+    expect(out.join("\n")).toContain("  afk stop-check");
+    expect(out.join("\n")).not.toContain("  afk-guard <slug>");
+    const err: string[] = [];
+    expect(run(["nope", "--help"], io([], err))).toBe(2);
+    expect(err).toEqual(["unknown command: nope"]);
+  });
+});
+
+describe("an option without its value", () => {
+  test.each([
+    [["branch", "x", "--use"], "branch: --use needs a value"],
+    [["branch", "x", "--use", " "], "branch: --use needs a value"],
+    [["branch", "x", "--use", "--existing"], "branch: --use needs a value"],
+    [["status", "init", "x", "--size"], "status init: --size needs a value"],
+    [["status", "approve", "x", "spec", "--quote"], "status approve: --quote needs a value"],
+    [["stamp", "set", "x", "--verdict"], "stamp set: --verdict needs a value"],
+    [["stamp", "set", "x", "--verdict", ""], "stamp set: --verdict needs a value"],
+    [["watch-pr", "x", "--interval"], "watch-pr: --interval needs a value"],
+    [["pr", "reply", "x", "--comment", "issue:1", "--body-file"], "pr reply: --body-file needs a value"],
+    [["camp", "followup", "x", "--summary", "s", "--thread"], "camp followup: --thread needs a value"],
+    [["afk", "stop", "x", "--reason"], "afk stop: --reason needs a value"],
+  ])("%p says so", (args, message) => {
+    const out: string[] = [];
+    const err: string[] = [];
+    expect(run(args, io(out, err, gitRepo()))).toBe(2);
+    expect({ out, err }).toEqual({ out: [], err: [message] });
+  });
+
+  test("an unknown option is still an unknown command", () => {
+    const err: string[] = [];
+    expect(run(["branch", "x", "--nope", "v"], io([], err, gitRepo()))).toBe(2);
+    expect(err).toEqual(["unknown command: branch x --nope v"]);
+  });
 });
 
 test("context check in a repo with no .fbs reports no context file", () => {
@@ -246,7 +336,7 @@ test("blocker lines come out as missing, empty, unsourced, unconfirmed, then ope
   writeFileSync(join(repo, "docs/features/2026-10-21-x/spec.md"), spec);
   expect(status(repo, "gate", "x", "spec").out).toEqual([
     "empty section: Assumptions (write None if there are none)",
-    "unsourced: F",
+    "unsourced: F (end the line with its source: (user, YYYY-MM-DD), (spec), (<https url>) or (<file path>[:<line>]), with an optional , <detail> or ; <detail> before the closing parenthesis)",
     "unconfirmed: A",
     "open question: Q1",
   ]);
@@ -545,7 +635,7 @@ test("stamp carry prints ok when nothing changed, then carried with the trees an
   git(repo, "commit", "-q", "-m", "docs");
   expect(stamp(repo, "check", "x")).toEqual({ code: 1, out: ["stale: tree changed"], err: [] });
   const paths = "docs/features/2026-10-21-x/changes.md, docs/features/2026-10-21-x/notes.md";
-  expect(stamp(repo, "carry", "x")).toEqual({ code: 0, out: [`carried: ${stamped.slice(0, 12)} -> ${headTreeOf(repo).slice(0, 12)}; only documents changed: ${paths}`], err: [] });
+  expect(stamp(repo, "carry", "x")).toEqual({ code: 0, out: [`carried: ${stamped.slice(0, 12)} -> ${headTreeOf(repo).slice(0, 12)}; nothing verify reads changed: ${paths}`], err: [] });
   expect(stamp(repo, "check", "x")).toEqual({ code: 0, out: ["ok"], err: [] });
   expect(JSON.parse(readFileSync(join(repo, RECORDS, "x.json"), "utf8")).stamp.verifiedTree).toBe(stamped);
 });
@@ -630,8 +720,6 @@ test.each([
   [[]],
   [["set", "x"]],
   [["set", "--verdict", VERDICT_PATH]],
-  [["set", "x", "--verdict"]],
-  [["set", "x", "--verdict", ""]],
   [["set", "x", "y", "--verdict", VERDICT_PATH]],
   [["set", "x", "--quote", "q"]],
   [["check"]],
@@ -702,6 +790,13 @@ test("the help lists both ways to approve", () => {
   expect(out.join("\n")).toContain("status approve <slug> design --auto <why the agent may approve it>");
 });
 
+test("the help lists renumbering a unit and moving a feature to another repo", () => {
+  const out: string[] = [];
+  expect(run(["help"], io(out, []))).toBe(0);
+  expect(out.join("\n")).toContain("status unit <unit slug> --move <n>");
+  expect(out.join("\n")).toContain("status move <slug> --to <path> [--remove-source]");
+});
+
 test("the help lists the stamp commands", () => {
   const out: string[] = [];
   expect(run(["help"], io(out, []))).toBe(0);
@@ -710,10 +805,105 @@ test("the help lists the stamp commands", () => {
   expect(out.join("\n")).toContain("stamp carry <slug>");
 });
 
+test("status rollout records a rollout criterion's outcome after the deploy, and show prints the criteria, their outcomes and what still waits", () => {
+  const repo = featureRepo(`${PASSING_SPEC}## Acceptance criteria\n- [ ] A member subscribes\n- [ ] (rollout) The plan shows in production\n- [ ] (rollout) Clients deploy through it\n`);
+  expect(status(repo, "approve", "x", "spec", "--quote", "ship it").code).toBe(0);
+  writeFileSync(join(repo, VERDICT_PATH), "## Criteria\n- [x] A member subscribes\n## Rollout\n- [ ] The plan shows in production — checked after the deploy\nVerdict: pass\n");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-q", "-m", "work");
+  expect(stamp(repo, "set", "x", "--verdict", VERDICT_PATH).code).toBe(0);
+  const r = status(repo, "rollout", "x", "AC2", "fail", "--note", "the plan is missing for EU clients");
+  expect(r.code).toBe(0);
+  const failed = { ac: 2, text: "The plan shows in production", outcome: "fail", at: "2026-10-21", note: "the plan is missing for EU clients" };
+  expect(JSON.parse(r.out.join("\n")).rollout).toEqual([failed, { ac: 3, text: "Clients deploy through it" }]);
+  const shown = JSON.parse(status(repo, "show", "x").out.join("\n"));
+  expect(shown.rollout).toEqual([failed, { ac: 3, text: "Clients deploy through it" }]);
+  expect(shown.pendingRollout).toEqual([{ slug: "x", ac: 3, text: "Clients deploy through it" }]);
+  expect(status(repo, "rollout", "x", "AC1", "pass")).toEqual({ code: 1, out: ["error: bad-rollout: AC1 isn't a rollout criterion of x: AC2, AC3"], err: [] });
+  expect(status(repo, "rollout", "x", "AC2").code).toBe(2);
+  expect(status(repo, "rollout", "x", "AC2", "pass", "--quote", "q").code).toBe(2);
+});
+
+test("status show on a stacked feature gathers its units' rollout criteria that still wait", () => {
+  const repo = gitRepo();
+  git(repo, "commit", "-q", "--allow-empty", "-m", "init");
+  expect(status(repo, "init", "f", "--size", "big").code).toBe(0);
+  const unit = (slug: string, n: number, rollout: object[]) => ({ slug, dir: `docs/features/2026-10-21-f/units/${slug}`, size: "big", approvals: {}, pr: null, unitOf: "f", unit: n, rollout });
+  writeRecordFile(repo, "f-api.json", JSON.stringify(unit("f-api", 1, [{ ac: 2, text: "A copy works between environments" }])));
+  writeRecordFile(repo, "f-ui.json", JSON.stringify(unit("f-ui", 2, [{ ac: 3, text: "Clients deploy through it", outcome: "pass", at: "2026-10-25" }])));
+  const shown = JSON.parse(status(repo, "show", "f").out.join("\n"));
+  expect(shown.pendingRollout).toEqual([{ slug: "f-api", ac: 2, text: "A copy works between environments" }]);
+  expect("pendingRollout" in JSON.parse(status(repo, "show", "f-ui").out.join("\n"))).toBe(false);
+});
+
+function ci(cwd: string, deps: PrDeps, ...args: string[]) {
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = run(["ci", ...args], io(out, err, cwd), deps);
+  return { code, out, err };
+}
+
+test("ci evidence prints the runs as one JSON line, exit 0 only for evidence, and a refusal as a refused line", () => {
+  const repo = gitRepo({ ".fbs/config.json": '{"verify": {"ciEvidence": true, "ciWorkflows": ["CI"]}}', ".gitignore": ".fbs/\n" });
+  git(repo, "add", ".gitignore");
+  git(repo, "commit", "-q", "-m", "init");
+  git(repo, "switch", "-q", "-c", "feature/x");
+  expect(status(repo, "init", "x", "--size", "mid").code).toBe(0);
+  const sha = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repo, env: isolatedGitEnv() }).stdout.toString().trim();
+  const record = JSON.parse(readFileSync(join(repo, RECORDS, "x.json"), "utf8"));
+  writeRecordFile(repo, "x.json", JSON.stringify({ ...record, pr: 7, repo: "acme/app", branch: { name: "feature/x", parent: "main", base: sha } }));
+  const runs = (conclusion: string) => ({ "repos/acme/app/actions/runs": { stdout: JSON.stringify({ workflow_runs: [{ id: 1, name: "CI", head_sha: sha, status: "completed", conclusion, html_url: "https://github.com/acme/app/actions/runs/1", created_at: "2026-10-21T10:00:00Z" }] }) } });
+  const green = ci(repo, prDeps(runs("success")).deps, "evidence", "x");
+  expect(green.code).toBe(0);
+  expect(green.out).toHaveLength(1);
+  expect(JSON.parse(green.out[0])).toEqual({ sha, tree: headTreeOf(repo), verdict: "evidence", runs: [{ workflow: "CI", state: "success", url: "https://github.com/acme/app/actions/runs/1" }] });
+  const red = ci(repo, prDeps(runs("failure")).deps, "evidence", "x");
+  expect(red.code).toBe(1);
+  expect(JSON.parse(red.out[0]).verdict).toBe("refused");
+  git(repo, "switch", "-q", "-");
+  expect(ci(repo, prDeps(runs("success")).deps, "evidence", "x")).toEqual({ code: 1, out: ["refused: x's branch feature/x is not checked out; check it out first"], err: [] });
+  expect(ci(repo, prDeps({}).deps, "evidence").code).toBe(2);
+  expect(ci(repo, prDeps({}).deps, "evidence", "x", "--now").code).toBe(2);
+});
+
+function config(cwd: string, ...args: string[]) {
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = run(["config", ...args], io(out, err, cwd));
+  return { code, out, err };
+}
+
+test("config show prints the validated config as one JSON line, defaults filled in, with each key's source", () => {
+  const repo = gitRepo({ ".fbs/config.json": '{"verify": {"suite": "pnpm test --filter api -- --maxWorkers=2", "ciEvidence": true, "ciWorkflows": ["CI"]}}' });
+  const r = config(repo, "show");
+  expect(r.code).toBe(0);
+  expect(r.out).toHaveLength(1);
+  expect(JSON.parse(r.out[0])).toEqual({
+    featuresDir: "docs/features",
+    context: { maxFacts: 25, staleDays: 30 },
+    verify: { suite: "pnpm test --filter api -- --maxWorkers=2", ciEvidence: true, ciWorkflows: ["CI"] },
+    sources: { featuresDir: "default", context: "default", verify: "repo" },
+  });
+  expect(config(repo, "show", "x").code).toBe(2);
+  expectEnvironmentError(config(gitRepo({ ".fbs/config.json": '{"verify": {"ciEvidence": "yes"}}' }), "show"), "verify.ciEvidence must be true or false");
+});
+
+test("the help lists status reconcile and watch-pr's taken-over exit, and status reconcile takes no argument", () => {
+  const out: string[] = [];
+  expect(run(["help"], io(out, []))).toBe(0);
+  expect(out.join("\n")).toContain("status reconcile ");
+  expect(out.join("\n")).toContain("10 taken-over");
+  const err: string[] = [];
+  expect(run(["status", "reconcile", "x"], io([], err, featureRepo()))).toBe(2);
+  expect(err).toEqual(["unknown command: status reconcile x"]);
+});
+
 test("the help lists the branch types", () => {
   const out: string[] = [];
   expect(run(["help"], io(out, []))).toBe(0);
-  expect(out.join("\n")).toContain("branch <slug> [--type <feature|bugfix|hotfix|chore>] [--ticket <id>] [--existing] [--parent <branch>]");
+  expect(out.join("\n")).toContain("branch <slug> [--type <type>] [--ticket <id>] [--existing] [--parent <branch>]");
+  expect(out.join("\n")).toContain("feature, bugfix, hotfix, chore, feat, fix, docs, style, refactor, perf, test, build, ci or revert");
+  expect(out.join("\n")).toContain("branch --types ");
 });
 
 test("branch names the flags --use can't be combined with, instead of an unknown command", () => {
@@ -738,7 +928,7 @@ test("the help lists the PR commands", () => {
   const out: string[] = [];
   expect(run(["help"], io(out, []))).toBe(0);
   const help = out.join("\n");
-  for (const line of ["status pr <slug> <number|url|none>", "watch-pr <slug> [--interval <s>] [--timeout <s>] [--once]", "pr reply <slug> --comment <thread|issue|review>:<id> --body-file <path>", "pr resolve <slug> --thread <id>"]) {
+  for (const line of ["status pr <slug> <number|url|none>", "watch-pr <slug> [--interval <s>] [--timeout <s>] [--once]", "pr reply <slug> --comment <thread|issue|review>:<id> --body-file <path>", "pr comment <slug> --body-file <path>", "pr resolve <slug> --thread <id>"]) {
     expect(help).toContain(line);
   }
   expect(help).toContain("6 conflict");
@@ -967,6 +1157,7 @@ test("watch-pr --once prints the verdict as one JSON line, exits with its code a
     truncated: false,
     newComments: [{ id: 9, key: "issue:9", kind: "issue", threadId: null, author: "ana", bot: false, path: null, line: null, body: "Why?", createdAt: "2026-10-25T10:00:00Z", updatedAt: "2026-10-25T10:00:00Z", edited: false }],
     failingChecks: [],
+    pendingChecks: 0,
     unresolvedThreads: 0,
   });
   expect(calls.every((c) => c.args.includes("owner=acme") && c.args.includes("repo=app"))).toBe(true);
@@ -1042,6 +1233,74 @@ test.each([[["watch-pr"]], [["watch-pr", "x", "--interval", "0"]], [["watch-pr",
   },
 );
 
+/** Run fbs from the Claude Code session `session`, or from none. */
+function inSession(session: string | null, cwd: string, deps: PrDeps, ...args: string[]) {
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = run(args, io(out, err, cwd), deps, { ...REAL_AFK_DEPS, sessionId: () => session });
+  return { code, out, err };
+}
+
+describe("a camp taken over by another session", () => {
+  test("watch-pr exits 10 with taken-over, naming the session, before asking gh, and saves no cursor", () => {
+    const repo = prRepo();
+    expect(inSession("s2", repo, prDeps({}).deps, "camp", "start", "x").code).toBe(0);
+    const { deps, calls } = prDeps({ graphql: { stdout: graphqlAnswer({}) } });
+    const r = inSession("s1", repo, deps, "watch-pr", "x", "--once");
+    expect(r.code).toBe(10);
+    expect(r.out.map((line) => JSON.parse(line))).toEqual([{ verdict: "taken-over", pr: 7, session: "s2" }]);
+    expect(calls).toEqual([]);
+    expect(existsSync(cursorFile(repo))).toBe(false);
+  });
+
+  test("the holding session's watcher, a watcher with no session, and a camp with no session recorded watch as before", () => {
+    const repo = prRepo();
+    const { deps } = prDeps({ graphql: { stdout: graphqlAnswer({ reviewDecision: "REVIEW_REQUIRED" }) } });
+    expect(inSession(null, repo, deps, "camp", "start", "x").code).toBe(0);
+    expect(inSession("s1", repo, deps, "watch-pr", "x", "--once").code).toBe(9);
+    rmSync(cursorFile(repo));
+    expect(inSession("s2", repo, deps, "camp", "start", "x").code).toBe(0);
+    expect(inSession("s2", repo, deps, "watch-pr", "x", "--once").code).toBe(9);
+    rmSync(cursorFile(repo));
+    expect(inSession(null, repo, deps, "watch-pr", "x", "--once").code).toBe(9);
+  });
+
+  test("a camp stopped while its watcher sleeps ends the watch with taken-over and no session; no camp at the start watches as before", () => {
+    const repo = prRepo();
+    const pendingCheck = { __typename: "CheckRun", databaseId: 2, name: "ci", status: "IN_PROGRESS", conclusion: null };
+    const commits = { nodes: [{ commit: { oid: PR_HEAD, statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, nodes: [pendingCheck] } } } }] };
+    const { deps } = prDeps({ graphql: { stdout: graphqlAnswer({ commits }) } });
+    expect(inSession("s1", repo, deps, "watch-pr", "x", "--once").code).toBe(5);
+    inSession("s1", repo, deps, "camp", "start", "x");
+    let naps = 0;
+    const stopCamp = () => {
+      if (++naps > 1) throw new Error("the watcher slept again after its camp was stopped");
+      rmSync(join(repo, ".git", "fbs", "pr", "x.camp"));
+    };
+    const r = inSession("s1", repo, { ...deps, sleep: stopCamp }, "watch-pr", "x", "--interval", "30");
+    expect(r.code).toBe(10);
+    expect(JSON.parse(r.out[0])).toEqual({ verdict: "taken-over", pr: 7, session: null });
+  });
+
+  test("a watcher whose camp is taken over while it sleeps exits at its next poll", () => {
+    const repo = prRepo();
+    const pendingCheck = { __typename: "CheckRun", databaseId: 2, name: "ci", status: "IN_PROGRESS", conclusion: null };
+    const commits = { nodes: [{ commit: { oid: PR_HEAD, statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, nodes: [pendingCheck] } } } }] };
+    const { deps, calls } = prDeps({ graphql: { stdout: graphqlAnswer({ commits }) } });
+    inSession("s1", repo, deps, "camp", "start", "x");
+    let naps = 0;
+    const takeOver = () => {
+      if (++naps > 1) throw new Error("the watcher slept again after the takeover");
+      inSession("s2", repo, deps, "camp", "start", "x");
+    };
+    const r = inSession("s1", repo, { ...deps, sleep: takeOver }, "watch-pr", "x", "--interval", "30");
+    expect(r.code).toBe(10);
+    expect(JSON.parse(r.out[0])).toEqual({ verdict: "taken-over", pr: 7, session: "s2" });
+    expect(calls.filter((call) => call.args.includes("graphql"))).toHaveLength(1);
+    expect(JSON.parse(r.err.at(-1) as string)).toMatchObject({ poll: 2, verdict: "taken-over", session: "s2" });
+  });
+});
+
 test("watch-pr with a malformed cursor is an environment error", () => {
   const repo = prRepo();
   mkdirSync(dirname(cursorFile(repo)), { recursive: true });
@@ -1103,6 +1362,34 @@ test("pr reply with a missing body file or a failing gh is an environment error"
   const failed = prCommand(repo, broken, "pr", "reply", "x", "--comment", "thread:5", "--body-file", "reply.md");
   expect(failed.code).toBe(2);
   expect(failed.err[0]).toContain("Bad credentials");
+});
+
+test("pr comment posts a new top-level PR comment from the body file and marks it seen, so a watch doesn't wake on it", () => {
+  const repo = prRepo();
+  writeFileSync(join(repo, "comment.md"), "@alex could you review the retry change?\n");
+  const { deps, calls } = prDeps({
+    "repos/acme/app/issues/7/comments": { stdout: JSON.stringify({ id: 11, updated_at: "2026-10-25T11:00:00Z", html_url: "https://github.com/c/11" }) },
+    graphql: { stdout: graphqlAnswer({ state: "CLOSED" }) },
+  });
+  const r = prCommand(repo, deps, "pr", "comment", "x", "--body-file", "comment.md");
+  expect(r.code).toBe(0);
+  expect(JSON.parse(r.out.join("\n"))).toEqual({ kind: "issue", id: 11, updatedAt: "2026-10-25T11:00:00Z", url: "https://github.com/c/11" });
+  expect(calls[0].args).toEqual(["api", "--method", "POST", "repos/acme/app/issues/7/comments", "--input", expect.any(String)]);
+  expect(JSON.parse(calls[0].input ?? "")).toEqual({ body: "@alex could you review the retry change?\n" });
+  expect(prCommand(repo, deps, "watch-pr", "x", "--once").code).toBe(4);
+  expect(JSON.parse(readFileSync(cursorFile(repo), "utf8")).comments).toEqual({ "issue:11": "2026-10-25T11:00:00Z" });
+});
+
+test("pr comment refuses an empty body and a feature without a PR, and needs --body-file", () => {
+  const repo = prRepo();
+  writeFileSync(join(repo, "empty.md"), "\n");
+  writeFileSync(join(repo, "comment.md"), "ok");
+  const { deps, calls } = prDeps({});
+  expect(prCommand(repo, deps, "pr", "comment", "x", "--body-file", "empty.md").out[0]).toStartWith("error: bad-body: ");
+  expect(prCommand(featureRepo(), deps, "pr", "comment", "x", "--body-file", "comment.md").out[0]).toStartWith("error: no-pr: ");
+  expect(prCommand(repo, deps, "pr", "comment", "x").err[0]).toStartWith("unknown command: pr comment");
+  expect(prCommand(repo, deps, "pr", "comment", "x", "--body-file", "comment.md", "--comment", "issue:9").code).toBe(2);
+  expect(calls).toEqual([]);
 });
 
 test("pr resolve resolves a thread of the PR", () => {
@@ -1201,6 +1488,15 @@ test("bin/fbs passes the gh, git and claude it resolves as leading flags", () =>
   expect(result.stdout.toString().trimEnd().split("\n")).toEqual([`--fbs-git=${join(tools, "git")}`, `--fbs-gh=${join(tools, "gh")}`, `--fbs-claude=${join(tools, "claude")}`, "watch-pr", "x"]);
 });
 
+test("bin/fbs passes the Claude Code session id as a leading flag when it has one", () => {
+  const dir = tempDir();
+  copyFileSync(join(import.meta.dir, "..", "bin", "fbs"), join(dir, "fbs"));
+  writeFileSync(join(dir, "fbs-bin"), '#!/bin/sh\nprintf "%s\\n" "$@"\n');
+  for (const file of [join(dir, "fbs"), join(dir, "fbs-bin")]) chmodSync(file, 0o755);
+  const result = Bun.spawnSync([join(dir, "fbs"), "land", "x"], { env: { PATH: "/usr/bin:/bin", CLAUDE_CODE_SESSION_ID: "s1" }, stdout: "pipe", stderr: "pipe" });
+  expect(result.stdout.toString().trimEnd().split("\n").slice(-3)).toEqual(["--fbs-session=s1", "land", "x"]);
+});
+
 test("--fbs-claude=<path> is the claude polish check runs", () => {
   const dir = tempDir();
   const claude = join(dir, "claude");
@@ -1213,21 +1509,24 @@ test("--fbs-claude=<path> is the claude polish check runs", () => {
 
 describe("takeToolFlags", () => {
   test("splits off a leading --fbs-git=<path>", () => {
-    expect(takeToolFlags(["--fbs-git=/x/git", "context", "check"])).toEqual({ git: "/x/git", gh: null, claude: null, argv: ["context", "check"] });
+    expect(takeToolFlags(["--fbs-git=/x/git", "context", "check"])).toEqual({ git: "/x/git", gh: null, claude: null, session: null, argv: ["context", "check"] });
   });
   test("splits off leading --fbs-git and --fbs-gh in either order", () => {
-    expect(takeToolFlags(["--fbs-git=/x/git", "--fbs-gh=/x/gh", "watch-pr", "x"])).toEqual({ git: "/x/git", gh: "/x/gh", claude: null, argv: ["watch-pr", "x"] });
-    expect(takeToolFlags(["--fbs-gh=/x/gh", "--fbs-git=/x/git", "help"])).toEqual({ git: "/x/git", gh: "/x/gh", claude: null, argv: ["help"] });
-    expect(takeToolFlags(["--fbs-gh=/x/gh", "help"])).toEqual({ git: null, gh: "/x/gh", claude: null, argv: ["help"] });
+    expect(takeToolFlags(["--fbs-git=/x/git", "--fbs-gh=/x/gh", "watch-pr", "x"])).toEqual({ git: "/x/git", gh: "/x/gh", claude: null, session: null, argv: ["watch-pr", "x"] });
+    expect(takeToolFlags(["--fbs-gh=/x/gh", "--fbs-git=/x/git", "help"])).toEqual({ git: "/x/git", gh: "/x/gh", claude: null, session: null, argv: ["help"] });
+    expect(takeToolFlags(["--fbs-gh=/x/gh", "help"])).toEqual({ git: null, gh: "/x/gh", claude: null, session: null, argv: ["help"] });
   });
   test("splits off a leading --fbs-claude=<path> with the others", () => {
-    expect(takeToolFlags(["--fbs-git=/x/git", "--fbs-gh=/x/gh", "--fbs-claude=/x/claude", "polish", "check"])).toEqual({ git: "/x/git", gh: "/x/gh", claude: "/x/claude", argv: ["polish", "check"] });
+    expect(takeToolFlags(["--fbs-git=/x/git", "--fbs-gh=/x/gh", "--fbs-claude=/x/claude", "polish", "check"])).toEqual({ git: "/x/git", gh: "/x/gh", claude: "/x/claude", session: null, argv: ["polish", "check"] });
+  });
+  test("splits off a leading --fbs-session=<id>, which the compiled CLI can't read from its emptied environment", () => {
+    expect(takeToolFlags(["--fbs-gh=/x/gh", "--fbs-session=s1", "land", "x"])).toEqual({ git: null, gh: "/x/gh", claude: null, session: "s1", argv: ["land", "x"] });
   });
   test("leaves argv alone without the flags, or when they aren't first, are empty or repeat", () => {
-    expect(takeToolFlags(["context", "check"])).toEqual({ git: null, gh: null, claude: null, argv: ["context", "check"] });
-    expect(takeToolFlags(["context", "--fbs-git=/x/git"])).toEqual({ git: null, gh: null, claude: null, argv: ["context", "--fbs-git=/x/git"] });
-    expect(takeToolFlags(["--fbs-git="])).toEqual({ git: null, gh: null, claude: null, argv: ["--fbs-git="] });
-    expect(takeToolFlags(["--fbs-gh=/a", "--fbs-gh=/b"])).toEqual({ git: null, gh: "/a", claude: null, argv: ["--fbs-gh=/b"] });
+    expect(takeToolFlags(["context", "check"])).toEqual({ git: null, gh: null, claude: null, session: null, argv: ["context", "check"] });
+    expect(takeToolFlags(["context", "--fbs-git=/x/git"])).toEqual({ git: null, gh: null, claude: null, session: null, argv: ["context", "--fbs-git=/x/git"] });
+    expect(takeToolFlags(["--fbs-git="])).toEqual({ git: null, gh: null, claude: null, session: null, argv: ["--fbs-git="] });
+    expect(takeToolFlags(["--fbs-gh=/a", "--fbs-gh=/b"])).toEqual({ git: null, gh: "/a", claude: null, session: null, argv: ["--fbs-gh=/b"] });
   });
 });
 
@@ -1249,13 +1548,14 @@ describe("work units", () => {
     return repo;
   }
 
-  test("status init --unit-of prints the unit record, numbered next or as --unit says", () => {
+  test("status init --unit-of prints the unit record, numbered next or as --unit says, a taken number shifting the units up", () => {
     const repo = unitRepo();
     const r = status(repo, "init", "f-api", "--unit-of", "f");
     expect(r.code).toBe(0);
     expect(JSON.parse(r.out.join("\n"))).toEqual({ slug: "f-api", dir: `${DIR}/units/f-api`, size: "big", approvals: {}, pr: null, unitOf: "f", unit: 1 });
     expect(JSON.parse(status(repo, "init", "f-ui", "--unit-of", "f", "--unit", "2").out.join("\n")).unit).toBe(2);
-    expect(status(repo, "init", "f-x", "--unit-of", "f", "--unit", "2")).toEqual({ code: 1, out: ["error: unit-taken: unit 2 of f is f-ui"], err: [] });
+    expect(JSON.parse(status(repo, "init", "f-x", "--unit-of", "f", "--unit", "2").out.join("\n")).unit).toBe(2);
+    expect(JSON.parse(readFileSync(join(repo, RECORDS, "f-ui.json"), "utf8")).unit).toBe(3);
     expect(status(repo, "init", "f-y", "--unit-of", "f-api")).toEqual({ code: 1, out: [expect.stringMatching(/^error: is-unit: /)], err: [] });
   });
 
@@ -1284,7 +1584,7 @@ describe("work units", () => {
     expect(JSON.parse(status(repo, "show", "f-api").out.join("\n")).approvals.design.current).toBe(false);
   });
 
-  test("status show on a feature lists its units in order with branch, PR, stamp and landed", () => {
+  test("status show on a feature lists its units in order with branch, PR, stamp and landed, marking an independent one", () => {
     const repo = unitRepo();
     expect(JSON.parse(status(repo, "show", "f").out.join("\n")).units).toBeUndefined();
     status(repo, "init", "f-ui", "--unit-of", "f", "--unit", "2");
@@ -1296,10 +1596,10 @@ describe("work units", () => {
     expect(stamp(repo, "set", "f-api", "--verdict", verdict).code).toBe(0);
     const record = JSON.parse(readFileSync(join(repo, RECORDS, "f-ui.json"), "utf8"));
     const landed = { pr: 8, repo: "acme/app", commit: "c".repeat(40), at: "2026-10-25" };
-    writeRecordFile(repo, "f-ui.json", JSON.stringify({ ...record, branch: { name: "feature/f-ui", parent: "feature/f-api", base: "d".repeat(40) }, landed }));
+    writeRecordFile(repo, "f-ui.json", JSON.stringify({ ...record, branch: { name: "feature/f-ui", parent: "main", base: "d".repeat(40) }, landed, independent: true }));
     expect(JSON.parse(status(repo, "show", "f").out.join("\n")).units).toEqual([
       { slug: "f-api", unit: 1, branch: null, pr: null, stamp: { current: true }, landed: false },
-      { slug: "f-ui", unit: 2, branch: "feature/f-ui", pr: null, stamp: null, landed: true },
+      { slug: "f-ui", unit: 2, branch: "feature/f-ui", pr: null, stamp: null, landed: true, independent: true },
     ]);
     writeFileSync(join(repo, DIR, "design.md"), `${DESIGN}edited\n`);
     git(repo, "commit", "-q", "-am", "edit design");

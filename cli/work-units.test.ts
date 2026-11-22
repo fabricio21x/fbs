@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { acceptanceCriteria, parseWorkUnits, workUnitProblems } from "./work-units";
+import { acceptanceCriteria, criterionBlocks, parseWorkUnits, unitSection, workUnitProblems } from "./work-units";
 
 const SPEC = [
   "# Booking sync",
@@ -29,15 +29,51 @@ const GOOD = design(unit("U1: Booking time", "AC1", "none"), unit("U2: Reminders
 
 test("the spec's acceptance criteria are the checkbox lines under its section, struck-through ones dropped", () => {
   expect(acceptanceCriteria(SPEC)).toEqual([
-    { text: "A member sees the booking time", dropped: false },
-    { text: "The host gets a reminder", dropped: false },
-    { text: "The owner can turn reminders off", dropped: false },
+    { text: "A member sees the booking time", dropped: false, rollout: false },
+    { text: "The host gets a reminder", dropped: false, rollout: false },
+    { text: "The owner can turn reminders off", dropped: false, rollout: false },
   ]);
   expect(acceptanceCriteria("## Acceptance criteria\n- [ ] ~~Old one~~ (dropped 2026-10-28)\n- [x] Kept, with ~~a struck word~~\n")).toEqual([
-    { text: "~~Old one~~ (dropped 2026-10-28)", dropped: true },
-    { text: "Kept, with ~~a struck word~~", dropped: false },
+    { text: "~~Old one~~ (dropped 2026-10-28)", dropped: true, rollout: false },
+    { text: "Kept, with ~~a struck word~~", dropped: false, rollout: false },
   ]);
   expect(acceptanceCriteria("## Scope\n- [ ] x\n")).toEqual([]);
+});
+
+test("a criterion that starts with (rollout) is checked after the deploy; struck through, it is dropped instead", () => {
+  expect(acceptanceCriteria("## Acceptance criteria\n- [ ] (rollout) A copy works between environments\n- [ ] (Rollout) Clients deploy through it\n- [ ] A note (rollout) later\n- [ ] ~~(rollout) Old~~\n")).toEqual([
+    { text: "(rollout) A copy works between environments", dropped: false, rollout: true },
+    { text: "(Rollout) Clients deploy through it", dropped: false, rollout: true },
+    { text: "A note (rollout) later", dropped: false, rollout: false },
+    { text: "~~(rollout) Old~~", dropped: true, rollout: false },
+  ]);
+});
+
+test("a unit's section is its heading and lines up to the next unit or section, without trailing blank lines; null when missing", () => {
+  expect(unitSection(GOOD, 1)).toBe(unit("U1: Booking time", "AC1", "none"));
+  expect(unitSection(GOOD, 2)).toBe(unit("U2: Reminders", "AC2, AC3", "U1"));
+  expect(unitSection(GOOD, 3)).toBeNull();
+  expect(unitSection(GOOD, 9)).toBeNull();
+  expect(unitSection("# Design\n", 1)).toBeNull();
+});
+
+test("a unit's section keeps its fenced blocks and comments as written, and a heading inside a fence doesn't end it", () => {
+  const withFence = (field: string) => design(`${unit("U1: Booking time", "AC1", "none")}\n\`\`\`ts\n### U2: not a heading\ninterface Booking { ${field}: string }\n\`\`\`\n<!-- keep the zone -->`, unit("U2: Reminders", "AC2, AC3", "U1"));
+  expect(unitSection(withFence("at"), 1)).toContain("### U2: not a heading\ninterface Booking { at: string }");
+  expect(unitSection(withFence("at"), 1)).toEndWith("<!-- keep the zone -->");
+  expect(unitSection(withFence("at"), 1)).not.toBe(unitSection(withFence("startsAt"), 1));
+  expect(unitSection(withFence("at"), 2)).toBe(unitSection(withFence("startsAt"), 2));
+});
+
+test("a duplicate unit heading has no section, and a renamed or renumbered heading changes it", () => {
+  expect(unitSection(design(unit("U1: Booking time", "AC1", "none"), unit("U1: Again", "AC2, AC3", "none")), 1)).toBeNull();
+  expect(unitSection(design(unit("U1: Booking times", "AC1", "none")), 1)).not.toBe(unitSection(GOOD, 1));
+  expect(unitSection(design(unit("U2: Booking time", "AC1", "none")), 1)).toBeNull();
+});
+
+test("a criterion's block is its line and every line under it up to the next criterion", () => {
+  const spec = "## Acceptance criteria\n<!-- intro -->\n- [ ] A member sees the booking time\n  - in their own zone\n\n- [ ] The host gets a reminder\n## Facts\nNone\n";
+  expect(criterionBlocks(spec)).toEqual(["- [ ] A member sees the booking time\n  - in their own zone", "- [ ] The host gets a reminder"]);
 });
 
 const DROPPED_SPEC = SPEC.replace("- [x] The host gets a reminder", "- [x] ~~The host gets a reminder~~");

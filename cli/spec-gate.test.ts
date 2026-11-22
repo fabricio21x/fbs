@@ -353,8 +353,10 @@ test("a fact's source must be the user on a date, the spec, a URL or a file path
     "- A (docs/features/x/spec.md:47)",
     "- A (src/a.ts:3-9)",
     "- A (https://example.com/docs)",
+    "- A (user, 2026-10-22; replaces the old limit)",
+    "- A (CLAUDE.md; the billing section)",
   ])
     expect(facts(line).unsourced).toEqual([]);
-  for (const line of ["- Runs only on localhost (single user)", "- A (the spec)", "- A (user)", "- A (Stripe docs)", "- A (user, 2026-10-22)."])
+  for (const line of ["- Runs only on localhost (single user)", "- A (the spec)", "- A (user)", "- A (Stripe docs)", "- A (user, 2026-10-22).", "- A (user; 2026-10-22)", "- A (git log main)"])
     expect(facts(line).unsourced).toHaveLength(1);
 });

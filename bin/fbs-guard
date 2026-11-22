@@ -1,5 +1,5 @@
 #!/bin/sh
-# The guard hook runs on every tool call and prompt in every session with fbs enabled, so it must never depend on Bun to allow: only a running camp, an open fbs PR, an afk run or a pending land request switches it on.
+# The guard hook runs on every tool call and prompt in every session with fbs enabled, so it must never depend on Bun to allow: only a running camp, an open fbs PR, an afk run, a pending land request or a token switches it on.
 input="$(cat)"
 cwd="$(printf '%s' "$input" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
 [ -n "$cwd" ] && [ -d "$cwd" ] || cwd="$PWD"
@@ -13,10 +13,18 @@ open_pr() {
   done
   return 1
 }
+# Loose on purpose: the CLI decides; these only keep Bun from starting for prompts that can't ask to rewrite a branch.
+rewrite_words='amend[a-z]*|[a-z]*squash[a-z]*|rebas[a-z]*|reword[a-z]*|rewrit[a-z]*|force[a-z-]*|fold|folds|folded|folding|push|pushed|pushing'
+scheduled_ask() {
+  printf '%s' "$input" | grep -qE '"tool_name"[[:space:]]*:[[:space:]]*"(CronCreate|ScheduleWakeup|RemoteTrigger|Skill)"' &&
+    ls "$common"/fbs/features/*.json >/dev/null 2>&1 && printf '%s' "$input" | grep -qiwE "land|merge|ship|yes|yep|yeah|y|ok|okay|sure|go|lgtm|$rewrite_words"
+}
 case "$1" in
   --prompt) ;;
-  --reply) [ -f "$common/fbs/land/request.json" ] || exit 0 ;;
-  *) ls "$common"/fbs/pr/*.camp >/dev/null 2>&1 || open_pr || afk_run || exit 0 ;;
+  # A prompt starts Bun only to answer or drop a land request or token, or when it may ask to land or rewrite while an fbs PR is open.
+  --reply) [ -f "$common/fbs/land/request.json" ] || ls "$common"/fbs/land/*.token >/dev/null 2>&1 || { printf '%s' "$input" | grep -qiwE "land|merge|ship|$rewrite_words" && open_pr; } || exit 0 ;;
+  # A scheduled prompt that asks to land or rewrite is checked in any fbs repo, since it fires later, when a PR may be open.
+  *) ls "$common"/fbs/pr/*.camp >/dev/null 2>&1 || open_pr || afk_run || scheduled_ask || exit 0 ;;
 esac
 dir="$(dirname "$0")"
 printf '%s' "$input" | "$dir/fbs" guard "$@"

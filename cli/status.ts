@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join, posix } from "node:path";
-import { hasGitSegment, projectConfig } from "./config";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, posix } from "node:path";
+import { type FbsConfig, hasGitSegment, projectConfig } from "./config";
 import { isValidDate } from "./date";
 import { gitCommonDir, isIgnored, rootFor } from "./git";
 import { isRepoName } from "./github";
@@ -27,6 +27,18 @@ export interface Stamp {
   verifiedTree?: string;
 }
 
+/**
+ * A spec criterion marked `(rollout)`: verify passed without its evidence, so it is checked after the deploy. `outcome`,
+ * `at` and `note` are what the user reported then; unset while it waits.
+ */
+export interface RolloutCriterion {
+  ac: number;
+  text: string;
+  outcome?: "pass" | "fail";
+  at?: string;
+  note?: string;
+}
+
 export interface FeatureRecord {
   slug: string;
   dir: string;
@@ -45,6 +57,10 @@ export interface FeatureRecord {
   unitOf?: string;
   /** The unit's place in its feature's stack, from 1; set with `unitOf`. */
   unit?: number;
+  /** The rollout criteria the last stamp passed without evidence, lowest first; kept when an approval clears the stamp. */
+  rollout?: RolloutCriterion[];
+  /** A unit based on the default branch instead of the unit below, as its design allows; it lands on its own, outside the stack's bottom-up order. */
+  independent?: true;
 }
 
 /** A work unit: one PR of a Big feature's stack. */
@@ -125,8 +141,13 @@ export type StatusErrorCode =
   | "is-unit"
   | "not-big"
   | "design-not-approved"
-  | "unit-taken"
-  | "bad-unit";
+  | "bad-unit"
+  | "bad-rollout"
+  | "not-unit"
+  | "breaks-stack"
+  | "open-pr"
+  | "bad-target"
+  | "has-landed";
 
 export class StatusError extends Error {
   readonly code: StatusErrorCode;
@@ -198,40 +219,136 @@ export function initFeature(cwd: string, slug: string, size: string, today: stri
   if (!SIZES.includes(size)) throw new StatusError("bad-size", `${JSON.stringify(size)} must be one of ${SIZES.join(", ")}`);
   assertToday(today);
 
+  excludeLocalDocs(cwd);
   const dir = posix.join(projectConfig(cwd).featuresDir, `${today}-${slug}`);
   return createRecord(cwd, { slug, dir, size: size as Size, approvals: {}, pr: null });
 }
 
 /**
  * Record work unit `slug` of a Big feature with a current design approval, numbered next in its stack unless `unit`
- * names a free number; the number must be one the design's Work units list.
+ * names a number; a taken one is made free by shifting the units at and above it up one. Every number must be one the
+ * design's Work units list.
  */
 export function initUnit(cwd: string, slug: string, featureSlug: string, unit?: number): UnitRecord {
   assertSlug(slug);
   assertSlug(featureSlug);
-  if (unit !== undefined && !(Number.isInteger(unit) && unit >= 1)) throw new StatusError("bad-unit", `${unit} must be a positive integer`);
+  if (unit !== undefined) assertUnitNumber(unit);
   if (!existsSync(recordPath(cwd, featureSlug))) throw new StatusError("missing", `no feature ${featureSlug}`);
   // Under the feature's lock, so two units never take the same number and the design approval holds while it's checked.
   return withLock(cwd, featureSlug, () => {
     const feature = readFeature(cwd, featureSlug);
     if (isUnit(feature)) throw new StatusError("is-unit", `${featureSlug} is unit ${feature.unit} of ${feature.unitOf}; units belong to a feature`);
     if (feature.size !== "big") throw new StatusError("not-big", `${featureSlug} is ${feature.size}; only a big feature splits into units`);
-    if (!feature.approvals.design) throw new StatusError("design-not-approved", `approve the design of ${featureSlug} before recording its units`);
-    if (!isApprovalCurrent(cwd, feature, "design")) throw new StatusError("design-not-approved", `${docPath(cwd, feature, "design")} changed since its approval; approve it again`);
+    const planned = approvedWorkUnits(cwd, feature);
     const units = featureUnits(cwd, featureSlug);
     const number = unit ?? Math.max(0, ...units.map((u) => u.unit)) + 1;
-    const planned = parseWorkUnits(readFileSync(docFile(cwd, feature, "design"), "utf8")).units ?? [];
-    if (!planned.some((u) => u.number === number)) throw new StatusError("bad-unit", `${docPath(cwd, feature, "design")} lists no U${number} under Work units; amend the design to add it first`);
-    const taken = units.find((u) => u.unit === number);
-    if (taken !== undefined) throw new StatusError("unit-taken", `unit ${number} of ${featureSlug} is ${taken.slug}`);
     const rec: UnitRecord = { slug, dir: posix.join(feature.dir, "units", slug), size: "big", approvals: {}, pr: null, unitOf: featureSlug, unit: number };
+    const taken = units.some((u) => u.unit === number);
+    const shifted = units.map((u) => (taken && u.unit >= number ? { ...u, unit: u.unit + 1 } : u));
+    for (const n of [number, ...shifted.map((u) => u.unit)]) assertPlanned(cwd, feature, planned, n);
+    assertStackKept(feature, units, [...shifted, rec], planned);
     createRecord(cwd, rec);
+    writeRenumbered(cwd, units, shifted);
     return rec;
   });
 }
 
+/**
+ * Give unit `slug` number `to`, shifting the units between its old and new number one place toward the old; `to` must
+ * be listed in the feature's approved design. Returns the feature's units, lowest first.
+ */
+export function moveUnit(cwd: string, slug: string, to: number): UnitRecord[] {
+  assertUnitNumber(to);
+  const unit = readFeature(cwd, slug);
+  if (!isUnit(unit)) throw new StatusError("not-unit", `${slug} isn't a work unit`);
+  return withLock(cwd, unit.unitOf, () => {
+    const feature = readFeature(cwd, unit.unitOf);
+    const planned = approvedWorkUnits(cwd, feature);
+    assertPlanned(cwd, feature, planned, to);
+    const units = featureUnits(cwd, unit.unitOf);
+    const from = (units.find((u) => u.slug === slug) as UnitRecord).unit;
+    const place = (n: number) => (n === from ? to : from < to && n > from && n <= to ? n - 1 : to < from && n >= to && n < from ? n + 1 : n);
+    const moved = units.map((u) => ({ ...u, unit: place(u.unit) }));
+    assertStackKept(feature, units, moved, planned);
+    writeRenumbered(cwd, units, moved);
+    return moved.sort((a, b) => a.unit - b.unit);
+  });
+}
+
+function assertUnitNumber(n: number): void {
+  if (!(Number.isInteger(n) && n >= 1)) throw new StatusError("bad-unit", `${n} must be a positive integer`);
+}
+
+/** The feature's design Work units, refused unless its approval is current. */
+function approvedWorkUnits(cwd: string, feature: FeatureRecord): WorkUnit[] {
+  if (!feature.approvals.design) throw new StatusError("design-not-approved", `approve the design of ${feature.slug} before recording its units`);
+  if (!isApprovalCurrent(cwd, feature, "design")) throw new StatusError("design-not-approved", `${docPath(cwd, feature, "design")} changed since its approval; approve it again`);
+  return parseWorkUnits(readFileSync(docFile(cwd, feature, "design"), "utf8")).units ?? [];
+}
+
+function assertPlanned(cwd: string, feature: FeatureRecord, planned: WorkUnit[], n: number): void {
+  if (!planned.some((u) => u.number === n)) throw new StatusError("bad-unit", `${docPath(cwd, feature, "design")} lists no U${n} under Work units; amend the design to add it first`);
+}
+
+/** The slug of what `unit` stacks on among `units`: the nearest lower unit that isn't independent, else the feature. */
+function chainBelow(feature: FeatureRecord, units: UnitRecord[], unit: UnitRecord): string {
+  const lower = units.filter((u) => u.unit < unit.unit && !u.independent).sort((a, b) => b.unit - a.unit);
+  return lower[0]?.slug ?? feature.slug;
+}
+
+/**
+ * Refuse a renumbering that would put another unit below an unlanded unit whose branch was cut from the one there now, or
+ * leave an unlanded independent unit on a number the approved design doesn't let stand apart.
+ */
+function assertStackKept(feature: FeatureRecord, before: UnitRecord[], after: UnitRecord[], planned: WorkUnit[]): void {
+  for (const unit of after) {
+    const old = before.find((u) => u.slug === unit.slug);
+    if (old === undefined || unit.landed !== undefined || unit.independent || unit.branch === undefined) continue;
+    const was = chainBelow(feature, before, old);
+    const will = chainBelow(feature, after, unit);
+    if (was === will) continue;
+    const pr = unit.pr === null ? "" : ` (PR #${unit.pr})`;
+    throw new StatusError("breaks-stack", `${unit.slug}'s branch ${unit.branch.name}${pr} was cut from ${was}, but this would put ${will} below it; renumber only units above ${unit.slug}, or land it first`);
+  }
+  for (const unit of after) {
+    const problems = unit.independent && unit.landed === undefined ? independenceProblems(unit, after, planned) : [];
+    if (problems.length > 0) throw new StatusError("breaks-stack", `${unit.slug} is independent, but as U${unit.unit}: ${problems.join(", and ")}; number it elsewhere, or put it back in the stack first`);
+  }
+}
+
+/**
+ * Why the design's Work units, `planned`, don't let `unit` stand apart from the stack with `units` numbered as they are:
+ * it depends on a unit that hasn't landed, a later unit that hasn't landed depends on it, or no unit of the stack is
+ * below it. Empty when they do, or when `planned` is empty because the design can't be read here.
+ */
+export function independenceProblems(unit: UnitRecord, units: UnitRecord[], planned: WorkUnit[]): string[] {
+  if (planned.length === 0) return [];
+  const n = unit.unit;
+  const landed = (number: number) => units.find((u) => u.unit === number)?.landed !== undefined;
+  const own = planned.find((entry) => entry.number === n);
+  if (own === undefined) return [`the design lists no U${n}`];
+  const problems = own.dependsOn.filter((dep) => !landed(dep)).map((dep) => `U${n} depends on U${dep}, which hasn't landed`);
+  for (const later of planned) if (later.number > n && later.dependsOn.includes(n) && !landed(later.number)) problems.push(`U${later.number} depends on U${n}`);
+  if (!units.some((u) => u.unit < n && !u.independent)) problems.push(`no unit of the stack is below U${n}`);
+  return problems;
+}
+
+/** Why an unlanded independent unit can't stand apart any more, as land and sync say it; null when it can. */
+export function independenceProblem(cwd: string, unit: UnitRecord): string | null {
+  if (!unit.independent || unit.landed !== undefined) return null;
+  const problems = independenceProblems(unit, featureUnits(cwd, unit.unitOf), plannedUnits(cwd, unit));
+  if (problems.length === 0) return null;
+  return `${unit.slug} is independent, but ${problems.join(", and ")}; put it back in the stack (fbs branch ${unit.slug} --parent <the branch of the unit below>, once it has no PR), or amend the design`;
+}
+
+function writeRenumbered(cwd: string, before: UnitRecord[], after: UnitRecord[]): void {
+  for (const unit of after) {
+    if (before.find((u) => u.slug === unit.slug)?.unit !== unit.unit) writeRecord(cwd, unit.slug, unit);
+  }
+}
+
 /** Reserve the record's slug, write it and make its dir; a failure leaves neither behind. */
-function createRecord<T extends FeatureRecord>(cwd: string, rec: T): T {
+export function createRecord<T extends FeatureRecord>(cwd: string, rec: T): T {
   const root = rootFor(cwd, `${rec.dir}/`);
   if (existsSync(join(root, rec.dir))) throw new StatusError("exists", `${rec.dir} already exists`);
   const path = recordPath(cwd, rec.slug);
@@ -265,7 +382,7 @@ export function readFeature(cwd: string, slug: string): FeatureRecord {
     throw invalid((e as Error).message.split("\n")[0]);
   }
   if (!isObject(raw)) throw invalid("expected a JSON object");
-  const unknownKey = Object.keys(raw).find((key) => !["slug", "dir", "size", "approvals", "pr", "unitOf", "unit", "repo", "stamp", "landed", "branch", "ticket"].includes(key));
+  const unknownKey = Object.keys(raw).find((key) => !["slug", "dir", "size", "approvals", "pr", "unitOf", "unit", "independent", "repo", "stamp", "landed", "branch", "ticket", "rollout"].includes(key));
   if (unknownKey !== undefined) throw invalid(`unknown field ${unknownKey}`);
   if (raw.slug !== slug) throw invalid(`slug ${JSON.stringify(raw.slug)} does not match the file name`);
   if (typeof raw.size !== "string" || !SIZES.includes(raw.size)) throw invalid(`unknown size ${JSON.stringify(raw.size)}`);
@@ -276,6 +393,7 @@ export function readFeature(cwd: string, slug: string): FeatureRecord {
   if ((raw.unitOf === undefined) !== (raw.unit === undefined)) throw invalid("unitOf and unit go together");
   if (raw.unitOf !== undefined && (typeof raw.unitOf !== "string" || !SLUG.test(raw.unitOf) || raw.unitOf === slug)) throw invalid("unitOf must be another feature's slug");
   if (raw.unit !== undefined && (!Number.isInteger(raw.unit) || (raw.unit as number) < 1)) throw invalid("unit must be a positive integer");
+  if (raw.independent !== undefined && (raw.independent !== true || raw.unitOf === undefined)) throw invalid("independent must be true, and only on a unit");
 
   const approvals: Partial<Record<DocKind, Approval>> = {};
   for (const [kind, approval] of Object.entries(raw.approvals)) {
@@ -289,10 +407,12 @@ export function readFeature(cwd: string, slug: string): FeatureRecord {
     approvals,
     pr: raw.pr as number | null,
     ...(typeof raw.unitOf === "string" && { unitOf: raw.unitOf, unit: raw.unit as number }),
+    ...(raw.independent === true && { independent: true as const }),
     ...(typeof raw.repo === "string" && { repo: raw.repo }),
     ...(raw.landed !== undefined && { landed: readLanded(raw.landed, invalid) }),
     ...(raw.branch !== undefined && { branch: readBranch(raw.branch, invalid) }),
     ...(raw.ticket !== undefined && { ticket: readTicket(raw.ticket, invalid) }),
+    ...(raw.rollout !== undefined && { rollout: readRollout(raw.rollout, invalid) }),
   };
   if (raw.stamp === undefined) return rec;
 
@@ -311,6 +431,21 @@ export function readFeature(cwd: string, slug: string): FeatureRecord {
   const verdictSha256 = typeof stamp.verdictSha256 === "string" && { verdictSha256: stamp.verdictSha256 };
   const verifiedTree = typeof stamp.verifiedTree === "string" && { verifiedTree: stamp.verifiedTree };
   return { ...rec, stamp: { tree: stamp.tree, at: stamp.at, verdict: "pass", criteria: stamp.criteria as number, evidence: stamp.evidence, ...verdictSha256, ...verifiedTree } };
+}
+
+function readRollout(criteria: unknown, invalid: (reason: string) => RecordError): RolloutCriterion[] {
+  const shape = "rollout must be a list of { ac, text, outcome?, at?, note? }, outcome and at together, note only with them";
+  if (!Array.isArray(criteria)) throw invalid(shape);
+  return criteria.map((item) => {
+    if (!isObject(item) || !["ac,text", "ac,at,outcome,text", "ac,at,note,outcome,text"].includes(Object.keys(item).sort().join())) throw invalid(shape);
+    if (!Number.isInteger(item.ac) || (item.ac as number) < 1) throw invalid("rollout ac must be a positive integer");
+    if (typeof item.text !== "string" || item.text.trim() === "") throw invalid("rollout text must be a non-empty string");
+    if (item.outcome === undefined) return { ac: item.ac as number, text: item.text };
+    if (item.outcome !== "pass" && item.outcome !== "fail") throw invalid('rollout outcome must be "pass" or "fail"');
+    if (typeof item.at !== "string" || !isValidDate(item.at)) throw invalid("rollout at must be a valid date");
+    if (item.note !== undefined && (typeof item.note !== "string" || item.note.trim() === "")) throw invalid("rollout note must be a non-empty string");
+    return { ac: item.ac as number, text: item.text, outcome: item.outcome, at: item.at, ...(typeof item.note === "string" && { note: item.note }) };
+  });
 }
 
 function readLanded(landed: unknown, invalid: (reason: string) => RecordError): Landed {
@@ -433,9 +568,14 @@ export function featureUnits(cwd: string, feature: string): UnitRecord[] {
     .sort((a, b) => a.unit - b.unit);
 }
 
-/** The unit a unit is stacked on, unit k-1; null for unit 1 or when k-1 has no record. */
+/** The unit a unit is stacked on: the nearest lower one that isn't independent; null for unit 1, or when a unit on the way down has no record. */
 export function unitBelow(cwd: string, unit: UnitRecord): UnitRecord | null {
-  return featureUnits(cwd, unit.unitOf).find((rec) => rec.unit === unit.unit - 1) ?? null;
+  const units = featureUnits(cwd, unit.unitOf);
+  for (let n = unit.unit - 1; n >= 1; n--) {
+    const below = units.find((rec) => rec.unit === n);
+    if (below === undefined || !below.independent) return below ?? null;
+  }
+  return null;
 }
 
 /** The unit stacked on a unit, unit k+1; null when there is none. */
@@ -443,9 +583,13 @@ export function unitAbove(cwd: string, unit: UnitRecord): UnitRecord | null {
   return featureUnits(cwd, unit.unitOf).find((rec) => rec.unit === unit.unit + 1) ?? null;
 }
 
-/** The unit of a feature's stack that lands next: its lowest unit with a PR that hasn't landed; null when there is none. */
+/**
+ * The unit of a feature's stack that lands next: the lowest unit with a PR that hasn't landed, an independent one only
+ * when no other has one; null when there is none.
+ */
 export function nextToLand(cwd: string, feature: string): UnitRecord | null {
-  return featureUnits(cwd, feature).find((unit) => unit.pr !== null && unit.landed === undefined) ?? null;
+  const open = featureUnits(cwd, feature).filter((unit) => unit.pr !== null && unit.landed === undefined);
+  return open.find((unit) => !unit.independent) ?? open[0] ?? null;
 }
 
 /** The record whose documents and approvals `rec` goes by: a unit's feature, else the record itself. */
@@ -453,11 +597,16 @@ export function documentsRecord(cwd: string, rec: FeatureRecord): FeatureRecord 
   return isUnit(rec) ? readFeature(cwd, rec.unitOf) : rec;
 }
 
+/** The entries of the feature's design `## Work units`, `rec` being the feature or one of its units; empty when the design or the section is missing. */
+export function plannedUnits(cwd: string, rec: FeatureRecord): WorkUnit[] {
+  const path = docFile(cwd, rec, "design");
+  if (!existsSync(path)) return [];
+  return parseWorkUnits(readFileSync(path, "utf8")).units ?? [];
+}
+
 /** The unit's entry in its feature's design `## Work units`; null when the design or the entry is missing. */
 export function plannedUnit(cwd: string, unit: UnitRecord): WorkUnit | null {
-  const path = docFile(cwd, unit, "design");
-  if (!existsSync(path)) return null;
-  return parseWorkUnits(readFileSync(path, "utf8")).units?.find((planned) => planned.number === unit.unit) ?? null;
+  return plannedUnits(cwd, unit).find((planned) => planned.number === unit.unit) ?? null;
 }
 
 function refuseUnit(rec: FeatureRecord): void {
@@ -471,6 +620,35 @@ export function docPath(cwd: string, rec: FeatureRecord, kind: DocKind): string 
 /** `local` when git ignores the feature's dir, whose documents then live only in the main worktree; else `tracked`. */
 export function docsMode(cwd: string, rec: FeatureRecord): "local" | "tracked" {
   return isIgnored(cwd, `${documentsRecord(cwd, rec).dir}/`) ? "local" : "tracked";
+}
+
+/** The exclude pattern for the features folder when `docs.store` is `local`; null otherwise. */
+export function localDocsPattern(config: FbsConfig): string | null {
+  if (config.docs?.store !== "local") return null;
+  return `/${config.featuresDir.replace(/[*?[\\]/g, "\\$&")}/`;
+}
+
+/**
+ * With `docs.store` `local`, add the features folder to the shared `info/exclude` when git doesn't ignore it yet, so
+ * the documents mode reads `local` in every worktree; returns the line added, else null.
+ */
+export function excludeLocalDocs(cwd: string): string | null {
+  const config = projectConfig(cwd);
+  const pattern = localDocsPattern(config);
+  if (pattern === null || isIgnored(cwd, `${config.featuresDir}/`)) return null;
+  const path = join(gitCommonDir(cwd), "info", "exclude");
+  mkdirSync(dirname(path), { recursive: true });
+  const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
+  if (existing.split("\n").includes(pattern)) return null;
+  appendFileSync(path, `${existing === "" || existing.endsWith("\n") ? "" : "\n"}${pattern}\n`);
+  return pattern;
+}
+
+/** A warning when `docs.store` says tracked but git ignores the features folder, so the documents stay local; else null. */
+export function docsStoreWarning(cwd: string): string | null {
+  const config = projectConfig(cwd);
+  if (config.docs?.store !== "tracked" || !isIgnored(cwd, `${config.featuresDir}/`)) return null;
+  return `warning: docs.store is tracked, but git ignores ${config.featuresDir}/, so the documents stay local: git's ignore wins`;
 }
 
 /** The absolute dir the feature's documents are read from: the main worktree's when local, else this worktree's. */
@@ -520,7 +698,7 @@ export function isApprovalCurrent(cwd: string, rec: FeatureRecord, kind: DocKind
   return approval !== undefined && existsSync(path) && sha256(readFileSync(path)) === approval.sha256;
 }
 
-function withLock<T>(cwd: string, slug: string, body: () => T): T {
+export function withLock<T>(cwd: string, slug: string, body: () => T): T {
   const lock = join(recordsDir(cwd), `${slug}.lock`);
   try {
     closeSync(openSync(lock, "wx"));
@@ -575,6 +753,25 @@ export function setTicket(cwd: string, slug: string, id: string, url?: string): 
 
 export function clearTicket(cwd: string, slug: string): FeatureRecord {
   return updateFeature(cwd, slug, ({ ticket: _, ...rec }) => rec);
+}
+
+/** Record how a rollout criterion (`AC<n>`) turned out after the deploy; a later outcome replaces an earlier one. */
+export function recordRollout(cwd: string, slug: string, criterion: string, outcome: string, today: string, note?: string): FeatureRecord {
+  assertToday(today);
+  const ac = Number(/^AC([1-9][0-9]*)$/i.exec(criterion)?.[1] ?? Number.NaN);
+  if (Number.isNaN(ac)) throw new StatusError("bad-rollout", `${JSON.stringify(criterion)} must be AC<n>, the criterion's position in the spec`);
+  if (outcome !== "pass" && outcome !== "fail") throw new StatusError("bad-rollout", `${JSON.stringify(outcome)} must be pass or fail`);
+  if (note !== undefined && note.trim() === "") throw new StatusError("bad-rollout", "the note must not be blank");
+  const result: "pass" | "fail" = outcome;
+  return updateFeature(cwd, slug, (rec) => {
+    const listed = rec.rollout ?? [];
+    if (!listed.some((item) => item.ac === ac)) {
+      const known = listed.length > 0 ? `: ${listed.map((item) => `AC${item.ac}`).join(", ")}` : " (it has none)";
+      throw new StatusError("bad-rollout", `AC${ac} isn't a rollout criterion of ${slug}${known}`);
+    }
+    const rollout = listed.map((item): RolloutCriterion => (item.ac === ac ? { ac, text: item.text, outcome: result, at: today, ...(note !== undefined && { note }) } : item));
+    return { ...rec, rollout };
+  });
 }
 
 /** The feature's PR and repo; a feature without a PR is refused. */

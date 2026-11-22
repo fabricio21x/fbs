@@ -28,12 +28,7 @@ export function parseWorkUnits(design: string): ParsedWorkUnits {
   if (content.length === 1 && NONE.test(content[0].trim())) return { units: [], problems: [] };
 
   const problems: string[] = [];
-  const blocks: { heading: string; lines: string[] }[] = [];
-  for (const line of body) {
-    const heading = HEADING.exec(line);
-    if (heading?.[1].length === 3) blocks.push({ heading: heading[2].trim(), lines: [] });
-    else blocks[blocks.length - 1]?.lines.push(line);
-  }
+  const blocks = unitBlocks(body);
   if (blocks.length === 0) return { units: [], problems: ["write one ### U<n>: <name> per unit, or None when the feature ships as one PR"] };
 
   const units = blocks.map(({ heading, lines }, index): WorkUnit => {
@@ -62,18 +57,64 @@ export function parseWorkUnits(design: string): ParsedWorkUnits {
   return { units, problems };
 }
 
-/** One `- [ ]` or `- [x]` line of the spec's acceptance criteria; struck through (`~~`) it was dropped but keeps its position. */
+/** The `###` blocks of the Work units section, each with the lines under its heading. */
+function unitBlocks(body: string[]): { heading: string; lines: string[] }[] {
+  const blocks: { heading: string; lines: string[] }[] = [];
+  for (const line of body) {
+    const heading = HEADING.exec(line);
+    if (heading?.[1].length === 3) blocks.push({ heading: heading[2].trim(), lines: [] });
+    else blocks[blocks.length - 1]?.lines.push(line);
+  }
+  return blocks;
+}
+
+/**
+ * Unit `n`'s block of the design's Work units as written, comments and fenced blocks included, without trailing blank
+ * lines; null when no `### U<n>:` heading or more than one heads it.
+ */
+export function unitSection(design: string, n: number): string | null {
+  const body = section(design, "work units") ?? [];
+  const starts = body.flatMap(({ text }, i) => (text !== null && HEADING.exec(text)?.[1].length === 3 ? [i] : []));
+  const own = starts.filter((i) => UNIT_HEADING.exec((HEADING.exec(body[i].text as string) as RegExpExecArray)[2].trim())?.[1] === String(n));
+  if (own.length !== 1) return null;
+  const end = starts.find((i) => i > own[0]) ?? body.length;
+  return joinRaw(body.slice(own[0], end));
+}
+
+function joinRaw(lines: ScannedLine[]): string {
+  const raw = lines.map((line) => line.raw);
+  while (raw.length > 0 && raw[raw.length - 1].trim() === "") raw.pop();
+  return raw.join("\n");
+}
+
+/**
+ * One `- [ ]` or `- [x]` line of the spec's acceptance criteria; struck through (`~~`) it was dropped but keeps its
+ * position, and starting with `(rollout)` it can only be checked after the deploy.
+ */
 export interface AcceptanceCriterion {
   text: string;
   dropped: boolean;
+  rollout: boolean;
 }
 
 /** The spec's acceptance criteria in order, so `AC<i>` is the i-th. */
 export function acceptanceCriteria(spec: string): AcceptanceCriterion[] {
-  return (sectionLines(spec, "acceptance criteria") ?? []).flatMap((line) => {
-    const text = /^- \[[ xX]\]\s+(.*)$/.exec(line)?.[1];
-    return text === undefined ? [] : [{ text, dropped: text.startsWith("~~") }];
-  });
+  return criterionItems(spec).map(({ text }) => ({ text, dropped: text.startsWith("~~"), rollout: /^\(rollout\)\s/i.test(text) }));
+}
+
+/** Each acceptance criterion as written, with every line under it up to the next criterion; `AC<i>` is the i-th. */
+export function criterionBlocks(spec: string): string[] {
+  return criterionItems(spec).map(({ lines }) => joinRaw(lines));
+}
+
+function criterionItems(spec: string): { text: string; lines: ScannedLine[] }[] {
+  const items: { text: string; lines: ScannedLine[] }[] = [];
+  for (const line of section(spec, "acceptance criteria") ?? []) {
+    const text = line.text === null ? undefined : /^- \[[ xX]\]\s+(.*)$/.exec(line.text)?.[1];
+    if (text !== undefined) items.push({ text, lines: [line] });
+    else items[items.length - 1]?.lines.push(line);
+  }
+  return items;
 }
 
 /** The design's work-unit problems: parsing, then references, then each criterion still in the spec covered by exactly one unit. */
@@ -101,20 +142,30 @@ export function workUnitProblems(design: string, spec: string): string[] {
   return problems;
 }
 
-/** The lines under the first `## <title>`, up to the next level 1 or 2 heading, without comments or fenced blocks; null when it's missing. */
-function sectionLines(markdown: string, title: string): string[] | null {
-  let lines: string[] | null = null;
+/** A raw line, and its text outside comments and fenced blocks; null for a line in a fence or a comment, or a fence line. */
+interface ScannedLine {
+  raw: string;
+  text: string | null;
+}
+
+function scan(markdown: string): ScannedLine[] {
+  const lines: ScannedLine[] = [];
   let fence: string | null = null;
   let inComment = false;
   for (const raw of rawLines(markdown)) {
+    const hidden = () => lines.push({ raw, text: null });
     if (fence !== null) {
       if (closesFence(raw, fence)) fence = null;
+      hidden();
       continue;
     }
     let line = raw;
     if (inComment) {
       const end = line.indexOf("-->");
-      if (end === -1) continue;
+      if (end === -1) {
+        hidden();
+        continue;
+      }
       line = line.slice(end + 3);
       inComment = false;
     }
@@ -126,17 +177,26 @@ function sectionLines(markdown: string, title: string): string[] | null {
     }
     line = line.trimEnd();
     const opener = fenceOpener(line);
-    if (opener !== null) {
-      fence = opener;
-      continue;
-    }
-    const heading = HEADING.exec(line);
-    if (heading !== null && heading[1].length <= 2) {
-      if (lines !== null) return lines;
-      if (heading[1].length === 2 && heading[2].trim().toLowerCase() === title) lines = [];
-      continue;
-    }
-    lines?.push(line);
+    if (opener !== null) fence = opener;
+    lines.push({ raw, text: opener === null ? line : null });
   }
   return lines;
+}
+
+/** The lines under the first `## <title>`, up to the next level 1 or 2 heading; null when it's missing. */
+function section(markdown: string, title: string): ScannedLine[] | null {
+  const lines = scan(markdown);
+  let start: number | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    const heading = lines[i].text === null ? null : HEADING.exec(lines[i].text as string);
+    if (heading === null || heading[1].length > 2) continue;
+    if (start !== null) return lines.slice(start, i);
+    if (heading[1].length === 2 && heading[2].trim().toLowerCase() === title) start = i + 1;
+  }
+  return start === null ? null : lines.slice(start);
+}
+
+/** The text of the lines under the first `## <title>`, without comments or fenced blocks; null when it's missing. */
+function sectionLines(markdown: string, title: string): string[] | null {
+  return section(markdown, title)?.flatMap(({ text }) => (text === null ? [] : [text])) ?? null;
 }

@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { BRANCH_TYPES, BranchRefusedError, type BranchChoice, type BranchResult, enterFeatureBranch, isConventionalBranchName } from "./branch";
+import { BranchRefusedError, type BranchChoice, type BranchResult, enterFeatureBranch, isConventionalBranchName } from "./branch";
+import { BRANCH_TYPES } from "./config";
 import { GitError, setGitBinary } from "./git";
 import { run } from "./main";
 import { approve, type FeatureBranch, initFeature, initUnit, readFeature, setPr, setTicket, updateFeature } from "./status";
@@ -227,7 +228,7 @@ describe("a new feature branch", () => {
 });
 
 describe("the new branch's name", () => {
-  const TYPES_HINT = "a new branch needs --type <feature|bugfix|hotfix|chore>";
+  const TYPES_HINT = "a new branch needs --type <feature|bugfix|hotfix|chore|feat|fix|docs|style|refactor|perf|test|build|ci|revert>";
 
   /** A repo with no remote, on `main`, with feature `slug` recorded. */
   function localWith(slug: string): string {
@@ -249,6 +250,8 @@ describe("the new branch's name", () => {
     ["hotfix", "Ab2-7", "hotfix/ab2-7-x"],
     ["chore", "123", "chore/issue-123-x"],
     ["feature", "#123", "feature/issue-123-x"],
+    ["feat", "ACM-123", "feat/acm-123-x"],
+    ["fix", "#7", "fix/issue-7-x"],
   ])("--type %s --ticket %s is %s", (type, ticket, name) => {
     const repo = local();
     expect(enter(repo, { type, ticket }).result.branch).toBe(name);
@@ -286,11 +289,54 @@ describe("the new branch's name", () => {
     expect(refusal(() => enter(repo, { type: undefined }))).toBe(TYPES_HINT);
     expect(refusal(() => enter(repo, { type: undefined, ticket: "ACM-1" }))).toBe(TYPES_HINT);
     for (const type of ["release", "Feature", "fbs"]) {
-      expect(refusal(() => enter(repo, { type }))).toBe(`unknown type ${JSON.stringify(type)}; --type is one of feature, bugfix, hotfix, chore`);
+      expect(refusal(() => enter(repo, { type }))).toBe(`unknown type ${JSON.stringify(type)}; --type is one of feature, bugfix, hotfix, chore, feat, fix, docs, style, refactor, perf, test, build, ci, revert`);
     }
     expect(current(repo)).toBe("main");
     expect(git(repo, "branch", "--format=%(refname:short)")).toBe("main");
     expect(readFeature(repo, "x").branch).toBeUndefined();
+  });
+
+  test("branches.types in .fbs/config.json limits the types a new branch can take, and the refusal names them", () => {
+    const repo = local();
+    commitFile(repo, ".fbs/config.json", '{"branches":{"types":["feat","fix","chore"]}}');
+    expect(refusal(() => enter(repo, { type: undefined }))).toBe("a new branch needs --type <feat|fix|chore>");
+    expect(refusal(() => enter(repo, { type: "feature" }))).toBe('unknown type "feature"; --type is one of feat, fix, chore (branches.types in .fbs/config.json)');
+    expect(current(repo)).toBe("main");
+    expect(enter(repo, { type: "fix", ticket: "ACM-123" }).result.branch).toBe("fix/acm-123-x");
+  });
+
+  /** A repo whose config allows only `types`, with x recorded on `name`, a branch cut before the config was set. */
+  function recordedBeforeConfig(name: string, types: string[]): string {
+    const repo = local();
+    commitFile(repo, ".fbs/config.json", JSON.stringify({ branches: { types } }));
+    const base = git(repo, "rev-parse", "HEAD");
+    git(repo, "branch", name);
+    updateFeature(repo, "x", (rec) => ({ ...rec, branch: { name, parent: "main", base } }));
+    return repo;
+  }
+
+  test("a branch recorded before branches.types was set still resumes under its name", () => {
+    const repo = recordedBeforeConfig("feature/x", ["feat", "fix"]);
+    expect(enter(repo, { type: undefined }).result).toMatchObject({ branch: "feature/x", switched: true, renamed: false });
+  });
+
+  test.each([
+    ["feature/x", ["feat", "fix"], "feat/acm-1-x"],
+    ["bugfix/x", ["feat", "fix"], "fix/acm-1-x"],
+    ["feat/x", ["feature", "bugfix"], "feature/acm-1-x"],
+    ["chore/x", ["fix", "feat"], "fix/acm-1-x"],
+    ["chore/x", ["feat", "chore"], "chore/acm-1-x"],
+  ])("--ticket renames %s, with no PR, under branches.types %j to %s", (name, types, renamed) => {
+    const repo = recordedBeforeConfig(name, types);
+    const { result, notes } = enter(repo, { type: undefined, ticket: "ACM-1" });
+    expect(result).toMatchObject({ branch: renamed, renamed: true });
+    expect(notes).toContain(`note: renamed ${name} to ${renamed}`);
+  });
+
+  test("with a PR open, --ticket keeps the type branches.types excludes, and the rename is refused as before", () => {
+    const repo = recordedBeforeConfig("feature/x", ["feat", "fix"]);
+    setPr(repo, "x", 4, "acme/app");
+    expect(refusal(() => enter(repo, { type: undefined, ticket: "ACM-1" }))).toBe("feature/x has an open PR; it can't be renamed to feature/acm-1-x");
   });
 
   test("a recorded branch resumes without --type, and --type doesn't rename it", () => {
@@ -323,7 +369,7 @@ describe("the new branch's name", () => {
     expect(enter(repo, { type: undefined, use: "Alex/WIP" }).result).toMatchObject({ branch: "Alex/WIP", parent: null });
   });
 
-  test.each(["feature/x", "bugfix/acm-123-booking-sync", "hotfix/issue-7", "chore/v1.2.0", "feature/a.b-c.d", "feature/2fa"])("%p is a conventional branch name", (name) => {
+  test.each(["feature/x", "bugfix/acm-123-booking-sync", "hotfix/issue-7", "chore/v1.2.0", "feature/a.b-c.d", "feature/2fa", "feat/x", "fix/acm-1-x", "ci/v1.2", "revert/issue-3"])("%p is a conventional branch name", (name) => {
     expect(isConventionalBranchName(name)).toBe(true);
   });
 
@@ -853,14 +899,91 @@ describe("fbs branch", () => {
 
   test("--type and --ticket reach the command, and a missing or unknown --type is refused on stdout", () => {
     const { work } = cloned();
-    expect(cli(work, "x")).toEqual({ code: 1, out: ["refused: a new branch needs --type <feature|bugfix|hotfix|chore>"], err: [] });
-    expect(cli(work, "x", "--ticket", "ACM-1")).toEqual({ code: 1, out: ["refused: a new branch needs --type <feature|bugfix|hotfix|chore>"], err: [] });
-    expect(cli(work, "x", "--type", "release")).toEqual({ code: 1, out: ['refused: unknown type "release"; --type is one of feature, bugfix, hotfix, chore'], err: [] });
+    expect(cli(work, "x")).toEqual({ code: 1, out: ["refused: a new branch needs --type <feature|bugfix|hotfix|chore|feat|fix|docs|style|refactor|perf|test|build|ci|revert>"], err: [] });
+    expect(cli(work, "x", "--ticket", "ACM-1")).toEqual({ code: 1, out: ["refused: a new branch needs --type <feature|bugfix|hotfix|chore|feat|fix|docs|style|refactor|perf|test|build|ci|revert>"], err: [] });
+    expect(cli(work, "x", "--type", "release")).toEqual({ code: 1, out: ['refused: unknown type "release"; --type is one of feature, bugfix, hotfix, chore, feat, fix, docs, style, refactor, perf, test, build, ci, revert'], err: [] });
     expect(cli(work, "x", "--type", "bugfix", "--ticket", "x")).toEqual({ code: 1, out: ['refused: bad ticket "x": use a tracker id like ACM-123 or an issue number'], err: [] });
     const r = cli(work, "x", "--type", "bugfix", "--ticket", "ACM-1");
     expect(r.code).toBe(0);
     expect(JSON.parse(r.out[0])).toMatchObject({ branch: "bugfix/acm-1-x", parent: "main", created: true });
     expect(JSON.parse(cli(work, "x").out[0])).toMatchObject({ branch: "bugfix/acm-1-x", created: false });
+  });
+
+  describe("--types", () => {
+    const BRANCH_FAMILY = ["feature", "bugfix", "hotfix", "chore"];
+    const COMMIT_FAMILY = ["feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert"];
+    const types = (cwd: string) => {
+      const r = cli(cwd, "--types");
+      expect(r.code).toBe(0);
+      expect(r.out).toHaveLength(1);
+      return JSON.parse(r.out[0]);
+    };
+
+    /** Point each of `refs` at `commit` in one git call. */
+    function makeRefs(cwd: string, refs: string[], commit: string): void {
+      const input = refs.map((ref) => `create ${ref} ${commit}\n`).join("");
+      const result = Bun.spawnSync(["git", "update-ref", "--stdin"], { cwd, env: isolatedGitEnv(), stdin: Buffer.from(input), stderr: "pipe" });
+      if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+    }
+
+    test("without branches.types or typed branches, it gives today's default family", () => {
+      const { work } = cloned();
+      expect(types(work)).toEqual({ types: BRANCH_FAMILY, from: "default", seen: [] });
+    });
+
+    test("it counts the type prefixes of local and remote branch names, and gives the family they use", () => {
+      const { work } = cloned();
+      makeRefs(work, ["refs/remotes/origin/feat/a", "refs/remotes/origin/fix/b", "refs/remotes/origin/chore/c", "refs/heads/feature/d", "refs/heads/alex/wip", "refs/heads/feat/a"], "HEAD");
+      expect(types(work)).toEqual({
+        types: COMMIT_FAMILY,
+        from: "branches",
+        seen: [
+          { type: "chore", count: 1 },
+          { type: "feat", count: 1 },
+          { type: "feature", count: 1 },
+          { type: "fix", count: 1 },
+        ],
+      });
+      makeRefs(work, ["refs/heads/bugfix/e", "refs/heads/hotfix/f"], "HEAD");
+      expect(types(work)).toMatchObject({ types: BRANCH_FAMILY, from: "branches" });
+    });
+
+    /** A commit on top of HEAD, committed later than anything else in the repo; HEAD stays where it is. */
+    function newerCommit(cwd: string): string {
+      const env = isolatedGitEnv({ GIT_COMMITTER_DATE: "2030-01-01T00:00:00Z", GIT_AUTHOR_DATE: "2030-01-01T00:00:00Z" });
+      const args = ["-c", "user.name=fbs", "-c", "user.email=fbs@example.com", "commit-tree", "-p", "HEAD", "-m", "newer", git(cwd, "rev-parse", "HEAD^{tree}")];
+      return Bun.spawnSync(["git", ...args], { cwd, env }).stdout.toString().trim();
+    }
+
+    test("only the 50 most recently committed typed branches count", () => {
+      const { work } = cloned();
+      const newer = newerCommit(work);
+      makeRefs(work, Array.from({ length: 60 }, (_, i) => `refs/heads/feat/old-${i}`), "HEAD");
+      makeRefs(work, Array.from({ length: 50 }, (_, i) => `refs/heads/feature/new-${i}`), newer);
+      expect(types(work)).toEqual({ types: BRANCH_FAMILY, from: "branches", seen: [{ type: "feature", count: 50 }] });
+    });
+
+    test("branches without a type prefix take no slot among the 50", () => {
+      const { work } = cloned();
+      const newer = newerCommit(work);
+      makeRefs(work, Array.from({ length: 50 }, (_, i) => `refs/heads/dependabot/npm-${i}`), newer);
+      makeRefs(work, ["refs/heads/renovate/x", "refs/heads/alex/wip", "refs/heads/release"], newer);
+      makeRefs(work, ["refs/heads/feat/a", "refs/heads/fix/b"], "HEAD");
+      expect(types(work)).toEqual({ types: COMMIT_FAMILY, from: "branches", seen: [{ type: "feat", count: 1 }, { type: "fix", count: 1 }] });
+    });
+
+    test("a tie between the families gives the default", () => {
+      const { work } = cloned();
+      makeRefs(work, ["refs/heads/feat/a", "refs/heads/feature/b"], "HEAD");
+      expect(types(work)).toEqual({ types: BRANCH_FAMILY, from: "default", seen: [{ type: "feat", count: 1 }, { type: "feature", count: 1 }] });
+    });
+
+    test("branches.types wins over the branches", () => {
+      const { work } = cloned();
+      commitFile(work, ".fbs/config.json", '{"branches":{"types":["fix","feat"]}}');
+      makeRefs(work, ["refs/heads/feature/a"], "HEAD");
+      expect(types(work)).toEqual({ types: ["fix", "feat"], from: "config", seen: [{ type: "feature", count: 1 }] });
+    });
   });
 
   test("--use ignores --type and --ticket, as resuming does", () => {
@@ -918,19 +1041,27 @@ describe("fbs branch", () => {
   test.each([
     [[]],
     [["x", "y"]],
-    [["x", "--use"]],
     [["x", "--nope", "a"]],
     [["x", "--use", "a", "--use", "b"]],
     [["x", "--existing", "--existing"]],
-    [["x", "--type"]],
     [["x", "--type", "feature", "--type", "chore"]],
-    [["x", "--type", "feature", "--ticket", ""]],
+    [["--types", "x"]],
+    [["x", "--types"]],
   ])("%p is a usage error", (args) => {
     const { work } = cloned();
     const r = cli(work, ...args);
     expect(r.code).toBe(2);
     expect(r.out).toEqual([]);
     expect(r.err[0]).toContain("unknown command: branch");
+  });
+
+  test.each([
+    [["x", "--use"], "branch: --use needs a value"],
+    [["x", "--type"], "branch: --type needs a value"],
+    [["x", "--type", "feature", "--ticket", ""], "branch: --ticket needs a value"],
+  ])("%p is a usage error naming the option without its value", (args, message) => {
+    const { work } = cloned();
+    expect(cli(work, ...args)).toEqual({ code: 2, out: [], err: [message] });
   });
 
   test.each([
@@ -1137,12 +1268,68 @@ describe("fbs push", () => {
     expect(() => git(origin, "rev-parse", "--verify", name)).toThrow();
   });
 
-  test("a work tree on another branch is refused", () => {
+  test("the recorded branch's tip is pushed from a work tree on another branch, on a detached HEAD or in another worktree", () => {
+    const { origin, work, tip } = onFeature();
+    git(work, "switch", "-q", "main");
+    expect(push(work)).toEqual({ code: 0, out: pushedJson(tip), err: [] });
+    git(work, "switch", "-q", "feature/x");
+    const next = commitFile(work, "more.txt", "more\n");
+    git(work, "switch", "-q", "--detach", "main");
+    expect(push(work)).toEqual({ code: 0, out: pushedJson(next), err: [] });
+    const wt = join(tempDir(), "wt");
+    git(work, "worktree", "add", "-q", "-b", "elsewhere", wt, "main");
+    git(work, "switch", "-q", "feature/x");
+    const last = commitFile(work, "last.txt", "last\n");
+    expect(push(wt)).toEqual({ code: 0, out: pushedJson(last), err: [] });
+    expect(git(origin, "rev-parse", "feature/x")).toBe(last);
+    expect(readFeature(work, "x").branch?.pushed).toBe(last);
+  });
+
+  test("a checkout whose HEAD isn't on the pushed branch gets a note, and the JSON says so", () => {
+    const { work, tip } = onFeature();
+    git(work, "switch", "-q", "--detach");
+    const detached = commitFile(work, "detached.txt", "d\n");
+    const short = (sha: string) => sha.slice(0, 12);
+    expect(push(work)).toEqual({
+      code: 0,
+      out: [JSON.stringify({ branch: "feature/x", pushed: tip, forced: false, headNotPushed: { head: detached, on: null } })],
+      err: [`note: pushed feature/x at ${short(tip)}; this checkout's HEAD ${short(detached)} (a detached HEAD) is not on it`],
+    });
+    git(work, "switch", "-q", "-c", "worktree-agent-1");
+    const isolated = commitFile(work, "isolated.txt", "i\n");
+    const r = push(work);
+    expect(JSON.parse(r.out[0]).headNotPushed).toEqual({ head: isolated, on: "worktree-agent-1" });
+    expect(r.err).toEqual([`note: pushed feature/x at ${short(tip)}; this checkout's HEAD ${short(isolated)} (on worktree-agent-1) is not on it`]);
+  });
+
+  test("a branch being rebased in any worktree is refused, naming where", () => {
+    const { origin, work } = onFeature();
+    const wt = join(tempDir(), "wt");
+    git(work, "worktree", "add", "-q", "-b", "elsewhere", wt, "main");
+    Bun.spawnSync(["git", "rebase", "-q", "--exec", "false", "HEAD~1"], { cwd: work, env: isolatedGitEnv(), stdout: "pipe", stderr: "pipe" });
+    expect(existsSync(join(work, ".git/rebase-merge/head-name"))).toBe(true);
+    const refusal = `refused: feature/x is being rebased in ${work}; finish it there (git rebase --continue) or abort it (git rebase --abort), then run fbs push x`;
+    expect(push(wt)).toEqual({ code: 1, out: [refusal], err: [] });
+    expect(push(work)).toEqual({ code: 1, out: [refusal], err: [] });
+    expect(() => git(origin, "rev-parse", "--verify", "feature/x")).toThrow();
+  });
+
+  test("from another branch, commits someone else pushed are still never overwritten", () => {
+    const { origin, work, tip } = onFeature();
+    push(work);
+    const theirs = pushFromElsewhere(origin, "feature/x");
+    amend(work);
+    git(work, "switch", "-q", "main");
+    expect(push(work)).toEqual({ code: 1, out: ["refused: origin has commits fbs didn't push to feature/x; fetch and look before pushing"], err: [] });
+    expect(git(origin, "rev-parse", "feature/x")).toBe(theirs);
+    expect(readFeature(work, "x").branch?.pushed).toBe(tip);
+  });
+
+  test("a recorded branch with no commit here is refused, saying what to do", () => {
     const { origin, work } = onFeature();
     git(work, "switch", "-q", "main");
-    expect(push(work)).toEqual({ code: 1, out: ["refused: on main, not feature/x"], err: [] });
-    git(work, "switch", "-q", "--detach", "feature/x");
-    expect(push(work).out).toEqual(["refused: on a detached HEAD, not feature/x"]);
+    git(work, "branch", "-q", "-D", "feature/x");
+    expect(push(work)).toEqual({ code: 1, out: ["refused: no commit on feature/x here to push; commit on it, or run fbs branch x to restore it from origin"], err: [] });
     expect(() => git(origin, "rev-parse", "--verify", "feature/x")).toThrow();
   });
 
@@ -1479,5 +1666,141 @@ describe("a unit's branch", () => {
     git(work, "switch", "-q", "-c", "feature/wit-1464");
     commitFile(work, "ui.txt", "ui\n");
     expect(enter(work, { use: "feature/wit-1464" }, "f-ui").result).toMatchObject({ branch: "feature/wit-1464", parent: "main", base: landed });
+  });
+});
+
+describe("an independent unit", () => {
+  const SPEC = "## Facts\n- Two beta clients (.fbs/context.md)\n## Assumptions\nNone\n## Open questions\nNone\n";
+  const unitLines = (deps: string[]) =>
+    ["Api", "Ui", "Mail", "Late"].map((name, i) => `### U${i + 1}: ${name}\n- Covers: none\n- Depends on: ${deps[i]}\n`).join("");
+  const DESIGN = `${SPEC}## Work units\n${unitLines(["none", "U1", "none", "U2"])}`;
+  const DOCS = "docs/features/2026-10-21-f";
+
+  /** Big feature f on feature/f with local documents (`design`, approved) and units f-api, f-ui, f-mail and f-late. */
+  function units(work: string, design = DESIGN): void {
+    writeFileSync(join(work, ".git/info/exclude"), "docs/features/\n");
+    initFeature(work, "f", "big", "2026-10-21");
+    enter(work, {}, "f");
+    writeFileSync(join(work, DOCS, "spec.md"), SPEC);
+    writeFileSync(join(work, DOCS, "design.md"), design);
+    approve(work, "f", "spec", "spec ok", "2026-10-21");
+    approve(work, "f", "design", "design ok", "2026-10-21");
+    for (const slug of ["f-api", "f-ui", "f-mail", "f-late"]) initUnit(work, slug, "f");
+  }
+
+  /** Branch f-api and f-ui, one commit each; returns f-ui's tip. */
+  function lowerUnits(work: string): string {
+    enter(work, {}, "f-api");
+    commitFile(work, "api.txt", "api\n");
+    enter(work, {}, "f-ui");
+    return commitFile(work, "ui.txt", "ui\n");
+  }
+
+  function landed(work: string, slug: string): void {
+    updateFeature(work, slug, (rec) => ({ ...rec, landed: { pr: 21, repo: "acme/app", commit: "c".repeat(40), at: "2026-10-25" } }));
+  }
+
+  test("--parent <default> cuts a unit that depends on no unit below from origin's default branch and records it independent", () => {
+    const { origin, work } = cloned();
+    units(work);
+    const ui = lowerUnits(work);
+    const main = pushFromElsewhere(origin);
+    expect(enter(work, { parent: "main" }, "f-mail").result).toEqual({ branch: "feature/f-mail", parent: "main", base: main, created: true, switched: true, moved: false, renamed: false });
+    expect(git(work, "rev-parse", "HEAD")).toBe(main);
+    expect(readFeature(work, "f-mail")).toMatchObject({ independent: true, branch: { name: "feature/f-mail", parent: "main", base: main } });
+    expect(enter(work, {}, "f-late").result).toMatchObject({ parent: "feature/f-ui", base: ui });
+  });
+
+  test("a unit that depends on a unit still to land is refused, and allowed once that unit landed", () => {
+    const { work } = cloned();
+    units(work, `${SPEC}## Work units\n${unitLines(["none", "U1", "none", "U1"])}`);
+    enter(work, {}, "f-api");
+    commitFile(work, "api.txt", "api\n");
+    expect(refusal(() => enter(work, { parent: "main" }, "f-ui"))).toBe("U2 depends on U1, which hasn't landed, so f-ui stays in the stack; --parent main is only for a unit that depends on no unit still to land and that no later unit depends on");
+    expect(readFeature(work, "f-ui").branch).toBeUndefined();
+    landed(work, "f-api");
+    expect(enter(work, { parent: "main" }, "f-ui").result).toMatchObject({ branch: "feature/f-ui", parent: "main" });
+    expect(readFeature(work, "f-ui").independent).toBe(true);
+  });
+
+  test("--parent takes only the default branch, never for unit 1, and refuses a unit a unit above depends on", () => {
+    const { work } = cloned();
+    units(work, `${SPEC}## Work units\n${unitLines(["none", "U1", "none", "U2, U3"])}`);
+    lowerUnits(work);
+    expect(refusal(() => enter(work, { parent: "feature/f-api" }, "f-mail"))).toBe("f-mail is unit 3 of f; its stack sets its parent, so --parent takes only the default branch main, to make it independent, or for an independent unit the branch of the unit below, to put it back");
+    expect(refusal(() => enter(work, { parent: "main" }, "f-api"))).toBe("f-api is unit 1 of f; its stack sets its parent, so --parent isn't used");
+    expect(refusal(() => enter(work, { parent: "main" }, "f-mail"))).toBe("U4 depends on U3, so f-mail stays in the stack; --parent main is only for a unit that depends on no unit still to land and that no later unit depends on");
+  });
+
+  test("--parent needs the design's approval to be current, since the design is what allows it", () => {
+    const { work } = cloned();
+    units(work);
+    lowerUnits(work);
+    writeFileSync(join(work, DOCS, "design.md"), `${DESIGN}edited\n`);
+    expect(refusal(() => enter(work, { parent: "main" }, "f-mail"))).toBe(`${DOCS}/design.md doesn't match its approval here; approve the amended design first`);
+  });
+
+  test("with tracked documents, a unit can't be independent before unit 1 lands, since its PR carries the spec and design", () => {
+    const { work } = cloned();
+    initFeature(work, "f", "big", "2026-10-21");
+    enter(work, {}, "f");
+    commitFile(work, `${DOCS}/spec.md`, SPEC);
+    commitFile(work, `${DOCS}/design.md`, DESIGN);
+    approve(work, "f", "spec", "spec ok", "2026-10-21");
+    approve(work, "f", "design", "design ok", "2026-10-21");
+    for (const slug of ["f-api", "f-ui", "f-mail"]) initUnit(work, slug, "f");
+    lowerUnits(work);
+    expect(refusal(() => enter(work, { parent: "main" }, "f-mail"))).toBe("the feature's documents are tracked and ship with unit 1, so a unit based on main would lack them until f-api lands");
+  });
+
+  test("a recorded unit branch with no PR moves onto the default branch; one with a PR, or a unit stacked on it, is refused", () => {
+    const { work } = cloned();
+    units(work);
+    const ui = lowerUnits(work);
+    enter(work, {}, "f-mail");
+    commitFile(work, "mail.txt", "mail\n");
+    enter(work, {}, "f-late");
+    expect(refusal(() => enter(work, { parent: "main" }, "f-mail"))).toBe("f-late is stacked on feature/f-mail; it can't leave the stack");
+    updateFeature(work, "f-late", ({ branch: _, ...rec }) => rec);
+    git(work, "switch", "-q", "feature/f-mail");
+    git(work, "branch", "-q", "-D", "feature/f-late");
+    setPr(work, "f-mail", 14, "acme/app");
+    expect(refusal(() => enter(work, { parent: "main" }, "f-mail"))).toBe("feature/f-mail has an open PR; it can't move");
+    updateFeature(work, "f-mail", ({ repo: _, ...rec }) => ({ ...rec, pr: null }));
+    const main = git(work, "rev-parse", "origin/main");
+    expect(enter(work, { parent: "main" }, "f-mail").result).toMatchObject({ branch: "feature/f-mail", parent: "main", base: main, moved: true });
+    expect(git(work, "log", "--format=%s", "main..feature/f-mail").split("\n")).toEqual(["write mail.txt"]);
+    expect(readFeature(work, "f-mail")).toMatchObject({ independent: true, branch: { parent: "main", base: main } });
+    expect(enter(work, {}, "f-late").result).toMatchObject({ parent: "feature/f-ui", base: ui });
+  });
+
+  test("a unit that depends on an independent unit still to land is refused a branch until it lands", () => {
+    const { work } = cloned();
+    units(work);
+    lowerUnits(work);
+    enter(work, { parent: "main" }, "f-mail");
+    writeFileSync(join(work, DOCS, "design.md"), `${SPEC}## Work units\n${unitLines(["none", "U1", "none", "U2, U3"])}`);
+    approve(work, "f", "design", "design ok again", "2026-10-22");
+    expect(refusal(() => enter(work, {}, "f-late"))).toBe("U4 depends on U3, f-mail, which is independent and hasn't landed; land f-mail first");
+    landed(work, "f-mail");
+    expect(enter(work, {}, "f-late").result).toMatchObject({ parent: "feature/f-ui" });
+  });
+
+  test("--parent <the branch of the unit below> puts an independent unit with no PR back in the stack", () => {
+    const { work } = cloned();
+    units(work);
+    const ui = lowerUnits(work);
+    enter(work, { parent: "main" }, "f-mail");
+    commitFile(work, "mail.txt", "mail\n");
+    expect(refusal(() => enter(work, { parent: "feature/f-api" }, "f-mail"))).toBe("f-mail goes back onto feature/f-ui, the branch of the unit below it in the stack");
+    setPr(work, "f-mail", 14, "acme/app");
+    expect(refusal(() => enter(work, { parent: "feature/f-ui" }, "f-mail"))).toBe(
+      "f-mail has PR #14 open against main; land what it depends on first, or close that PR, clear it with fbs status pr f-mail none, and run this again",
+    );
+    updateFeature(work, "f-mail", ({ repo: _, ...rec }) => ({ ...rec, pr: null }));
+    expect(enter(work, { parent: "feature/f-ui" }, "f-mail").result).toMatchObject({ branch: "feature/f-mail", parent: "feature/f-ui", base: ui, moved: true });
+    expect(git(work, "log", "--format=%s", "feature/f-ui..feature/f-mail").split("\n")).toEqual(["write mail.txt"]);
+    expect(readFeature(work, "f-mail").independent).toBeUndefined();
+    expect(enter(work, {}, "f-late").result).toMatchObject({ parent: "feature/f-mail" });
   });
 });

@@ -4,13 +4,16 @@
 - Tree: <the HEAD^{tree} hash the evidence was checked on, before this file was committed, when it is>
 - Date: <YYYY-MM-DD>
 
-<!-- Written by /fbs:verify. `fbs stamp set` reads this file: it counts the `- [x]` lines under Criteria and needs a line that is exactly `Verdict: pass`, alone on its line, to stamp. Never write that line unless every criterion is `[x]` and Open issues is None. -->
+<!-- Written by /fbs:verify. `fbs stamp set` reads this file: it counts the `- [x]` lines under Criteria and needs a line that is exactly `Verdict: pass`, alone on its line, to stamp. Never write that line unless every criterion under Criteria is `[x]` and Open issues is None. -->
 
 ## Suite
-<!-- The test command and its summary line, quoted; the type check and its result; failures not in the baseline, if any. -->
+<!-- The test command and its summary line, quoted; the type check and its result; failures not in the baseline, if any. With verify.ciEvidence on and a green CI run on the exact head commit instead: the commit's SHA and each run's URL and conclusion. -->
 
 ## Criteria
-<!-- One line per acceptance criterion, in the spec's order: `- [x] <criterion, short> — <evidence>` when verified, `- [ ] <criterion, short> — <what is missing>` when not. Evidence is a test (`path:line`, the test's name) that ran green in this run and asserts this criterion, or a validate evidence entry (the `index.md` path under the git common dir's `fbs/evidence/<slug>/`, and the entry) captured on this tree. -->
+<!-- One line per acceptance criterion, in the spec's order, rollout ones aside: `- [x] <criterion, short> — <evidence>` when verified, `- [ ] <criterion, short> — <what is missing>` when not. Evidence is a test (`path:line`, the test's name) that ran green in this run and asserts this criterion, or a validate evidence entry (the `index.md` path under the git common dir's `fbs/evidence/<slug>/`, and the entry) captured on this tree. -->
+
+## Rollout
+<!-- One line per criterion that starts with `(rollout)`, which can only be shown after a deploy: `- [ ] <criterion, short> — checked after the deploy`; or None. They need no evidence here and never fail the verdict. -->
 
 ## Open issues
 <!-- Escalated or blocked tasks from plan.md, blocking review findings still open, and failing tests not in the baseline; or None. -->

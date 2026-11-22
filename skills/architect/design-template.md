@@ -31,7 +31,7 @@
 <!-- Where each acceptance criterion is checked, and what the test controls or fakes there. -->
 
 ## Work units
-<!-- The PRs this feature ships as, in order, each stacked on the one before, or `None` when it ships as one PR. Per unit a `### U<n>: <name>` heading, then the lines `- Covers: AC<i>, …` (the spec's acceptance criteria by position, or `none` for a setup unit), `- Depends on: U<k>, …` (lower units only, or `none`), `- Ships: <what a reviewer sees in this PR>` and `- Files: <paths from the file map>`. Every acceptance criterion is covered by exactly one unit. -->
+<!-- The PRs this feature ships as, in order, each stacked on the one before (except an independent unit: one that depends on no unit still to land and that no later unit depends on, built off the default branch), or `None` when it ships as one PR. Per unit a `### U<n>: <name>` heading, then the lines `- Covers: AC<i>, …` (the spec's acceptance criteria by position, or `none` for a setup unit), `- Depends on: U<k>, …` (lower units only, or `none`), `- Ships: <what a reviewer sees in this PR>` and `- Files: <paths from the file map>`. Every acceptance criterion is covered by exactly one unit. -->
 
 ## Risks
 <!-- What can go wrong, how likely it is, and what limits the damage. -->
